@@ -15,7 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from audit_video_driver import disk_image, symbols
+from audit_video_driver import symbols
+from kernel_slice import SliceImage, analyze_image
 from metal_cache import macho
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,15 +95,6 @@ PROFILE_VIDEO = [
     "__ZN27AVDVcn2HevcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatusInfoPvP15VAVendorTexture",
     "__ZN11Vcn2Encoder15setEncodeParamsEPvP15VAVendorTexture",
 ]
-KERNEL_BUCKETS = {
-    "vcnUvdVce": re.compile(r"VCN|UVD|VCE", re.I),
-    "videoContext": re.compile(r"VideoContext"),
-    "shared": re.compile(r"AccelShared|SharedUserClient|SMLInterface"),
-    "engine": re.compile(r"HWEngine|Engine", re.I),
-}
-KERNEL_VTABLE_CLASSES = re.compile(
-    r"VCN|UVD|VCE|VideoContext|GraphicsAccelerator|AccelShared|SharedUserClient|SMLInterface|"
-    r"Vega10Hardware|Vega20Hardware|GFX9Hardware")
 VA_BUCKETS = {
     "vcn1": re.compile(r"Vcn1|VCN1"),
     "vcn2": re.compile(r"Vcn2|VCN2"),
@@ -119,50 +111,6 @@ MAX_DISASM = 64
 
 def run(command, timeout=60):
     return subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
-
-
-def class_name(symbol):
-    # __ZN<len><name>10gMetaClassE -> name（含 AMDRadeonXxxxx_ 前缀）
-    m = re.match(r"^__ZN(\d+)(.+?)\d+gMetaClassE$", symbol)
-    if not m or int(m[1]) != len(m[2]):
-        return None
-    return m[2]
-
-
-def kernel_symbols(path):
-    data, read = disk_image(path)
-    result = run(["nm", "-n", str(path)])
-    names = {}
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) == 3:
-            try:
-                names[fields[2]] = int(fields[0], 16)
-            except ValueError:
-                pass
-    return data, read, names
-
-
-def enrich_vtable(read, names, metaclass):
-    # 由 metaclass 符号精确构造 __ZTV<len><Class>，不做后缀猜测。
-    m = re.match(r"^__ZN(\d+)(.+?)\d+gMetaClassE$", metaclass)
-    if not m or int(m[1]) != len(m[2]):
-        raise ValueError(f"无法解析 metaclass：{metaclass}")
-    vtable_symbol = f"__ZTV{m[1]}{m[2]}"
-    address = names.get(vtable_symbol)
-    if address is None:
-        raise ValueError(f"虚表符号缺失：{vtable_symbol}")
-    end = min(a for a in names.values() if a > address)
-    entries = struct.unpack("<" + "Q" * ((end - address - 16) // 8), read(address + 16, end - address - 16))
-    table = {"symbol": vtable_symbol, "symbolAddress": address, "addressPoint": address + 16,
-             "slots": [{"offset": i * 8, "target": a} for i, a in enumerate(entries)]}
-    reverse = {a: name for name, a in names.items()}
-    for slot in table["slots"]:
-        slot["symbol"] = reverse.get(slot["target"])
-        following = min((a for a in names.values() if a > slot["target"]), default=slot["target"])
-        if slot["target"] and 0 < following - slot["target"] <= 32:
-            slot["code"] = read(slot["target"], following - slot["target"]).hex()
-    return table
 
 
 KEXT_BUNDLE_IDS = {
@@ -209,6 +157,28 @@ def discover_kexts(report):
     return dict(discovery["matched"])
 
 
+def dump_shared_linkedit(handle, blob):
+    """子项的符号在共享 __LINKEDIT（kc 文件偏移）里；导出为伴生文件供符号解析。"""
+    ncmds = struct.unpack_from("<I", blob, 16)[0]
+    commands = blob[32:32 + min(struct.unpack_from("<I", blob, 20)[0], len(blob) - 32)]
+    cursor = 0
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", commands, cursor)
+        if cmd == 0x19:
+            name, _, seg_size, offset, file_size = struct.unpack_from("<16sQQQQ", commands, cursor + 8)[:5]
+            if name.rstrip(b"\0") == b"__LINKEDIT":
+                length = min(seg_size, file_size)
+                if offset + length <= len(blob):
+                    return None
+                target = WORK / f"linkedit-{offset:X}-{seg_size:X}.bin"
+                if not target.exists():
+                    handle.seek(offset)
+                    target.write_bytes(handle.read(length))
+                return str(target)
+        cursor += size
+    return None
+
+
 def kernel_collection_extract(report):
     """从 Preboot 内核集合 (.kc) 的 LC_FILESET_ENTRY 提取 AMD 驱动切片为独立 Mach-O。"""
     result = {}
@@ -252,8 +222,12 @@ def kernel_collection_extract(report):
                     following = [offset for offset in offsets if offset > fileoff]
                     size = min(following[0] - fileoff if following else 16 << 20, 64 << 20)
                     handle.seek(fileoff)
+                    blob = handle.read(size)
                     target = WORK / f"{label}.kc.bin"
-                    target.write_bytes(handle.read(size))
+                    target.write_bytes(blob)
+                    companion = dump_shared_linkedit(handle, blob)
+                    if companion:
+                        info.setdefault("linkedit", []).append(companion)
                     result[label] = str(target)
                     del remaining[label]
         except Exception as error:    # noqa: BLE001 - 单个 kc 失败不影响其余
@@ -270,32 +244,11 @@ def audit_kernel(report, binaries):
         if path is None:
             entry["error"] = "磁盘与内核集合均未找到驱动二进制；见 kernelDiscovery/kernelCollections"
             continue
-        path = Path(path)
         entry["path"] = str(path)
         try:
-            data, read, names = kernel_symbols(path)
+            entry.update(analyze_image(SliceImage(path)))
         except Exception as error:    # noqa: BLE001 - 审计需要完整记录失败原因
             entry["error"] = f"{type(error).__name__}: {error}"
-            continue
-        entry["sha256"] = hashlib.sha256(data).hexdigest()
-        entry["symbolCount"] = len(names)
-        for bucket, pattern in KERNEL_BUCKETS.items():
-            matched = sorted(((value, name) for name, value in names.items() if pattern.search(name)))
-            entry[bucket] = [f"{name}@{value:X}" for value, name in matched[:MAX_BUCKET]]
-        metaclasses = sorted(n for n in names if n.endswith("gMetaClassE"))
-        entry["metaclasses"] = [class_name(n) or n for n in metaclasses]
-        vtables = {}
-        for metaclass in metaclasses:
-            classname = class_name(metaclass)
-            if not classname or not KERNEL_VTABLE_CLASSES.search(classname):
-                continue
-            if len(vtables) >= 24:
-                break
-            try:
-                vtables[classname] = enrich_vtable(read, names, metaclass)
-            except Exception as error:    # noqa: BLE001
-                vtables[classname] = {"error": f"{type(error).__name__}: {error}"}
-        entry["vtables"] = vtables
 
 
 class SharedCache:
