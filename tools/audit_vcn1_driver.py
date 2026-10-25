@@ -55,11 +55,16 @@ FOLLOWUP_FUNCTIONS = [
     "__ZN12VAVcnDecoder4InitEj",
     "__ZN12VAUveEncoder4initEj",
     "__ZN12VAUveEncoder9configureEjPv",
+    "__ZN12VAUveEncoder13createSessionEv",
     "__ZN12VAUveEncoder15getFeedbackSizeEv",
     "__ZN12VAUveEncoder22getEncodePackageParamsEjPv",
     "__ZN12VAUveEncoder22setEncodePackageParamsEjPv",
+    "__ZN13VAHevcEncoder4initEj",
+    "__ZN13VAHevcEncoder13createSessionEv",
+    "__ZN13VAHevcEncoder16configureEncoderEv",
     "__ZN12VAAvcEncoder4initEj",
-    "__ZN12VAHevcEncoder4initEj",
+    "__ZN12VAAvcEncoder13createSessionEv",
+    "__ZN12VAAvcEncoder16configureEncoderEv",
     "__ZN13UvdEncCommand18buildCreateSessionEP25_HevcEncCreateSessionInfoP9VAEncoder",
     "__ZN13UvdEncCommand19buildGeneralCommandEP15_HevcEncCmdInfo",
     "__ZN9UvdEngine11startEngineE21eAMDAccelVideoChannel",
@@ -211,9 +216,13 @@ def kernel_collection_extract(report):
     report["kernelCollections"] = info
     preboot = Path("/System/Volumes/Preboot")
     kc_paths = []
-    if preboot.is_dir():
-        for pattern in ("*/KernelCollections/*.kc", "*/*/KernelCollections/*.kc"):
-            kc_paths.extend(sorted(preboot.glob(pattern)))
+    for root in [preboot, Path("/System/Library/KernelCollections")]:
+        if not root.is_dir():
+            continue
+        try:
+            kc_paths.extend(sorted(root.rglob("*.kc")))
+        except OSError:
+            pass
     info["paths"] = [str(p) for p in kc_paths]
     remaining = dict(KEXT_BUNDLE_IDS)
     for kc_path in kc_paths:
@@ -364,18 +373,18 @@ def audit_function(cache, names, name, *, dump_disasm):
             text = disasm(code[:MAX_CODE], name[-48:].replace("/", "_"))
             entry["disasm"] = text
             if name in RIP_FOLLOW:
-                # 反汇编注释里的 ## 0x... 是相对函数开头的目标；只跟随远处的数据引用。
+                # 反汇编注释里的 ## 0x... 是相对函数开头的目标；小偏移是跳表/常量池，一并跟随。
                 entry["ripData"] = {}
                 seen = set()
                 for value in re.findall(r"##\s+0x([0-9a-f]+)", text):
                     offset = int(value, 16)
-                    if offset in seen or not 0x10000 < offset < 0x8000000:
+                    if offset in seen or not 0x40 <= offset < 0x8000000:
                         continue
                     seen.add(offset)
-                    if len(seen) > 24:
+                    if len(seen) > 32:
                         break
                     try:
-                        entry["ripData"][f"+{offset:X}"] = cache.read(address + offset, 96).hex()
+                        entry["ripData"][f"+{offset:X}"] = cache.read(address + offset, 128).hex()
                     except Exception:    # noqa: BLE001 - 单个引用失败不影响其余
                         pass
         except Exception as error:    # noqa: BLE001
