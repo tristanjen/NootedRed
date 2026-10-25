@@ -17,7 +17,7 @@ jobs:
       contents: write
       discussions: write
     steps:
-      - if: github.repository != 'ChefKissInc/NootedRed' && github.repository != 'steve12311/NootedRed'
+      - if: github.repository != 'ChefKissInc/NootedRed' && github.repository != 'tristanjen/NootedRed'
         run: |
           cat << 'EOF' >> $GITHUB_STEP_SUMMARY
           # 🛑 STOP!
