@@ -21,12 +21,50 @@ from metal_cache import macho
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "build/vcn"
 
+# Sequoia 起系统 kext 位于 cryptex；两个位置都尝试。
 KERNELS = {
-    "X5000": "/System/Library/Extensions/AMDRadeonX5000.kext/Contents/MacOS/AMDRadeonX5000",
-    "X5000HWLibs": ("/System/Library/Extensions/AMDRadeonX5000HWServices.kext/Contents/PlugIns/"
-                    "AMDRadeonX5000HWLibs.kext/Contents/MacOS/AMDRadeonX5000HWLibs"),
-    "X6000": "/System/Library/Extensions/AMDRadeonX6000.kext/Contents/MacOS/AMDRadeonX6000",
+    "X5000": ["/System/Volumes/Preboot/Cryptexes/OS/System/Library/Extensions/AMDRadeonX5000.kext/Contents/"
+              "MacOS/AMDRadeonX5000",
+              "/System/Library/Extensions/AMDRadeonX5000.kext/Contents/MacOS/AMDRadeonX5000"],
+    "X5000HWLibs": ["/System/Volumes/Preboot/Cryptexes/OS/System/Library/Extensions/"
+                    "AMDRadeonX5000HWServices.kext/Contents/PlugIns/AMDRadeonX5000HWLibs.kext/Contents/MacOS/"
+                    "AMDRadeonX5000HWLibs",
+                    "/System/Library/Extensions/AMDRadeonX5000HWServices.kext/Contents/PlugIns/"
+                    "AMDRadeonX5000HWLibs.kext/Contents/MacOS/AMDRadeonX5000HWLibs"],
+    "X6000": ["/System/Volumes/Preboot/Cryptexes/OS/System/Library/Extensions/AMDRadeonX6000.kext/Contents/MacOS/"
+              "AMDRadeonX6000",
+              "/System/Library/Extensions/AMDRadeonX6000.kext/Contents/MacOS/AMDRadeonX6000"],
 }
+# 家族分派与 VCN1/UVD/VCE 路径的关键函数；identify 已确认 family 4 = Vega 20 (VCN1)。
+FOLLOWUP_FUNCTIONS = [
+    "__ZN9VAFactory13createDecoderEiP9VAContext",
+    "__ZN9VAFactory25createDecodeDataProcessorE23DecodeDataProcessorTypeP9VADecoder",
+    "__ZN9VAFactory13createEncoderEiP9VAContext",
+    "__ZN9VAFactory21createEncodeProcessorEiP9VAEncoder",
+    "__ZN9VAFactory16createUVDCommandEP9VAContext",
+    "__ZN12AvdVAContext13CreateDecoderEjjjjj",
+    "__ZN12AvdVAContext13CreateEncoderEjjjjj",
+    "__ZN12AvdVAContext13EncodePictureEP11AVD_CmdInfoP14_CommandRefCon",
+    "__ZN17VAAcceleratorInfo14getExtraIdInfoEjjP11_VAHWConfig",
+    "__ZN17VAAcceleratorInfo11getVendorIDEPj",
+    "__ZN12VAUvdDecoder4InitEj",
+    "__ZN12VAUvdDecoder15setupPowerStateEjP21_CWDDEPM_SCHEDULER_IDPjS2_S2_",
+    "__ZN12VAVcnDecoder4InitEj",
+    "__ZN12VAUveEncoder4initEj",
+    "__ZN12VAUveEncoder9configureEjPv",
+    "__ZN12VAUveEncoder15getFeedbackSizeEv",
+    "__ZN12VAUveEncoder22getEncodePackageParamsEjPv",
+    "__ZN12VAUveEncoder22setEncodePackageParamsEjPv",
+    "__ZN12VAAvcEncoder4initEj",
+    "__ZN12VAHevcEncoder4initEj",
+    "__ZN13UvdEncCommand18buildCreateSessionEP25_HevcEncCreateSessionInfoP9VAEncoder",
+    "__ZN13UvdEncCommand19buildGeneralCommandEP15_HevcEncCmdInfo",
+    "__ZN9UvdEngine11startEngineE21eAMDAccelVideoChannel",
+    "__ZN9UvdEngine10stopEngineEv",
+    "__ZN9UvdEngine16createUvdContextEP23sVideoContextCreateInfoP23sVideoContextReturnInfo",
+    "__ZN9VceEngine11startEngineEj",
+    "__ZN9VceEngine16createVceContextEP23sVideoContextCreateInfoP23sVideoContextReturnInfo",
+]
 VA_IMAGE = "/System/Library/Extensions/AMDRadeonVADriver2.bundle/Contents/MacOS/AMDRadeonVADriver2"
 GVA_MATCH = "AppleGVA.framework"
 # 与 tools/fixtures/sequoia-compat.json 的 video 键一致；用于比对用户构建与作者 15.8.1 档案。
@@ -68,7 +106,7 @@ VA_BUCKETS = {
 }
 MAX_BUCKET = 3000
 MAX_CODE = 8192
-MAX_DISASM = 24
+MAX_DISASM = 64
 
 
 def run(command, timeout=60):
@@ -120,11 +158,16 @@ def enrich_vtable(read, names, metaclass):
 
 
 def audit_kernel(report):
-    for label, path in KERNELS.items():
+    for label, candidates in KERNELS.items():
         entry = {}
         report["kernel"][label] = entry
+        path = next((Path(p) for p in candidates if Path(p).exists()), None)
+        if path is None:
+            entry["error"] = "未找到驱动二进制：" + " | ".join(candidates)
+            continue
+        entry["path"] = str(path)
         try:
-            data, read, names = kernel_symbols(Path(path))
+            data, read, names = kernel_symbols(path)
         except Exception as error:    # noqa: BLE001 - 审计需要完整记录失败原因
             entry["error"] = f"{type(error).__name__}: {error}"
             continue
@@ -240,7 +283,9 @@ def audit_userspace(report, cache):
         userspace[bucket] = sorted(n for n in names if pattern.search(n))[:MAX_BUCKET]
 
     functions = {}
-    for name in PROFILE_VIDEO + [n for n in names if "VAAcceleratorInfo8m_hwInfoE" in n]:
+    for name in PROFILE_VIDEO + [n for n in names if "VAAcceleratorInfo8m_hwInfoE" in n] + FOLLOWUP_FUNCTIONS:
+        if name in functions:
+            continue
         if name not in names:
             functions[name] = {"missing": True}
             continue
@@ -248,7 +293,7 @@ def audit_userspace(report, cache):
     extra = sorted({n for bucket in ("vcn1", "uvd", "vce") for n in userspace.get(bucket, [])}
                    | {n for n in userspace.get("encode", [])})
     for name in extra:
-        if len(functions) >= 60 or name in functions:
+        if len(functions) >= 120 or name in functions:
             continue
         want_disasm = len([v for v in functions.values() if "disasm" in v]) < MAX_DISASM
         try:
