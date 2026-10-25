@@ -141,7 +141,7 @@ def analyze_image(image, vtable_limit=40):
     }
     for label, pattern in buckets.items():
         matched = sorted(((a, n) for n, a in image.symbols.items() if pattern.search(n)))
-        report[label] = [f"{name}@{address:X}" for _, name in matched[:3000]]
+        report[label] = [f"{name}@{value:X}" for value, name in matched[:3000]]
     metaclasses = sorted(n for n in image.symbols if n.endswith("gMetaClassE"))
     report["metaclasses"] = [SliceImage.class_name(n) or n for n in metaclasses]
     vtables = {}
