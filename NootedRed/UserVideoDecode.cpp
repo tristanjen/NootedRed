@@ -304,7 +304,13 @@ namespace
                 stage(Stage::CodeRead, fairPlayPID);
                 return result;
             }
-            if (memcmp(saved[i].bytes, patches[i].original, patches[i].size) == 0) { ++originals; }
+            // VCN1 的编码器补丁按设备退化为原样；这些条目既视作 original 也视作 patched，
+            // 否则事务重入时永远进不了 Already 判定。
+            const bool identity = memcmp(patches[i].original, patches[i].patched, patches[i].size) == 0;
+            if (memcmp(saved[i].bytes, patches[i].original, patches[i].size) == 0) {
+                ++originals;
+                if (identity) { ++patched; }
+            }
             else if (memcmp(saved[i].bytes, patches[i].patched, patches[i].size) == 0) {
                 ++patched;
             }
