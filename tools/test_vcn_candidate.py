@@ -24,6 +24,11 @@ def main():
     assert devices() == [(0x15D8, 4), (0x15E7, 5), (0x1636, 5), (0x1638, 5), (0x164C, 5)]
     for device, family in devices():
         per_device = WORK / f"identify-{device:04X}.s"
+        if not per_device.exists():
+            # --sequoia-cache 生成时，载荷文件位于 build/sequoia/video/。
+            sequoia = ROOT / "build/sequoia/video" / f"identify-{device:04X}.s"
+            if sequoia.exists():
+                per_device = sequoia
         source = per_device.read_text().replace("_payload", "_nativeIdentify")
         for label, replacement in [("24", "leaq _fakeHardwareInfo(%rip), %rax"),
                                    ("48", "callq _readHwInfo"),
