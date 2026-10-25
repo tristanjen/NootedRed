@@ -32,7 +32,16 @@ def main():
     harness = preamble + r'''
 static bool drmClient=false;
 static const char* clientName="Music";
+static unsigned dbgId=0,dbgPhase=0;
 static std::set<uint64_t> drmTouchedPages;
+static int checkedLookup(const char* where,uint64_t key){
+ auto it=protections.find(key);
+ if(it==protections.end()){
+  fprintf(stderr,"%s miss: page=%llx id=%x phase=%u protections=%zu\\n",where,(unsigned long long)key,dbgId,dbgPhase,protections.size());
+  abort();
+ }
+ return it->second;
+}
 static kern_return_t vm_protect(vm_map_t,uint64_t a,unsigned,int setMax,int flags){
  protects++;if(protects==failedProtect || failedProtectCalls.contains(protects))return 42;assert(protections.contains(a));
  drmTouchedPages.insert(a);
@@ -43,7 +52,7 @@ static int proc_pid(proc_t){return 217;}static void proc_name(int,char* name,int
 static vm_map_t map(task_t){return reinterpret_cast<void*>(2);}
 static kern_return_t query(vm_map_t,uint64_t* a,uint64_t* size,unsigned*,int* p,unsigned* count){
  assert(*count==VM_REGION_SUBMAP_SHORT_INFO_COUNT_64);auto*i=reinterpret_cast<vm_region_submap_short_info_data_64_t*>(p);
- i->protection=protections.at(*a);i->is_submap=0;*size=4096;return 0;}
+ i->protection=checkedLookup("query",*a);i->is_submap=0;*size=4096;return 0;}
 static void setup(unsigned id){
  using namespace UserVideoDecodeData;cache(ResolverImages,ResolverFunctions);devicePatches=findDevice(id);assert(devicePatches);
  drmClient=false;clientEntitlement=nullptr;drmTouchedPages.clear();
@@ -52,10 +61,11 @@ static void setup(unsigned id){
 #endif
  seenStages=appliedCount=errorCount=0;originalCheck=reinterpret_cast<uint64_t>(original);readUser=reader;writeUser=writer;getTaskMap=map;queryRegion=query;
 }
-static void call(){SharedRegionCheckArgs args{0x1000};int value=0;assert(wrappedSharedRegionCheck(drmClient?reinterpret_cast<void*>(217):nullptr,&args,&value)==0&&value==123);}
+static void call(){++dbgPhase;SharedRegionCheckArgs args{0x1000};int value=0;assert(wrappedSharedRegionCheck(drmClient?reinterpret_cast<void*>(217):nullptr,&args,&value)==0&&value==123);}
 int main(){
  unsigned cases=0;
  for(unsigned id:{0x15d8U,0x15e7U,0x1636U,0x1638U,0x164cU}){
+  dbgId=id;
   setup(id);UserVideoDecodeResolver::Plan plan;
   assert(UserVideoDecodeResolver::resolve(reader,base,devicePatches,plan));
   pages(plan.patches,PatchCount);auto initial=blocks;assert(protections.size()>UserVideoDecodeData::PageCount);
@@ -91,7 +101,7 @@ int main(){
 #ifndef BASELINE
  // 各 FairPlay 客户端共用解码子集，在重排及跨页缓存中仍对全部已选页实施事务回滚。
  for(unsigned id:{0x15d8U,0x15e7U,0x1636U,0x1638U,0x164cU})for(const char* name:{"Music","TV","Other"}){
-  clientName=name;
+  dbgId=id;clientName=name;
   setup(id);UserVideoDecodeResolver::Plan plan;
   assert(UserVideoDecodeResolver::resolve(reader,base,devicePatches,plan));
   auto enable=[&]{fairPlayDriverOnly=drmClient=true;clientEntitlement=kOSBooleanTrue;pages(plan.patches,PatchCount);};
