@@ -160,9 +160,16 @@ def enrich_vtable(read, names, metaclass):
     return table
 
 
+KEXT_BUNDLE_IDS = {
+    "X5000": "com.apple.kext.AMDRadeonX5000",
+    "X5000HWLibs": "com.apple.kext.AMDRadeonX5000HWLibs",
+    "X6000": "com.apple.kext.AMDRadeonX6000",
+}
+
+
 def discover_kexts(report):
-    """在常见根目录里搜索 AMD 驱动 kext，记录全部候选路径与 AMD 相关清单。"""
-    discovery = {"amdEntries": {}, "matched": {}}
+    """在常见根目录里搜索 AMD 驱动 kext；Sequoia 的 bundle 可能只有 Info 壳，记录完整布局。"""
+    discovery = {"amdEntries": {}, "matched": {}, "layouts": {}}
     report["kernelDiscovery"] = discovery
     for root in KEXT_ROOTS:
         base = Path(root)
@@ -179,17 +186,71 @@ def discover_kexts(report):
             if label in discovery["matched"]:
                 continue
             for pattern in patterns:
-                candidates = sorted(base.glob(pattern))
-                for kext in candidates:
+                for kext in sorted(base.glob(pattern)):
                     if not kext.is_dir():
                         continue
+                    files = [str(p.relative_to(kext)) for p in sorted(kext.rglob("*")) if p.is_file()]
+                    discovery["layouts"].setdefault(label, {})[str(kext)] = files[:80]
                     binary = kext / "Contents/MacOS" / kext.stem
-                    if binary.is_file():
+                    if not binary.is_file():
+                        macos = kext / "Contents/MacOS"
+                        candidates = sorted(p for p in macos.iterdir() if p.is_file()) if macos.is_dir() else []
+                        binary = candidates[0] if candidates else None
+                    if binary is not None:
                         discovery["matched"][label] = str(binary)
                         break
                 if label in discovery["matched"]:
                     break
-    return discovery.get("matched", {})
+    return dict(discovery["matched"])
+
+
+def kernel_collection_extract(report):
+    """从 Preboot 内核集合 (.kc) 的 LC_FILESET_ENTRY 提取 AMD 驱动切片为独立 Mach-O。"""
+    result = {}
+    info = {"paths": [], "extracted": {}}
+    report["kernelCollections"] = info
+    preboot = Path("/System/Volumes/Preboot")
+    kc_paths = []
+    if preboot.is_dir():
+        for pattern in ("*/KernelCollections/*.kc", "*/*/KernelCollections/*.kc"):
+            kc_paths.extend(sorted(preboot.glob(pattern)))
+    info["paths"] = [str(p) for p in kc_paths]
+    remaining = dict(KEXT_BUNDLE_IDS)
+    for kc_path in kc_paths:
+        if not remaining:
+            break
+        try:
+            with kc_path.open("rb") as handle:
+                header = handle.read(32)
+                if len(header) < 32 or struct.unpack_from("<I", header)[0] != 0xFEEDFACF:
+                    continue
+                commands = handle.read(struct.unpack_from("<I", header, 20)[0])
+                ncmds = struct.unpack_from("<I", header, 16)[0]
+                cursor, entries = 0, []
+                for _ in range(ncmds):
+                    cmd, size = struct.unpack_from("<II", commands, cursor)
+                    if cmd == 0x35:    # LC_FILESET_ENTRY
+                        vmaddr, fileoff = struct.unpack_from("<QQ", commands, cursor + 8)
+                        entry_id = struct.unpack_from("<I", commands, cursor + 24)[0]
+                        end = commands.find(b"\0", cursor + entry_id)
+                        entries.append((commands[cursor + entry_id:end].decode(errors="replace"), vmaddr, fileoff))
+                    cursor += size
+                offsets = sorted(entry[2] for entry in entries)
+                for name, vmaddr, fileoff in entries:
+                    label = next((k for k, v in remaining.items() if v == name), None)
+                    if label is None:
+                        continue
+                    following = [offset for offset in offsets if offset > fileoff]
+                    size = min(following[0] - fileoff if following else 16 << 20, 64 << 20)
+                    handle.seek(fileoff)
+                    target = WORK / f"{label}.kc.bin"
+                    target.write_bytes(handle.read(size))
+                    result[label] = str(target)
+                    del remaining[label]
+        except Exception as error:    # noqa: BLE001 - 单个 kc 失败不影响其余
+            info[str(kc_path)] = f"{type(error).__name__}: {error}"
+    info["extracted"] = dict(result)
+    return result
 
 
 def audit_kernel(report, binaries):
@@ -198,7 +259,7 @@ def audit_kernel(report, binaries):
         report["kernel"][label] = entry
         path = binaries.get(label)
         if path is None:
-            entry["error"] = "未找到驱动二进制；见 kernelDiscovery.amdEntries"
+            entry["error"] = "磁盘与内核集合均未找到驱动二进制；见 kernelDiscovery/kernelCollections"
             continue
         path = Path(path)
         entry["path"] = str(path)
@@ -210,8 +271,8 @@ def audit_kernel(report, binaries):
         entry["sha256"] = hashlib.sha256(data).hexdigest()
         entry["symbolCount"] = len(names)
         for bucket, pattern in KERNEL_BUCKETS.items():
-            matched = sorted(((address, name) for name, address in names.items() if pattern.search(name)))
-            entry[bucket] = [f"{name}@{address:X}" for _, name in matched[:MAX_BUCKET]]
+            matched = sorted(((value, name) for name, value in names.items() if pattern.search(name)))
+            entry[bucket] = [f"{name}@{value:X}" for value, name in matched[:MAX_BUCKET]]
         metaclasses = sorted(n for n in names if n.endswith("gMetaClassE"))
         entry["metaclasses"] = [class_name(n) or n for n in metaclasses]
         vtables = {}
@@ -333,8 +394,8 @@ def audit_userspace(report, cache):
     userspace["base"] = base
     userspace["symbolCount"] = len(names)
     for bucket, pattern in VA_BUCKETS.items():
-        matched = sorted(((address, name) for name, address in names.items() if pattern.search(name)))
-        userspace[bucket] = [f"{name}@{address:X}" for _, name in matched[:MAX_BUCKET]]
+        matched = sorted(((value, name) for name, value in names.items() if pattern.search(name)))
+        userspace[bucket] = [f"{name}@{value:X}" for value, name in matched[:MAX_BUCKET]]
 
     functions = {}
     for name in PROFILE_VIDEO + [n for n in names if "VAAcceleratorInfo8m_hwInfoE" in n] + FOLLOWUP_FUNCTIONS:
@@ -428,6 +489,8 @@ def main():
 
     system_info(report)
     binaries = discover_kexts(report)
+    for label, path in kernel_collection_extract(report).items():
+        binaries.setdefault(label, path)
     audit_kernel(report, binaries)
     cache = None
     try:
