@@ -58,9 +58,10 @@ class SliceImage:
         return None
 
     def _read_file(self, position, length):
-        """按文件偏移读取：切片优先，其余落入共享 LINKEDIT 伴生文件。"""
-        if position + length <= len(self.data):
-            return self.data[position:position + length]
+        """按 kc 文件偏移读取：切片内先换算为切片相对偏移，其余落入共享 LINKEDIT。"""
+        slice_position = position - self._file_base
+        if 0 <= slice_position and slice_position + length <= len(self.data):
+            return self.data[slice_position:slice_position + length]
         if self.companion is None:
             raise ValueError(f"{self.path.name}: 文件偏移越界且无伴生 LINKEDIT：{position:#x}")
         companion = self.companion.read_bytes()
@@ -68,6 +69,11 @@ class SliceImage:
         if begin < 0 or begin + length > len(companion):
             raise ValueError(f"{self.path.name}: 伴生 LINKEDIT 范围外：{position:#x}")
         return companion[begin:begin + length]
+
+    @property
+    def _file_base(self):
+        """切片窗口在 kc 文件中的起始偏移（首个段即 __TEXT，其 off 即入口位置）。"""
+        return self.segments[0][3] if self.segments else 0
 
     @property
     def _companion_base(self):
