@@ -1,6 +1,7 @@
 // 测试缓存重排 Mach-O、完整函数与合并 GOT；各补丁刻意跨页。
 static std::map<uint64_t,std::vector<uint8_t>> blocks;
 static std::map<uint64_t,int> protections;
+static unsigned dbgId=0,dbgPhase=0;
 static std::vector<uint64_t> imageAddresses,functionAddresses;
 static constexpr uint64_t base=0x7ff800200000ULL,unslid=base-0x200000;
 static unsigned writes=0,protects=0,failWrite=0,failedProtect=0;

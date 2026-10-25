@@ -32,7 +32,6 @@ def main():
     harness = preamble + r'''
 static bool drmClient=false;
 static const char* clientName="Music";
-static unsigned dbgId=0,dbgPhase=0;
 static std::set<uint64_t> drmTouchedPages;
 static int checkedLookup(const char* where,uint64_t key){
  auto it=protections.find(key);
