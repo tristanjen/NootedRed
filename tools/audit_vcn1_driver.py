@@ -21,20 +21,23 @@ from metal_cache import macho
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "build/vcn"
 
-# Sequoia 起系统 kext 位于 cryptex；两个位置都尝试。
-KERNELS = {
-    "X5000": ["/System/Volumes/Preboot/Cryptexes/OS/System/Library/Extensions/AMDRadeonX5000.kext/Contents/"
-              "MacOS/AMDRadeonX5000",
-              "/System/Library/Extensions/AMDRadeonX5000.kext/Contents/MacOS/AMDRadeonX5000"],
-    "X5000HWLibs": ["/System/Volumes/Preboot/Cryptexes/OS/System/Library/Extensions/"
-                    "AMDRadeonX5000HWServices.kext/Contents/PlugIns/AMDRadeonX5000HWLibs.kext/Contents/MacOS/"
-                    "AMDRadeonX5000HWLibs",
-                    "/System/Library/Extensions/AMDRadeonX5000HWServices.kext/Contents/PlugIns/"
-                    "AMDRadeonX5000HWLibs.kext/Contents/MacOS/AMDRadeonX5000HWLibs"],
-    "X6000": ["/System/Volumes/Preboot/Cryptexes/OS/System/Library/Extensions/AMDRadeonX6000.kext/Contents/MacOS/"
-              "AMDRadeonX6000",
-              "/System/Library/Extensions/AMDRadeonX6000.kext/Contents/MacOS/AMDRadeonX6000"],
+KEXT_ROOTS = ["/System/Library/Extensions",
+               "/System/Volumes/Preboot/Cryptexes/OS/System/Library/Extensions",
+               "/Library/Extensions"]
+KEXT_GLOBS = {
+    "X5000": ["AMDRadeonX5000.kext"],
+    "X5000HWLibs": ["AMDRadeonX5000HWServices.kext/Contents/PlugIns/AMDRadeonX5000HWLibs.kext",
+                    "AMDRadeonX5000HWLibs.kext"],
+    "X6000": ["AMDRadeonX6000.kext"],
 }
+# 需要跟随 rip 数据引用的函数（跳转表 / 常量表位于函数体外）。
+RIP_FOLLOW = [
+    "__ZN17VAAcceleratorInfo8identifyEjj",
+    "__ZN17VAAcceleratorInfo14getExtraIdInfoEjjP11_VAHWConfig",
+    "__ZN9VAFactory13createDecoderEiP9VAContext",
+    "__ZN9VAFactory16createUVDCommandEP9VAContext",
+    "__ZN9VAFactory13createEncoderEiP9VAContext",
+]
 # 家族分派与 VCN1/UVD/VCE 路径的关键函数；identify 已确认 family 4 = Vega 20 (VCN1)。
 FOLLOWUP_FUNCTIONS = [
     "__ZN9VAFactory13createDecoderEiP9VAContext",
@@ -157,14 +160,47 @@ def enrich_vtable(read, names, metaclass):
     return table
 
 
-def audit_kernel(report):
-    for label, candidates in KERNELS.items():
+def discover_kexts(report):
+    """在常见根目录里搜索 AMD 驱动 kext，记录全部候选路径与 AMD 相关清单。"""
+    discovery = {"amdEntries": {}, "matched": {}}
+    report["kernelDiscovery"] = discovery
+    for root in KEXT_ROOTS:
+        base = Path(root)
+        if not base.is_dir():
+            continue
+        try:
+            entries = sorted(p.name for p in base.iterdir()
+                             if "AMD" in p.name.upper() and (p.name.endswith(".kext") or p.name.endswith(".bundle")))
+        except OSError as error:
+            discovery["amdEntries"][root] = f"{type(error).__name__}: {error}"
+            continue
+        discovery["amdEntries"][root] = entries
+        for label, patterns in KEXT_GLOBS.items():
+            if label in discovery["matched"]:
+                continue
+            for pattern in patterns:
+                candidates = sorted(base.glob(pattern))
+                for kext in candidates:
+                    if not kext.is_dir():
+                        continue
+                    binary = kext / "Contents/MacOS" / kext.stem
+                    if binary.is_file():
+                        discovery["matched"][label] = str(binary)
+                        break
+                if label in discovery["matched"]:
+                    break
+    return discovery.get("matched", {})
+
+
+def audit_kernel(report, binaries):
+    for label in KEXT_GLOBS:
         entry = {}
         report["kernel"][label] = entry
-        path = next((Path(p) for p in candidates if Path(p).exists()), None)
+        path = binaries.get(label)
         if path is None:
-            entry["error"] = "未找到驱动二进制：" + " | ".join(candidates)
+            entry["error"] = "未找到驱动二进制；见 kernelDiscovery.amdEntries"
             continue
+        path = Path(path)
         entry["path"] = str(path)
         try:
             data, read, names = kernel_symbols(path)
@@ -174,7 +210,8 @@ def audit_kernel(report):
         entry["sha256"] = hashlib.sha256(data).hexdigest()
         entry["symbolCount"] = len(names)
         for bucket, pattern in KERNEL_BUCKETS.items():
-            entry[bucket] = sorted(n for n in names if pattern.search(n))[:MAX_BUCKET]
+            matched = sorted(((address, name) for name, address in names.items() if pattern.search(name)))
+            entry[bucket] = [f"{name}@{address:X}" for _, name in matched[:MAX_BUCKET]]
         metaclasses = sorted(n for n in names if n.endswith("gMetaClassE"))
         entry["metaclasses"] = [class_name(n) or n for n in metaclasses]
         vtables = {}
@@ -263,7 +300,23 @@ def audit_function(cache, names, name, *, dump_disasm):
              "code": code[:MAX_CODE].hex()}
     if dump_disasm:
         try:
-            entry["disasm"] = disasm(code[:MAX_CODE], name[-48:].replace("/", "_"))
+            text = disasm(code[:MAX_CODE], name[-48:].replace("/", "_"))
+            entry["disasm"] = text
+            if name in RIP_FOLLOW:
+                # 反汇编注释里的 ## 0x... 是相对函数开头的目标；只跟随远处的数据引用。
+                entry["ripData"] = {}
+                seen = set()
+                for value in re.findall(r"##\s+0x([0-9a-f]+)", text):
+                    offset = int(value, 16)
+                    if offset in seen or not 0x10000 < offset < 0x8000000:
+                        continue
+                    seen.add(offset)
+                    if len(seen) > 24:
+                        break
+                    try:
+                        entry["ripData"][f"+{offset:X}"] = cache.read(address + offset, 96).hex()
+                    except Exception:    # noqa: BLE001 - 单个引用失败不影响其余
+                        pass
         except Exception as error:    # noqa: BLE001
             entry["disasmError"] = f"{type(error).__name__}: {error}"
     return entry
@@ -280,7 +333,8 @@ def audit_userspace(report, cache):
     userspace["base"] = base
     userspace["symbolCount"] = len(names)
     for bucket, pattern in VA_BUCKETS.items():
-        userspace[bucket] = sorted(n for n in names if pattern.search(n))[:MAX_BUCKET]
+        matched = sorted(((address, name) for name, address in names.items() if pattern.search(name)))
+        userspace[bucket] = [f"{name}@{address:X}" for _, name in matched[:MAX_BUCKET]]
 
     functions = {}
     for name in PROFILE_VIDEO + [n for n in names if "VAAcceleratorInfo8m_hwInfoE" in n] + FOLLOWUP_FUNCTIONS:
@@ -290,8 +344,8 @@ def audit_userspace(report, cache):
             functions[name] = {"missing": True}
             continue
         functions[name] = audit_function(cache, names, name, dump_disasm=True)
-    extra = sorted({n for bucket in ("vcn1", "uvd", "vce") for n in userspace.get(bucket, [])}
-                   | {n for n in userspace.get("encode", [])})
+    extra = sorted({n for bucket in ("vcn1", "uvd", "vce") for n in names if VA_BUCKETS[bucket].search(n)}
+                   | {n for n in names if VA_BUCKETS["encode"].search(n)})
     for name in extra:
         if len(functions) >= 120 or name in functions:
             continue
@@ -356,6 +410,11 @@ def system_info(report):
                              if "NRed" in line or "device-id" in line or "revision-id" in line][:400]
     except Exception as error:    # noqa: BLE001
         info["ioregError"] = f"{type(error).__name__}: {error}"
+    try:
+        kext = run(["kextstat", "-l"], timeout=120).stdout.splitlines()
+        info["kextstatAMD"] = [line.strip() for line in kext if "AMD" in line][:80]
+    except Exception as error:    # noqa: BLE001
+        info["kextstatError"] = f"{type(error).__name__}: {error}"
 
 
 def main():
@@ -368,7 +427,8 @@ def main():
     report = {"kernel": {}, "userspace": {}, "system": {}}
 
     system_info(report)
-    audit_kernel(report)
+    binaries = discover_kexts(report)
+    audit_kernel(report, binaries)
     cache = None
     try:
         cache = SharedCache(args.cache_dir)
@@ -385,12 +445,16 @@ def main():
     args.output.write_text(json.dumps(report, indent=1, ensure_ascii=False) + "\n")
     print("== VCN1 audit ==")
     print("system:", report["system"].get("sw_vers"), "|", report["system"].get("uname"))
+    for root, entries in report.get("kernelDiscovery", {}).get("amdEntries", {}).items():
+        names = entries if isinstance(entries, list) else []
+        print(f"kext root {root}: {len(names)} AMD entries", names[:12] if names else entries)
     for label, entry in report["kernel"].items():
         if "error" in entry:
             print(f"kernel {label}: ERROR {entry['error']}")
         else:
-            print(f"kernel {label}: symbols={entry['symbolCount']} vcnUvdVce={len(entry['vcnUvdVce'])} "
-                  f"videoContext={len(entry['videoContext'])} vtables={list(entry['vtables'])}")
+            print(f"kernel {label}: {entry['path']} symbols={entry['symbolCount']} "
+                  f"vcnUvdVce={len(entry['vcnUvdVce'])} videoContext={len(entry['videoContext'])} "
+                  f"vtables={list(entry['vtables'])}")
     userspace = report["userspace"]
     if "error" in userspace:
         print("userspace: ERROR", userspace["error"])
