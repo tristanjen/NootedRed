@@ -46,7 +46,7 @@ static bool checkKernelArgument(const char* s){
  return strcmp(s,"-NRedVideoFix")==0 || (wantRender && strcmp(s,"-NRedDisplayFix")==0);
 }
 namespace UserPatchPolicy {static bool isFairPlayClient(task_t){return fairPlay;}}
-namespace VCN {static bool allocated(){return true;}}
+namespace VCN {static bool allocated(){return true;} static bool vcn1Ready(){return false;}}
 namespace UserSurfaceSync {void init(struct KernelPatcher&);}
 struct KernelPatcher{
  static constexpr int KernelID=0;unsigned routes=0;

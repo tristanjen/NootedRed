@@ -27,7 +27,7 @@ struct NRed {static NRed& singleton(){static NRed n;return n;}void setProp32(con
 struct Version{unsigned major(){return majorValue;}unsigned minor(){return minorValue;}static unsigned majorValue,minorValue;};unsigned Version::majorValue=25;unsigned Version::minorValue=6;
 const PenguinWizardry::KernelVersion& currentKernelVersion(){static std::optional<PenguinWizardry::KernelVersion> current;return current.emplace(Version::majorValue,Version::minorValue);}
 static bool flag=true;static bool checkKernelArgument(const char* s){assert(strcmp(s,"-NRedVideoFix")==0);return flag;}
-namespace VCN { static bool active=true; bool allocated(){return active;} }
+namespace VCN { static bool active=true; bool allocated(){return active;} bool vcn1Ready(){return false;} }
 #define IONew(T,N) (new T[N])
 #define IODelete(P,T,N) delete[] P
 constexpr int KERN_RESOURCE_SHORTAGE=3;
