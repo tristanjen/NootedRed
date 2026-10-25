@@ -132,7 +132,10 @@ int main(){
         vcn1Prepared=false;
         assert(!VCN::vcn1Ready()&&VCN::allocateUVD7v2Engine()==nullptr);
         assert(NRed::singleton().properties.at("NRedVCN1AllocationSkipped")==1);
-        vcn1Object.fill(0);x.hasUVD0Field(vcn1Object.data())=true;x.hasUVD1Field(vcn1Object.data())=true;
+        // 就绪但元类分配失败：引擎槽为空并撤回能力位；未就绪时分配器不参与、能力位不动。
+        vcn1Object.fill(0);vcn1Prepared=true;uvd7v2.object=nullptr;
+        assert(VCN::vcn1Ready());
+        x.hasUVD0Field(vcn1Object.data())=true;x.hasUVD1Field(vcn1Object.data())=true;
         assert(x.allocateHWEngines(vcn1Object.data()));
         assert(!x.hasUVD0Field(vcn1Object.data())&&!x.hasUVD1Field(vcn1Object.data()));
         assert(getMember<void*>(vcn1Object.data(),0x3E0)==nullptr&&getMember<void*>(vcn1Object.data(),0x3E8)==nullptr);
