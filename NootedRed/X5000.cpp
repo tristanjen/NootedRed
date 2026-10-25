@@ -74,6 +74,7 @@ X5000::X5000()
         this->shCountField                 = 0x5C;
         this->hwMaxCUsField                = 0x80;
         this->hasUVD0Field                 = 0x90;
+        this->hasUVD1Field                 = 0x91;
         this->hasVCEField                  = 0x92;
         this->hasVCN0Field                 = 0x93;
         this->hasSDMAPagingQueueField      = 0xA4;
@@ -91,6 +92,7 @@ X5000::X5000()
         this->shCountField                 = 0x5C;
         this->hwMaxCUsField                = 0x80;
         this->hasUVD0Field                 = 0x90;
+        this->hasUVD1Field                 = 0x91;
         this->hasVCEField                  = 0x92;
         this->hasVCN0Field                 = 0x93;
         this->hasSDMAPagingQueueField      = 0xA4;
@@ -113,6 +115,7 @@ X5000::X5000()
             this->shCountField                 = 0x64;
             this->hwMaxCUsField                = 0x98;
             this->hasUVD0Field                 = 0xAC;
+            this->hasUVD1Field                 = 0xAD;
             this->hasVCEField                  = 0xAE;
             this->hasVCN0Field                 = 0xAF;
             this->hasSDMAPagingQueueField      = 0xC0;
@@ -127,6 +130,7 @@ X5000::X5000()
             this->shCountField               = 0x6C;
             this->hwMaxCUsField              = 0xA0;
             this->hasUVD0Field               = 0xB4;
+            this->hasUVD1Field               = 0xB5;
             this->hasVCEField                = 0xB6;
             this->hasVCN0Field               = 0xB7;
             this->hasSDMAPagingQueueField    = 0xBF;
@@ -318,6 +322,19 @@ bool X5000::allocateHWEngines(void* const self)
         (singleton().pm4EngineField + kAMDHWEngineTypeVCN0 * sizeof(void*))(self) = engine;
         if (!engine) { singleton().hasVCN0Field(self) = false; }
     }
+    else if (VCN::vcn1Ready()) {
+        // VCN1：镜像 Vega20 的原生分配——UVD0/UVD1 两个 UVD7v2 实例（解码/编码）。
+        auto* decodeEngine = VCN::allocateUVD7v2Engine();
+        auto* encodeEngine = VCN::allocateUVD7v2Engine();
+        (singleton().pm4EngineField + kAMDHWEngineTypeUVD0 * sizeof(void*))(self) = decodeEngine;
+        (singleton().pm4EngineField + kAMDHWEngineTypeUVD1 * sizeof(void*))(self) = encodeEngine;
+        const bool allocated = decodeEngine != nullptr && encodeEngine != nullptr;
+        if (!allocated) {
+            singleton().hasUVD0Field(self) = false;
+            singleton().hasUVD1Field(self) = false;
+        }
+        NRed::singleton().setProp32("NRedVCN1EnginesAllocated", allocated);
+    }
 
     return true;
 }
@@ -345,6 +362,11 @@ void X5000::wrapSetupAndInitializeHWCapabilities(void* const self)
     singleton().hasUVD0Field(self)               = false;
     singleton().hasVCEField(self)                = false;
     singleton().hasVCN0Field(self)               = VCN::ready();
+    if (VCN::vcn1Ready()) {
+        // VCN1：UVD7v2 双引擎（解码/编码）以 UVD0/UVD1 能力位暴露给原生视频上下文。
+        singleton().hasUVD0Field(self) = true;
+        singleton().hasUVD1Field(self) = true;
+    }
     singleton().hasSDMAPagingQueueField(self)    = false;
     singleton().hasGetAllClockLimitsField(self)  = false;
     if (currentKernelVersion() >= MACOS_10_15) { singleton().dccDisplayableSupportField(self) = true; }

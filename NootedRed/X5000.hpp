@@ -23,6 +23,7 @@ class X5000
     ObjectField<UInt32>            shCountField;
     ObjectField<UInt32>            hwMaxCUsField;
     ObjectField<bool>              hasUVD0Field;
+    ObjectField<bool>              hasUVD1Field;
     ObjectField<bool>              hasVCEField;
     ObjectField<bool>              hasVCN0Field;
     ObjectField<bool>              hasSDMAPagingQueueField;

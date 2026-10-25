@@ -55,7 +55,7 @@ static void setup(unsigned id){
 static void call(){SharedRegionCheckArgs args{0x1000};int value=0;assert(wrappedSharedRegionCheck(drmClient?reinterpret_cast<void*>(217):nullptr,&args,&value)==0&&value==123);}
 int main(){
  unsigned cases=0;
- for(unsigned id:{0x15e7U,0x1636U,0x1638U,0x164cU}){
+ for(unsigned id:{0x15d8U,0x15e7U,0x1636U,0x1638U,0x164cU}){
   setup(id);UserVideoDecodeResolver::Plan plan;
   assert(UserVideoDecodeResolver::resolve(reader,base,devicePatches,plan));
   pages(plan.patches,PatchCount);auto initial=blocks;assert(protections.size()>UserVideoDecodeData::PageCount);
@@ -90,7 +90,7 @@ int main(){
  }
 #ifndef BASELINE
  // 各 FairPlay 客户端共用解码子集，在重排及跨页缓存中仍对全部已选页实施事务回滚。
- for(unsigned id:{0x15e7U,0x1636U,0x1638U,0x164cU})for(const char* name:{"Music","TV","Other"}){
+ for(unsigned id:{0x15d8U,0x15e7U,0x1636U,0x1638U,0x164cU})for(const char* name:{"Music","TV","Other"}){
   clientName=name;
   setup(id);UserVideoDecodeResolver::Plan plan;
   assert(UserVideoDecodeResolver::resolve(reader,base,devicePatches,plan));

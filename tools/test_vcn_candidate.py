@@ -21,8 +21,8 @@ def main():
     stock_source = (test_video_driver_identify.WORK / "native-va-identify.s").read_text()
     stock = WORK / "stock-identify.s"
     stock.write_text(stock_source.replace("_nativeIdentify", "_stockIdentify"))
-    assert devices() == [(0x15E7, 5), (0x1636, 5), (0x1638, 5), (0x164C, 5)]
-    for device, _ in devices():
+    assert devices() == [(0x15D8, 4), (0x15E7, 5), (0x1636, 5), (0x1638, 5), (0x164C, 5)]
+    for device, family in devices():
         per_device = WORK / f"identify-{device:04X}.s"
         source = per_device.read_text().replace("_payload", "_nativeIdentify")
         for label, replacement in [("24", "leaq _fakeHardwareInfo(%rip), %rax"),
@@ -37,11 +37,11 @@ def main():
                                   "uint32_t stockIdentify(uint32_t connection, uint32_t type);")
         fixture = fixture.replace("counts[result]++;", "counts[result]++;\n"
                                   "        auto stock = stockIdentify(0x1234, 1);\n"
-                                  f"        assert(result == (id == {device} ? 5 : stock));")
+                                  f"        assert(result == (id == {device} ? {family} : stock));")
         fixture = fixture.replace("if (id == 0x1638 || id == 0x1636 || id == 0x15dd || id == 0x15d8) { assert(result == 11); }",
-                                  f"if (id == {device}) {{ assert(result == 5); }}")
+                                  f"if (id == {device}) {{ assert(result == {family}); }}")
         fixture = fixture.replace("Cezanne/Renoir/Raven return unsupported enum 11",
-                                  f"selected PCI {device:#06x} returns 5; other PCI classifications preserved")
+                                  f"selected PCI {device:#06x} returns {family}; other PCI classifications preserved")
         asm, cpp = WORK / "candidate-identify.s", WORK / "candidate-identify.cpp"
         asm.write_text(source)
         cpp.write_text(fixture)

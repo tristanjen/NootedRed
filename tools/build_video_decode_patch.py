@@ -9,11 +9,18 @@ import subprocess
 
 from audit_video_driver import symbols
 from metal_cache import CacheReader, array, macho
-from vcn_capabilities import devices
+from vcn_capabilities import device_generations, devices
 from cache_resolver_data import ResolverData
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "build/vcn"
+# VCN2 专用的编码器修正；VCN1（Picasso）没有这些类，按设备退化为原样字节。
+VCN2_ENCODE_LABELS = {
+    "__ZN14Vcn2EncCommand15getFeedbackSizeEv",
+    "__ZN26AVDVcn2AvcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatusInfoPvP15VAVendorTexture",
+    "__ZN27AVDVcn2HevcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatusInfoPvP15VAVendorTexture",
+    "__ZN11Vcn2Encoder15setEncodeParamsEPvP15VAVendorTexture",
+}
 GVA_CHOICE_ADDRESS = 0x7FFA0C59BBAC
 GVA_CHOICE_SIZE = 1136
 GVA_CHOICE_SHA256 = "b7c725552045a9db206ab2eed4edda7ea3d27a29de2feee782204c362764a33d"
@@ -291,19 +298,28 @@ def main():
         header += "};\n"
         header += f"inline constexpr UInt32 FairPlayDecodeMask = 0x{decode_mask:X}U;\n"
         identify_index = next(i for i, record in enumerate(records) if record['label'] == '__ZN17VAAcceleratorInfo8identifyEjj')
+        generations = device_generations()
         device_records = []
-        for device, _ in capabilities:
+        for device, family in capabilities:
+            is_vcn1 = generations.get(device) == 'VCN1'
             variants = [dict(record) for record in records]
             variants[identify_index]['patched'] = identify_variants[device].hex()
+            if is_vcn1:
+                # VCN1 无 Vcn2 编码器实现：编码器修正按设备退化为原样，布局与解码补丁保持一致。
+                for record in variants:
+                    if record['label'] in VCN2_ENCODE_LABELS:
+                        record['patched'] = record['original']
             device_records.append({'device_id': device, 'records': variants})
             if device == 0x1638:
                 continue
             suffix = f'{device:04X}'
             header += array(f'Identify{suffix}', identify_variants[device])
             header += f'inline constexpr Patch Patches{suffix}[] = {{\n'
-            for i in range(len(records)):
+            for i, record in enumerate(records):
                 if i == identify_index:
                     header += (f'    {{Patches[{i}].offset, Original{i}, Identify{suffix}, sizeof(Original{i})}},\n')
+                elif is_vcn1 and record['label'] in VCN2_ENCODE_LABELS:
+                    header += f'    {{Patches[{i}].offset, Original{i}, Original{i}, sizeof(Original{i})}},\n'
                 else:
                     header += f'    Patches[{i}],\n'
             header += '};\n'

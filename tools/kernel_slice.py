@@ -13,6 +13,11 @@ VCN_VTABLE_CLASSES = re.compile(
     r"Vega10Hardware|Vega12Hardware|Vega20Hardware|GFX9Hardware|Hardware")
 
 
+def decode_pointer(value):
+    """内核集合虚表指针为链式重定位编码；低位 28 位才是 vm 目标，高位是链式字段。"""
+    return value & 0xFFFFFFF if value >= 0x10000000 else value
+
+
 class SliceImage:
     """fileset 子项切片；符号经由共享 LINKEDIT 伴生文件解析。"""
 
@@ -123,7 +128,8 @@ class SliceImage:
         end = min(a for a in self.symbols.values() if a > address)
         entries = struct.unpack("<" + "Q" * ((end - address - 16) // 8), self.read(address + 16, end - address - 16))
         table = {"symbol": vtable_symbol, "address": address, "slots": []}
-        for i, target in enumerate(entries):
+        for i, encoded in enumerate(entries):
+            target = decode_pointer(encoded)
             slot = {"offset": i * 8, "target": target, "symbol": self.reverse.get(target)}
             following = min((a for a in self.symbols.values() if a > target), default=target)
             if target and 0 < following - target <= 32:

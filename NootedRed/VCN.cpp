@@ -21,6 +21,11 @@ namespace
                                   KernelPatcher::KextInfo::Unloaded};
     bool                    requested{false}, has5000{false}, has6000{false}, hooks{false}, engineAllocated{false};
     bool                    loadAttempted{false}, loadCompleted{false};
+    // VCN1（Raven/Picasso）全部使用 X5000 原生类，不加载 X6000。
+    bool                    vcn1Prepared{false};
+    OSMetaClass*            uvd7v2EngineMC{nullptr};
+    mach_vm_address_t       smlQueryOriginal{0}, uvd7v2InitHardwareOriginal{0};
+    UInt32                  uvd7v2InitHardwareCount{0}, smlQueryServedCount{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -47,6 +52,12 @@ namespace
         return requested && VCNCapabilities::rejection(NRed::singleton().getDeviceID(), currentKernelVersion()) == 0;
     }
 
+    bool vcn1Device()
+    {
+        const auto* capability = VCNCapabilities::findDevice(NRed::singleton().getDeviceID());
+        return capability && capability->generation == VCNCapabilities::Generation::VCN1 && capability->vaFamily != 0;
+    }
+
     bool acceleratorStart(void* self, IOService* provider)
     {
         auto  original = reinterpret_cast<bool (*)(void*, IOService*)>(acceleratorStartOriginal);
@@ -58,13 +69,23 @@ namespace
         }
         bool expected = false;
         if (__atomic_compare_exchange_n(&loadAttempted, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            // 在驱动 start 内请求可选加载，避免插件库依赖和加载回调内的递归请求。
-            const auto status   = OSKextLoadKextWithIdentifier("com.apple.kext.AMDRadeonX6000");
-            const bool complete = status == kOSReturnSuccess && has5000 && has6000 && hooks;
-            __atomic_store_n(&loadCompleted, complete, __ATOMIC_RELEASE);
-            NRed::singleton().setProp32("NRedVCNNativeLoadStatus", static_cast<UInt32>(status));
-            NRed::singleton().setProp32("NRedVCNNativeLoadReady", complete);
-            SYSLOG("VCN", "native load status=0x%X prepared=%u", status, complete);
+            if (vcn1Device()) {
+                // VCN1 全部使用 X5000 原生类；无需可选加载 X6000。
+                const bool complete = has5000 && vcn1Prepared;
+                __atomic_store_n(&loadCompleted, complete, __ATOMIC_RELEASE);
+                NRed::singleton().setProp32("NRedVCNNativeLoadStatus", kOSReturnSuccess);
+                NRed::singleton().setProp32("NRedVCNNativeLoadReady", complete);
+                SYSLOG("VCN", "VCN1 native path prepared=%u", complete);
+            }
+            else {
+                // 在驱动 start 内请求可选加载，避免插件库依赖和加载回调内的递归请求。
+                const auto status   = OSKextLoadKextWithIdentifier("com.apple.kext.AMDRadeonX6000");
+                const bool complete = status == kOSReturnSuccess && has5000 && has6000 && hooks;
+                __atomic_store_n(&loadCompleted, complete, __ATOMIC_RELEASE);
+                NRed::singleton().setProp32("NRedVCNNativeLoadStatus", static_cast<UInt32>(status));
+                NRed::singleton().setProp32("NRedVCNNativeLoadReady", complete);
+                SYSLOG("VCN", "native load status=0x%X prepared=%u", status, complete);
+            }
         }
         const auto result = original(self, provider);
         NRed::singleton().setProp32("NRedVCNAcceleratorStarted", result);
@@ -187,6 +208,73 @@ namespace
         return result;
     }
 
+    // UVD7v2 引擎 init 经 SML 查询选择子 0x0C 取 VCN 基址；Raven/Picasso 与 Vega10 同基址表。
+    int smlQueryBase(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out)
+    {
+        if (selector == 0xC && out != nullptr) {
+            *static_cast<UInt32*>(out) = 0x7800;    // VCN_BASE__INST0_SEG0
+            auto count = __atomic_fetch_add(&smlQueryServedCount, 1U, __ATOMIC_RELAXED);
+            if (count < 16) { SYSLOG("VCN1", "SML base query served: isEncode=%u flag=%u", isEncode, flag); }
+            return 0;
+        }
+        return reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32, void*)>(smlQueryOriginal)(self, selector,
+                                                                                                 isEncode, flag, out);
+    }
+
+    bool uvd7v2InitHardware(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(uvd7v2InitHardwareOriginal)(self);
+        NRed::singleton().setProp32("NRedVCN1LastHardwareInit", result);
+        auto count = __atomic_fetch_add(&uvd7v2InitHardwareCount, 1U, __ATOMIC_RELAXED);
+        if (count < 16) { SYSLOG("VCN1", "UVD7v2 initHardware result=%u", result); }
+        return result;
+    }
+
+    // VCN1 守卫与钩子：UVD7v2 虚表槽位与具名符号一致后，才接管 SML 基址查询（选择子 0x0C）。
+    bool prepareVCN1(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
+    {
+        mach_vm_address_t engineInit{0}, engineInitHardware{0}, engineVTable{0}, smlVTable{0};
+        bool ok = resolve(patcher, id, "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine10gMetaClassE", uvd7v2EngineMC, slide,
+                          size);
+        ok &= resolve(patcher, id,
+                      "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine4initEP30AMDRadeonX5000_IAMDHWInterface20_eAMD_HW_ENGINE_"
+                      "TYPE",
+                      engineInit, slide, size);
+        ok &= resolve(patcher, id, "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine12initHardwareEv", engineInitHardware, slide,
+                      size);
+        ok &= resolve(patcher, id, "__ZTV32AMDRadeonX5000_AMDUVD7v2HWEngine", engineVTable, slide, size);
+        ok &= resolve(patcher, id, "__ZTV34AMDRadeonX5000_AMDSMLGFX9Interface", smlVTable, slide, size);
+        if (!ok) { return false; }
+        // __ZTV 的两个头部槽不属于槽位地址；init=+0x118、initHardware=+0x368（24H32 已核对）。
+        const auto slot = [engineVTable, slide, size](const UInt32 offset) -> mach_vm_address_t {
+            if (engineVTable < slide || offset > size || engineVTable + 16 + offset > slide + size - sizeof(void*)) {
+                return 0;
+            }
+            mach_vm_address_t target{0};
+            memcpy(&target, reinterpret_cast<void*>(engineVTable + 16 + offset), sizeof(target));
+            return target;
+        };
+        if (slot(0x118) != engineInit || slot(0x368) != engineInitHardware) {
+            SYSLOG("VCN1", "UVD7v2 vtable mismatch: init=%p/%p hw=%p/%p", reinterpret_cast<void*>(slot(0x118)),
+                   reinterpret_cast<void*>(engineInit), reinterpret_cast<void*>(slot(0x368)),
+                   reinterpret_cast<void*>(engineInitHardware));
+            return false;
+        }
+        const mach_vm_address_t smlSlot = smlVTable + 16 + 0x58;
+        if (smlVTable < slide || smlSlot > slide + size - sizeof(void*)) { return false; }
+        memcpy(&smlQueryOriginal, reinterpret_cast<void*>(smlSlot), sizeof(smlQueryOriginal));
+        if (smlQueryOriginal == 0) { return false; }
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
+        const mach_vm_address_t hook = reinterpret_cast<mach_vm_address_t>(&smlQueryBase);
+        memcpy(reinterpret_cast<void*>(smlSlot), &hook, sizeof(hook));
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        // initHardware 路由仅作诊断，失败不影响接入。
+        KernelPatcher::RouteRequest route{"__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine12initHardwareEv", uvd7v2InitHardware,
+                                          uvd7v2InitHardwareOriginal};
+        if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        return true;
+    }
+
     bool install(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size)
     {
         if (size < 6 || slide > ~mach_vm_address_t{0} - size) { return false; }
@@ -260,11 +348,13 @@ namespace
 void VCN::init()
 {
     requested = checkKernelArgument("-NRedVideoFix");
+    // X6000 仅 VCN2.2 设备需要可选加载；注册保持不变，加载决策在 acceleratorStart 内按设备分流。
     if (requested) { lilu.onKextLoadForce(&x6000); }
 }
 bool VCN::ready()
 {
-    return supported() && __atomic_load_n(&loadCompleted, __ATOMIC_ACQUIRE) && has5000 && has6000 && hooks;
+    return supported() && !vcn1Device() && __atomic_load_n(&loadCompleted, __ATOMIC_ACQUIRE) && has5000 && has6000
+           && hooks;
 }
 bool  VCN::allocated() { return ready() && engineAllocated; }
 void* VCN::allocateEngine()
@@ -278,6 +368,16 @@ void* VCN::allocateEngine()
     if (!engineAllocated) { __atomic_store_n(&loadCompleted, false, __ATOMIC_RELEASE); }
     NRed::singleton().setProp32("NRedVCNEngineAllocated", engineAllocated);
     return engine;
+}
+
+bool VCN::vcn1Ready() { return supported() && vcn1Device() && vcn1Prepared && uvd7v2EngineMC != nullptr; }
+void* VCN::allocateUVD7v2Engine()
+{
+    if (!vcn1Ready()) {
+        NRed::singleton().setProp32("NRedVCN1AllocationSkipped", requested);
+        return nullptr;
+    }
+    return uvd7v2EngineMC->alloc();
 }
 
 void VCN::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size)
@@ -305,36 +405,43 @@ void VCN::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide
         auto& target  = old ? pairs[i].oldClass : pairs[i].newClass;
         ok           &= resolve(patcher, id, name, target, slide, size);
     }
-    if (old) {
-        ok &= resolve(patcher, id, "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient5startEP9IOService", clientStart5000,
-                      slide, size);
-        ok &= resolve(patcher, id, "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient4stopEP9IOService", clientStop5000,
-                      slide, size);
-        ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDAccelShared11SurfaceCopyEPjyP12IOAccelEvent", copy5000,
-                      slide, size);
-        ok &=
-            resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", notifyAccess, slide, size);
-        KernelPatcher::RouteRequest routes[] = {
-            {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator5startEP9IOService", acceleratorStart,
-             acceleratorStartOriginal},
-            {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator9newSharedEv", newShared, newSharedOriginal},
-            {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator19newSharedUserClientEv", newClient, newClientOriginal},
-            {"__ZN41AMDRadeonX5000_AMDGFX9GraphicsAccelerator15newVideoContextEv", newVideo, newVideoOriginal},
-            {"__ZN31AMDRadeonX5000_IAMDSMLInterface18createSMLInterfaceEj", createSML, sml5000},
-        };
-        if (ok) {
-            ok = patcher.routeMultiple(id, routes, arrsize(routes), slide, size);
-            patcher.clearError();
-        }
-        has5000 = ok;
-        if (ok) {
-            KernelPatcher::RouteRequest route{"__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass", safeCast,
-                                              safeCastOriginal};
-            ok = patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1);
-            patcher.clearError();
+        if (old) {
+            ok &= resolve(patcher, id, "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient5startEP9IOService", clientStart5000,
+                          slide, size);
+            ok &= resolve(patcher, id, "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient4stopEP9IOService", clientStop5000,
+                          slide, size);
+            ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDAccelShared11SurfaceCopyEPjyP12IOAccelEvent", copy5000,
+                          slide, size);
+            ok &=
+                resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", notifyAccess, slide, size);
+            KernelPatcher::RouteRequest routes[] = {
+                {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator5startEP9IOService", acceleratorStart,
+                 acceleratorStartOriginal},
+                {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator9newSharedEv", newShared, newSharedOriginal},
+                {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator19newSharedUserClientEv", newClient, newClientOriginal},
+                {"__ZN41AMDRadeonX5000_AMDGFX9GraphicsAccelerator15newVideoContextEv", newVideo, newVideoOriginal},
+                {"__ZN31AMDRadeonX5000_IAMDSMLInterface18createSMLInterfaceEj", createSML, sml5000},
+            };
+            if (ok) {
+                ok = patcher.routeMultiple(id, routes, arrsize(routes), slide, size);
+                patcher.clearError();
+            }
             has5000 = ok;
+            if (ok) {
+                KernelPatcher::RouteRequest route{"__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass", safeCast,
+                                                  safeCastOriginal};
+                ok = patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1);
+                patcher.clearError();
+                has5000 = ok;
+            }
+            if (vcn1Device()) {
+                // VCN1：X5000 原生 UVD7v2 引擎与 SML 基址查询；与 VCN2 桥接互不影响。
+                vcn1Prepared = prepareVCN1(patcher, id, slide, size);
+                NRed::singleton().setProp32("NRedVCN1Prepared", vcn1Prepared);
+                if (!vcn1Prepared) { NRed::singleton().setProp32("NRedVCN1AbiRejected", 1); }
+                SYSLOG("VCN", "VCN1 prepared=%u", vcn1Prepared);
+            }
         }
-    }
     else {
         ok &= resolve(patcher, id, "__ZN30AMDRadeonX6000_AMDVCN2HWEngine10gMetaClassE", engineClass, slide, size);
         ok &= resolve(patcher, id, "__ZN29AMDRadeonX6000_AMDAccelShared10gMetaClassE", sharedClass, slide, size);

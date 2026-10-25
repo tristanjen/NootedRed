@@ -209,7 +209,7 @@ namespace
             fairPlayDecode = true;
             if (pid > 0) { fairPlayPID = static_cast<UInt32>(pid); }
         }
-        if (!VCN::allocated() || !devicePatches) {
+        if ((!VCN::allocated() && !VCN::vcn1Ready()) || !devicePatches) {
             stage(Stage::NoMap, fairPlayPID);
             return result;
         }

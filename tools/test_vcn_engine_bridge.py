@@ -14,7 +14,8 @@ def main():
     (stubs / 'IOTypes.h').write_text('#pragma once\n#include <cstdint>\nusing UInt8=uint8_t;using UInt32=uint32_t;using UInt64=uint64_t;\n')
     vcn = (ROOT / 'NootedRed/VCN.cpp').read_text()
     functions = '\n'.join(function(vcn, prefix) for prefix in [
-        'bool supported()', 'bool VCN::ready()', 'bool  VCN::allocated()', 'void* VCN::allocateEngine()',
+        'bool supported()', 'bool vcn1Device()', 'bool VCN::ready()', 'bool  VCN::allocated()', 'void* VCN::allocateEngine()',
+        'bool VCN::vcn1Ready()', 'void* VCN::allocateUVD7v2Engine()',
         'OSMetaClassBase* safeCast(', 'void* createSML(', 'void signalWork('])
     allocation = function((ROOT / 'NootedRed/X5000.cpp').read_text(), 'bool X5000::allocateHWEngines(')
     fixture = r'''
@@ -40,6 +41,7 @@ struct NRed {
 unsigned kernelMinor=6;
 const PenguinWizardry::KernelVersion& currentKernelVersion(){static std::optional<PenguinWizardry::KernelVersion> current;return current.emplace(25,kernelMinor);}
 bool requested=true,loadCompleted=true,has5000=true,has6000=true,hooks=true,engineAllocated=false;
+bool vcn1Prepared=false;
 struct OSMetaClass {
     unsigned size=64;void* object=nullptr;
     unsigned getClassSize()const{return size;}
@@ -49,14 +51,16 @@ struct OSMetaClassBase {const OSMetaClass* meta;const OSMetaClass* getMetaClass(
 struct Pair {const OSMetaClass* oldClass;const OSMetaClass* newClass;};
 Pair pairs[4]{};
 OSMetaClass engine;OSMetaClass* engineClass=&engine;
+OSMetaClass uvd7v2;OSMetaClass* uvd7v2EngineMC=nullptr;
 mach_vm_address_t safeCastOriginal=0,sml5000=0,sml6000=0,signalOriginal=0;
 void (*notifyAccess)(void*)=nullptr;
-namespace VCN {bool ready();bool allocated();void* allocateEngine();}
+namespace VCN {bool ready();bool allocated();void* allocateEngine();bool vcn1Ready();void* allocateUVD7v2Engine();}
 template<typename T>T& getMember(void* object,unsigned offset){return *reinterpret_cast<T*>(static_cast<uint8_t*>(object)+offset);}
 template<typename T>struct Field {unsigned offset;Field operator+(unsigned delta)const{return {offset+delta};}T& operator()(void* object){return getMember<T>(object,offset);}};
 struct X5000 {
     OSMetaClass pm4,sdma;OSMetaClass *pm4EngineMC=&pm4,*sdmaEngineMC=&sdma;
     Field<void*> pm4EngineField{0x3B8},sdma0EngineField{0x3C0};Field<bool> hasVCN0Field{0xB7};
+    Field<bool> hasUVD0Field{0xB4},hasUVD1Field{0xB5};
     static X5000& singleton(){static X5000 x;return x;}
     bool allocateHWEngines(void* const);
 };
@@ -113,11 +117,33 @@ int main(){
         NRed::singleton().device=id;loadCompleted=has5000=has6000=hooks=true;
         assert(!VCN::ready()&&VCN::allocateEngine()==nullptr);
     }
+    // VCN1（Picasso）：X5000 原生 UVD7v2 双引擎（UVD0/UVD1 槽），不依赖 X6000 桥接状态。
+    {
+        NRed::singleton().device=0x15D8U;loadCompleted=has6000=false;has5000=hooks=true;
+        unsigned uvdObject=4;uvd7v2.object=&uvdObject;uvd7v2EngineMC=&uvd7v2;vcn1Prepared=true;
+        assert(VCN::vcn1Ready()&&!VCN::ready()&&!VCN::allocated());
+        alignas(8) std::array<uint8_t,0x408> vcn1Object{};
+        assert(x.allocateHWEngines(vcn1Object.data()));
+        assert(getMember<void*>(vcn1Object.data(),0x3B8)==&pm4Object);
+        assert(getMember<void*>(vcn1Object.data(),0x3C0)==&sdmaObject);
+        assert(getMember<void*>(vcn1Object.data(),0x3E0)==&uvdObject);
+        assert(getMember<void*>(vcn1Object.data(),0x3E8)==&uvdObject);
+        assert(NRed::singleton().properties.at("NRedVCN1EnginesAllocated")==1);
+        vcn1Prepared=false;
+        assert(!VCN::vcn1Ready()&&VCN::allocateUVD7v2Engine()==nullptr);
+        assert(NRed::singleton().properties.at("NRedVCN1AllocationSkipped")==1);
+        vcn1Object.fill(0);x.hasUVD0Field(vcn1Object.data())=true;x.hasUVD1Field(vcn1Object.data())=true;
+        assert(x.allocateHWEngines(vcn1Object.data()));
+        assert(!x.hasUVD0Field(vcn1Object.data())&&!x.hasUVD1Field(vcn1Object.data()));
+        assert(getMember<void*>(vcn1Object.data(),0x3E0)==nullptr&&getMember<void*>(vcn1Object.data(),0x3E8)==nullptr);
+        assert(NRed::singleton().properties.at("NRedVCN1EnginesAllocated")==0);
+        uvd7v2EngineMC=nullptr;NRed::singleton().device=0x1638U;
+    }
     NRed::singleton().device=0x1638;
     for(bool* state:{&requested,&loadCompleted,&has5000,&has6000,&hooks}){
         *state=false;assert(!VCN::ready());*state=true;
     }
-    puts("PASS: four VCN2 engine slots, allocation failure, SML selection, cast size checks and GFX access routing");
+    puts("PASS: four VCN2 engine slots, VCN1 dual UVD7v2 slots, allocation failures, SML selection, cast size checks and GFX access routing");
 }
 '''.replace('FUNCTIONS', functions).replace('ALLOCATION', allocation)
     util = WORK / "stubs/Headers"

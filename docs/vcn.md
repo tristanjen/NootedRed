@@ -3,15 +3,22 @@
 ## 范围
 
 实验性接入按 `VCNCapabilities.hpp` 的能力表选择设备，内核与用户态共用这一判定。
-当前开放 PCI `1002:15E7 / 1636 / 1638 / 164C` 的 VCN 2.2 路径；
-`1002:15D8 / 15DD` 保留分类但不接入 VCN1。能力表必须与 NRed 原有设备分类一致，
+当前开放 PCI `1002:15E7 / 1636 / 1638 / 164C` 的 VCN 2.2 路径与 `1002:15D8` 的 VCN1 路径；
+`1002:15DD` 保留分类但暂不接入。能力表必须与 NRed 原有设备分类一致，
 生成器发现重复、遗漏或未经核实的 VA 分类时拒绝生成。
 
 | PCI ID | NRed 家族 | 视频代际 | 本次接入 |
 | --- | --- | --- | --- |
-| `15D8 / 15DD` | Picasso / Raven（含 Raven2） | VCN 1.x | 拒绝，尚未实现 VCN1 桥接 |
+| `15D8` | Picasso | VCN 1.x | 实验路径：X5000 原生 UVD7v2 双引擎（UVD0 解码 / UVD1 编码），SML 基址查询按 Raven 表返回 0x7800；用户态映射 VA 分类 4（Vega 20）；Vcn2 编码器补丁按设备退化为原样 |
+| `15DD` | Raven（含 Raven2） | VCN 1.x | 拒绝，尚未实现 |
 | `1636 / 164C` | Renoir 系列 | VCN 2.2 | 显式启用的实验路径，待实机验收 |
 | `1638 / 15E7` | Cezanne / Barcelo 系列 | VCN 2.2 | 保留 Cezanne 路径，新增设备待实机验收 |
+
+VCN1 的接入不加载 X6000：内核侧在 `X5000::allocateHWEngines` 内按 Vega20 原生形态分配两个
+`AMDUVD7v2HWEngine`（引擎数组槽 5/6），能力位以 `hasUVD0/hasUVD1` 暴露；`AMDSMLGFX9Interface`
+虚表 +0x58 的 IP 基址查询（选择子 0x0C）被接管为返回 Raven 的 VCN 基址。详见
+[VCN1 分析](vcn1-analysis.md)。诊断字段为 `NRedVCN1*`（Prepared/EnginesAllocated/LastHardwareInit/
+SMLBaseServed）。
 
 代际依据 [Linux 内核 AMD 硬件组件表](https://www.kernel.org/doc/html/v6.17/gpu/amdgpu/amd-hardware-list-info.html)。
 同一视频代际是复用现有桥接的依据，不代表 Apple 驱动已经支持或新设备已经硬解成功。
