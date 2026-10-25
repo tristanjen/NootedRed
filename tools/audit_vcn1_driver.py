@@ -238,7 +238,7 @@ def kernel_collection_extract(report):
                 cursor, entries = 0, []
                 for _ in range(ncmds):
                     cmd, size = struct.unpack_from("<II", commands, cursor)
-                    if cmd == 0x35:    # LC_FILESET_ENTRY
+                    if cmd == 0x80000035:    # LC_FILESET_ENTRY (0x35 | LC_REQ_DYLD)
                         vmaddr, fileoff = struct.unpack_from("<QQ", commands, cursor + 8)
                         entry_id = struct.unpack_from("<I", commands, cursor + 24)[0]
                         end = commands.find(b"\0", cursor + entry_id)
