@@ -1,6 +1,7 @@
 """在 CPU 上执行核实过的原生 VA 识别函数；仅替换 IOKit 出口与全局缓冲地址。"""
 from pathlib import Path
 import hashlib
+import json
 import subprocess
 
 from audit_video_driver import symbols
@@ -9,6 +10,16 @@ from metal_cache import CACHE, CacheReader
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "build/vcn"
 EXPECTED = "d7c579bce55c5724ec241f7f9abece9d0f23b1c30178d2f539fc0cabf41dc0bd"
+IDENTIFY = "__ZN17VAAcceleratorInfo8identifyEjj"
+
+
+def open_cache():
+    """默认校验 Tahoe 档案；缓存 UUID 不符时回退到 Sequoia 档案与其函数摘要。"""
+    try:
+        return CacheReader(), EXPECTED
+    except ValueError:
+        profile = json.loads((ROOT / "tools/fixtures/sequoia-compat.json").read_text())
+        return CacheReader(CACHE, profile["uuid"]), profile["video"][IDENTIFY]["sha256"]
 
 
 def byte_lines(data):
@@ -17,16 +28,16 @@ def byte_lines(data):
 
 def main():
     WORK.mkdir(parents=True, exist_ok=True)
-    cache = CacheReader()
+    cache, expected = open_cache()
     try:
         lines = (CACHE / "dyld_shared_cache_x86_64h.map").read_text().splitlines()
         image = "/System/Library/Extensions/AMDRadeonVADriver2.bundle/Contents/MacOS/AMDRadeonVADriver2"
         base = int(lines[lines.index(image) + 1].split()[1], 16)
         names, _ = symbols(cache.read, base)
-        address = names["__ZN17VAAcceleratorInfo8identifyEjj"]
+        address = names[IDENTIFY]
         end = min(a for a in names.values() if a > address)
         native = cache.read(address, end - address)
-        if len(native) != 448 or hashlib.sha256(native).hexdigest() != EXPECTED:
+        if len(native) != 448 or hashlib.sha256(native).hexdigest() != expected:
             raise ValueError("VA 识别函数版本不匹配，拒绝执行")
         assert native[0x24:0x27] == b"\x48\x8d\x05"
         assert native[0x48] == 0xE8
