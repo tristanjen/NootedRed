@@ -15,7 +15,7 @@ def main():
     vcn = (ROOT / 'NootedRed/VCN.cpp').read_text()
     functions = '\n'.join(function(vcn, prefix) for prefix in [
         'bool supported()', 'bool vcn1Device()', 'bool VCN::ready()', 'bool  VCN::allocated()', 'void* VCN::allocateEngine()',
-        'bool VCN::vcn1Ready()', 'void* VCN::allocateUVD7v2Engine()',
+        'bool VCN::vcn1Ready()', 'void* VCN::allocateUVD7Engine()',
         'OSMetaClassBase* safeCast(', 'void* createSML(', 'void signalWork('])
     allocation = function((ROOT / 'NootedRed/X5000.cpp').read_text(), 'bool X5000::allocateHWEngines(')
     fixture = r'''
@@ -51,10 +51,10 @@ struct OSMetaClassBase {const OSMetaClass* meta;const OSMetaClass* getMetaClass(
 struct Pair {const OSMetaClass* oldClass;const OSMetaClass* newClass;};
 Pair pairs[4]{};
 OSMetaClass engine;OSMetaClass* engineClass=&engine;
-OSMetaClass uvd7v2;OSMetaClass* uvd7v2EngineMC=nullptr;
+OSMetaClass uvd7;OSMetaClass* uvd7EngineMC=nullptr;
 mach_vm_address_t safeCastOriginal=0,sml5000=0,sml6000=0,signalOriginal=0;
 void (*notifyAccess)(void*)=nullptr;
-namespace VCN {bool ready();bool allocated();void* allocateEngine();bool vcn1Ready();void* allocateUVD7v2Engine();}
+namespace VCN {bool ready();bool allocated();void* allocateEngine();bool vcn1Ready();void* allocateUVD7Engine();}
 template<typename T>T& getMember(void* object,unsigned offset){return *reinterpret_cast<T*>(static_cast<uint8_t*>(object)+offset);}
 template<typename T>struct Field {unsigned offset;Field operator+(unsigned delta)const{return {offset+delta};}T& operator()(void* object){return getMember<T>(object,offset);}};
 struct X5000 {
@@ -117,36 +117,36 @@ int main(){
         NRed::singleton().device=id;loadCompleted=has5000=has6000=hooks=true;
         assert(!VCN::ready()&&VCN::allocateEngine()==nullptr);
     }
-    // VCN1（Picasso）：X5000 原生 UVD7v2 双引擎（UVD0/UVD1 槽），不依赖 X6000 桥接状态。
+    // VCN1（Picasso，Vega10 世代）：X5000 原生单个 UVD7 解码引擎占用 UVD0 槽，不依赖 X6000 桥接状态。
     {
         NRed::singleton().device=0x15D8U;loadCompleted=has6000=false;has5000=hooks=true;
-        unsigned uvdObject=4;uvd7v2.object=&uvdObject;uvd7v2EngineMC=&uvd7v2;vcn1Prepared=true;
+        unsigned uvdObject=4;uvd7.object=&uvdObject;uvd7EngineMC=&uvd7;vcn1Prepared=true;
         assert(VCN::vcn1Ready()&&!VCN::ready()&&!VCN::allocated());
         alignas(8) std::array<uint8_t,0x408> vcn1Object{};
         assert(x.allocateHWEngines(vcn1Object.data()));
         assert(getMember<void*>(vcn1Object.data(),0x3B8)==&pm4Object);
         assert(getMember<void*>(vcn1Object.data(),0x3C0)==&sdmaObject);
         assert(getMember<void*>(vcn1Object.data(),0x3E0)==&uvdObject);
-        assert(getMember<void*>(vcn1Object.data(),0x3E8)==&uvdObject);
+        assert(getMember<void*>(vcn1Object.data(),0x3E8)==nullptr);
         assert(NRed::singleton().properties.at("NRedVCN1EnginesAllocated")==1);
         vcn1Prepared=false;
-        assert(!VCN::vcn1Ready()&&VCN::allocateUVD7v2Engine()==nullptr);
+        assert(!VCN::vcn1Ready()&&VCN::allocateUVD7Engine()==nullptr);
         assert(NRed::singleton().properties.at("NRedVCN1AllocationSkipped")==1);
         // 就绪但元类分配失败：引擎槽为空并撤回能力位；未就绪时分配器不参与、能力位不动。
-        vcn1Object.fill(0);vcn1Prepared=true;uvd7v2.object=nullptr;
+        vcn1Object.fill(0);vcn1Prepared=true;uvd7.object=nullptr;
         assert(VCN::vcn1Ready());
-        x.hasUVD0Field(vcn1Object.data())=true;x.hasUVD1Field(vcn1Object.data())=true;
+        x.hasUVD0Field(vcn1Object.data())=true;x.hasUVD1Field(vcn1Object.data())=false;
         assert(x.allocateHWEngines(vcn1Object.data()));
         assert(!x.hasUVD0Field(vcn1Object.data())&&!x.hasUVD1Field(vcn1Object.data()));
-        assert(getMember<void*>(vcn1Object.data(),0x3E0)==nullptr&&getMember<void*>(vcn1Object.data(),0x3E8)==nullptr);
+        assert(getMember<void*>(vcn1Object.data(),0x3E0)==nullptr);
         assert(NRed::singleton().properties.at("NRedVCN1EnginesAllocated")==0);
-        uvd7v2EngineMC=nullptr;NRed::singleton().device=0x1638U;
+        uvd7EngineMC=nullptr;NRed::singleton().device=0x1638U;
     }
     NRed::singleton().device=0x1638;
     for(bool* state:{&requested,&loadCompleted,&has5000,&has6000,&hooks}){
         *state=false;assert(!VCN::ready());*state=true;
     }
-    puts("PASS: four VCN2 engine slots, VCN1 dual UVD7v2 slots, allocation failures, SML selection, cast size checks and GFX access routing");
+    puts("PASS: four VCN2 engine slots, VCN1 single UVD7 decode slot, allocation failures, SML selection, cast size checks and GFX access routing");
 }
 '''.replace('FUNCTIONS', functions).replace('ALLOCATION', allocation)
     util = WORK / "stubs/Headers"

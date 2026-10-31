@@ -323,16 +323,11 @@ bool X5000::allocateHWEngines(void* const self)
         if (!engine) { singleton().hasVCN0Field(self) = false; }
     }
     else if (VCN::vcn1Ready()) {
-        // VCN1：镜像 Vega20 的原生分配——UVD0/UVD1 两个 UVD7v2 实例（解码/编码）。
-        auto* decodeEngine = VCN::allocateUVD7v2Engine();
-        auto* encodeEngine = VCN::allocateUVD7v2Engine();
+        // VCN1（Vega10 世代）：原生只有一个 UVD7 引擎，固件走 SML 寄存器写消息而不是 CAIL。
+        auto* decodeEngine = VCN::allocateUVD7Engine();
         (singleton().pm4EngineField + kAMDHWEngineTypeUVD0 * sizeof(void*))(self) = decodeEngine;
-        (singleton().pm4EngineField + kAMDHWEngineTypeUVD1 * sizeof(void*))(self) = encodeEngine;
-        const bool allocated = decodeEngine != nullptr && encodeEngine != nullptr;
-        if (!allocated) {
-            singleton().hasUVD0Field(self) = false;
-            singleton().hasUVD1Field(self) = false;
-        }
+        const bool allocated = decodeEngine != nullptr;
+        if (!allocated) { singleton().hasUVD0Field(self) = false; }
         NRed::singleton().setProp32("NRedVCN1EnginesAllocated", allocated);
     }
 
@@ -363,9 +358,9 @@ void X5000::wrapSetupAndInitializeHWCapabilities(void* const self)
     singleton().hasVCEField(self)                = false;
     singleton().hasVCN0Field(self)               = VCN::ready();
     if (VCN::vcn1Ready()) {
-        // VCN1：UVD7v2 双引擎（解码/编码）以 UVD0/UVD1 能力位暴露给原生视频上下文。
+        // VCN1：单个 UVD7 引擎只承担解码；Vega10 的编码在 VCE，Raven 没有对应类。
         singleton().hasUVD0Field(self) = true;
-        singleton().hasUVD1Field(self) = true;
+        singleton().hasUVD1Field(self) = false;
     }
     singleton().hasSDMAPagingQueueField(self)    = false;
     singleton().hasGetAllClockLimitsField(self)  = false;

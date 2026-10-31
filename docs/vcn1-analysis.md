@@ -85,9 +85,8 @@ hash 匹配，作者静态数据可复用）。
 - fork 的 VCN2 方案：可选加载 X6000，把 `AMDVCN2HWEngine` 嫁接进 X5000 的
   `kAMDHWEngineTypeVCN0`(8) 槽 + 跨驱动类桥接（safeCast/ClientStart/SurfaceCopy/SML）。
 - **VCN1 方案无需跨驱动**：全部类原生在 X5000。要点：
-  1. `X5000::allocateHWEngines` 为 VCN1 设备加配两个 `AMDUVD7v2HWEngine`
-     （槽 5/6，即 `pm4EngineField+5*8`、`+6*8`），并 `hasUVD0Field=true`
-     （+0x90；必要时 UVD1 对应位）——**不是** hasVCN0；
+  1. `X5000::allocateHWEngines` 为 VCN1 设备加配 **一个** `AMDUVD7HWEngine`
+     （槽 5，即 `pm4EngineField+5*8`，见 §6），并 `hasUVD0Field=true`——**不是** hasVCN0；
   2. X5000 原生 `newVideoContext`/AccelShared/AccelUVDContext 路径保持原生；
   3. HWLibs/SML 查询 0x0C 需对 APU 返回 Raven VCN 基址（fork 已 hook
      `IAMDSMLInterface::createSMLInterface`，注入点现成；具体 SML 方法 0x58 的
@@ -97,7 +96,8 @@ hash 匹配，作者静态数据可复用）。
 
 ## 3. 已核实/待办
 
-- 已核实：15.8.1 与作者档案逐函数匹配；用户态 15D8 补丁实机事务通过；UVD7v2 双引擎实机入槽。
+- 已核实：15.8.1 与作者档案逐函数匹配；用户态 15D8 补丁实机事务通过；VCN1 原生引擎类是
+  Vega10 世代的 `AMDUVD7HWEngine`（见 §6），实机已入槽。
 - 待办：`loadUVDFW`/`initHardwareCail` 失败子步骤定位（诊断已上线）；
   IOConnect 0x104/0x106 视频上下文与解码会话的端到端验收；
   Chrome/长时稳定性与 FairPlay。
@@ -135,3 +135,38 @@ hash 匹配，作者静态数据可复用）。
   - `initHardwareCail` 钩子先 `attachCailSubmit`：接管 `[engine+0x18]->vt[0x2B8]` 客户端的 `+0xD0`，逐 selector 发布 `CailSubmit1/6/7/8/9`、`CailLastSelector/Result`；同时发布 `FirmwareAddress(+0x280)`/`FirmwareSize(+0x29C)`/`RingCount(+0x2B8)`。
   - 静态槽位补丁写后读回：`SMLGFX9Verify/SMLBaseVerify`。
 - 下一步：若 `CailSubmit8/9/1` 显示拒绝，按 selector 追 CAIL 侧消息格式；`FirmwareAddress=0` 说明固件未被登记，需要另行处理（`+0x25D` 由 init 固定为 1，原生 APU 路径假定固件已由图形驱动载入）。
+
+## 6. 第四轮：改用 Vega10 原生 `AMDUVD7HWEngine`（15.8.1，2026-10-31）
+
+- 第四轮 ioreg（commit `e84d0a9` 的 CAIL 重试）：跳过 selector 8 后 selector 1 仍返回
+  `0xFFFFFFFFE00002C7`（kIOReturnUnsupported）→ 该 CAIL 客户端对 VCN1 消息整体不接受，
+  继续修 Vega20 CAIL 路径不可行；Vega20 引擎语义本身也不匹配 Raven。
+- `AMDVega10Hardware::allocateHWEngines`（0x43c6bce，0xBE 字节）：数组基址 +0x3B8，
+  `+0x3B8=GFX9PM4Engine(0x340)`、`+0x3C0/+0x3C8=GFX9SDMAEngine(0x250)×2`、
+  **`+0x3E0=AMDUVD7HWEngine(0x438)`（只有 UVD0）**、`+0x3F0=VCE4v1HWEngine(0x3A0)`。
+  VCN1 是 Vega10 世代 IP，原生类因此是 UVD7 而不是 UVD7v2。
+- `AMDUVD7HWEngine::init`（0x43d252e，0xF8）：interface 空即 false；`hw=iface->vt[0x2C0]`；
+  `hw->vt[0x58](hw, 0xC, 0, 1, &base)`（isEncode 恒 0）；成功后 `+0x210=2`、`+0x404=0xA`、
+  word `+0x3B8=0x100`、**byte `+0x25C=1`**、`+0x434=0`；再用 `iface->vt[0x150]` 取 chip id，
+  **`+0x25D=(chip==0x10000 || chip==0x20000)`**，`+0x250=base`。Raven 芯片 id 不在两者中，
+  故 `+0x25D=0`，`initHardware` 会真正执行 `loadUVDFW`。
+- `AMDUVD7HWEngine::initHardware`（0x43d27ec，0x96）：`[self+0x10]!=0` 直接 true；
+  `[self+0x25D]==0` → `vt[0x338]`=loadUVDFW（失败即 false）；再 `vt[0x390]`=initHardwareCail(+0x25D&1)；
+  成功后 `[self+0x30]->vt[0x128](base+0x500,1)` 与 `(base+0x500+[self+0x250],2)`。
+- `UVDHWEngine::loadUVDFW`（0x43d0c40）：读 `[self+0x3BA]`（已缓存标志）、`[self+0x280]`（固件指针）、
+  `[self+0x2A8]`、`[self+0x270]`，随后用 `[self+0x38]` 队列的
+  `vt[0x140](queue,[self+0x2B0],&local,global,0x15,0x11,0,0)` —— **走 SML 队列，不碰 CAIL**。
+- `AMDUVD7HWEngine::commitUVDFWMsg`（0x43d28a8）：把固件下载拆成 SML 寄存器写消息，寄存器基址
+  `[self+0x250]` + `0x3C4/0x3C5/0x3C3`，经 `[self+0xC0]->vt[0x120]` 与 `[self+0x20]` 的
+  `vt[0x1A0]/[0x1B0]/[0x258]/[0x248]/[0x140]/[0x148]/[0x160]` 提交。
+- 虚表核对 `__ZTV30AMDRadeonX5000_AMDUVD7HWEngine` @0x45a0e20：`+0x118=0x43d252e`(init)、
+  `+0x338=0x43d0c40`(loadUVDFW)、`+0x348=0x43d28a8`(commitUVDFWMsg)、`+0x368=0x43d27ec`(initHardware)、
+  `+0x390=0x43d1322`(initHardwareCail)、`+0x2B8=0x43d2c10`；对照 UVD7v2 @0x45a2928：
+  `+0x118=0x43d4fb8`、`+0x368=0x43d527a`、`+0x348=0x43d5330`。
+- 本轮实现：VCN1 只分配一个 `AMDUVD7HWEngine`（槽 5），`hasUVD1=false`；prepare 的符号与槽位校验
+  全部换成 UVD7；新增 `commitUVDFWMsg` 钩子发布 `FwMsgOpcode/FwMsgResult/FwMsgCount`；
+  `initHardwareCail` 钩子的字段语义修正为 `+0x29C=RingCount`、`+0x2B8=RingArrayLow`。
+- 下一步：若 `FwMsgCount` 不出现，说明 `+0x10` 提前返回或 `loadUVDFW` 未走到提交；若
+  `FirmwareAddress(`+0x280`)==0`，需要找固件登记方（HWLibs 的 `_CailUvdLoadEngine` 或
+  `AMDAccelVideoContext` 的会话建立），并检查 `Start/Power/Rings/Channels` 是否依次通过。
+
