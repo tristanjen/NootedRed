@@ -72,8 +72,8 @@ hash 匹配，作者静态数据可复用）。
     `+0x250=base`、`+0x254=isEncode`、`+0x434=0`。
 - `allocateHWRings`：3 个 0xE8 ring（Dec/Enc/EncLLQ，存 +0x50/+0x58/+0x60，计数 +0x48）。
 - `allocateHWChannels`：0x278 通道，按引擎 `+0xC`（engineType）分支 Dec(5)/Enc(6) 通道。
-- `initHardware`（0x43D527A）：`vt[+0x338]()`→固件就绪位（存 +0x25D）；
-  `vt[+0x390](flag&1)`；随后对 iface `vt[+0x128](base+0x500, 1/2)` 两次
+- `initHardware`（0x43D527A）：`+0x10` 非 0 直接成功；否则 `+0x25D==0` 时调 `vt[+0x338]()`（loadUVDFW），再由 `vt[+0x390](+0x25D&1)` 处理 CAIL；
+  成功后就 iface `vt[+0x128](base+0x500, 1)` 与 `(2*base+0x500, 2)` 两次
   （中断/事件路由，base=引擎+0x250）。
 - 同伴类：`UVD7v2Dec/EncRing`、`UVD7v2Dec/EncChannel`、`UVD7v2EncLLQRing/Channel`；
   `AMDAccelUVDContext`（IOConnect 0x104/0x106 的内核侧：requestCapability、
@@ -121,3 +121,17 @@ hash 匹配，作者静态数据可复用）。
 - `initHardware` 的两个子步骤已分别挂钩诊断：`loadUVDFW`（SML/PSP 固件下载）与
   `initHardwareCail`（CAIL 寄存器初始化）；引擎 init 成功后的 `+0x250` 基址与
   `+0x254` isEncode 也会发布（`NRedVCN1Engine*`）。下一轮 ioreg 将区分失败子步骤。
+
+## 5. 第二轮实机与运行期接管（15.8.1，2026-10-31）
+
+- 第二轮 ioreg：`X5000Prepared=1`、`NativeLoadReady=1`、`AcceleratorStarted=1`、`SMLGFX9Hooked/BaseHooked=1`、`EngineInitResult=1`、`EngineInitType=6`、`EngineIsEncode=1`；但 `EngineBase=0`、`InitHardwareCail=0`、`LastHardwareInit=0`，且 `SMLBaseServed/SMLNativeStatus/NativeBase` 全缺失 → 两张静态 SML 虚表补丁在两轮实机中都没被调用。
+- `AMDUVD7v2HWEngine::init`（0x43D4FB8）逐字节确认：`+0x25C(u16)=0x101` 使 `+0x25D=1`；`initHardware`（0x43D527A）在 `+0x25D!=0` 时**跳过** `vt[0x338]`（loadUVDFW），只调 `vt[0x390]`（initHardwareCail(1)）；`[engine+0x10]!=0` 时直接返回成功。故 loadUVDFW 未执行属原生设计，失败点在 initHardwareCail。
+- `initHardware` 成功后访问 `[engine+0x30]->vt[0x128](base+0x500, 1)` 与 `(base*2+0x500, 2)`：base=0 时写错 MMIO，必须先修正基址。
+- `initHardwareCail`（0x43D1322，flag=1 分支）：取 `[engine+0x18]` 接口 → `vt[0x2B8]` 得客户端对象 → `客户端+0xD0` 提交消息；selector 8（0x20 字节）与 9（0x120 字节，含 `+0x280` FW 地址、`+0x254` isEncode）都必须返回 0，公共尾块再按 `+0x2B8` 环数量拷贝 16 字节项并 submit(1)，任一非 0 即 false。
+- 该客户端 vtable 槽位于 gap 中另一个 fileset（0x94xxxxx–0xa4xxxxx，CAIL/AMDSupport 家族），X5000 符号无法静态定位 → 同样改为运行期按 vptr 接管。
+- 本轮实现：
+  - 路由 `AMDHardware::initializeExternalInterfaces`（0x43CA04C）：读 `*(void**)(hardware+0x338)`，并在引擎 init 钩子里于调用原函数**之前**再 `attachLiveSML(interface+0x338)`；把对象 vptr 的 `+0x58` 换成 `smlQueryLive`（链式调用原生；选择子 0x0C 应答 0x7800）。
+  - 引擎 init 成功后强制 `+0x250=0x7800`（Raven `VCN_BASE__INST0_SEG0`），按 5/6 分别发布 `BaseDec/BaseEnc`。
+  - `initHardwareCail` 钩子先 `attachCailSubmit`：接管 `[engine+0x18]->vt[0x2B8]` 客户端的 `+0xD0`，逐 selector 发布 `CailSubmit1/6/7/8/9`、`CailLastSelector/Result`；同时发布 `FirmwareAddress(+0x280)`/`FirmwareSize(+0x29C)`/`RingCount(+0x2B8)`。
+  - 静态槽位补丁写后读回：`SMLGFX9Verify/SMLBaseVerify`。
+- 下一步：若 `CailSubmit8/9/1` 显示拒绝，按 selector 追 CAIL 侧消息格式；`FirmwareAddress=0` 说明固件未被登记，需要另行处理（`+0x25D` 由 init 固定为 1，原生 APU 路径假定固件已由图形驱动载入）。

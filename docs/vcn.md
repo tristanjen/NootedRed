@@ -15,10 +15,16 @@
 | `1638 / 15E7` | Cezanne / Barcelo 系列 | VCN 2.2 | 保留 Cezanne 路径，新增设备待实机验收 |
 
 VCN1 的接入不加载 X6000：内核侧在 `X5000::allocateHWEngines` 内按 Vega20 原生形态分配两个
-`AMDUVD7v2HWEngine`（引擎数组槽 5/6），能力位以 `hasUVD0/hasUVD1` 暴露；`AMDSMLGFX9Interface`
-虚表 +0x58 的 IP 基址查询（选择子 0x0C）被接管为返回 Raven 的 VCN 基址。详见
-[VCN1 分析](vcn1-analysis.md)。诊断字段为 `NRedVCN1*`（Prepared/EnginesAllocated/LastHardwareInit/
-SMLBaseServed）。
+`AMDUVD7v2HWEngine`（引擎数组槽 5/6），能力位以 `hasUVD0/hasUVD1` 暴露。IP 基址查询（选择子 0x0C）
+先按两张 `AMDSML*` 虚表的 +0x58 静态接管；运行期若 `AMDHardware+0x338` 的实例落在别的类上，
+`initializeExternalInterfaces` 与引擎 `init` 会按对象真实 vptr 再接管一次，并把 Raven 表的
+`VCN_BASE__INST0_SEG0`（`0x7800`）写回引擎 `+0x250`。详见 [VCN1 分析](vcn1-analysis.md)。
+
+诊断字段为 `NRedVCN1*`：`Prepared`、`EnginesAllocated`、`EngineInit*`（Result/Type/Base/BaseDec/BaseEnc/
+IsEncode/BaseForced）、`SML*`（Present/SlotLow/LiveHooked/GFX9Verify/BaseVerify/BaseServed/NativeStatus/
+NativeBase）、`HardwareEarlyFlag`、`HardwareSkipFirmware`、`LastHardwareInit`、`InitHardwareCail`、
+`FirmwareAddress`、`FirmwareSize`、`RingCount`、`CailHooked`、`CailSubmit1/6/7/8/9`、`CailLastSelector`、
+`CailLastResult`。
 
 代际依据 [Linux 内核 AMD 硬件组件表](https://www.kernel.org/doc/html/v6.17/gpu/amdgpu/amd-hardware-list-info.html)。
 同一视频代际是复用现有桥接的依据，不代表 Apple 驱动已经支持或新设备已经硬解成功。

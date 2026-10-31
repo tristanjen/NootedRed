@@ -29,6 +29,13 @@ namespace
     mach_vm_address_t       uvd7v2LoadUVDFWOriginal{0}, uvd7v2InitHardwareCailOriginal{0};
     UInt32                  uvd7v2InitHardwareCount{0}, smlQueryServedCount{0};
     UInt32                  uvd7v2InitCount{0}, uvd7v2LoadUVDFWCount{0}, uvd7v2InitHardwareCailCount{0};
+    // VCN1 的 SML 实例由 services 的 +0x850 工厂创建，未必落在静态打补丁的两张虚表上；
+    // 运行期按对象真实 vptr 再接管一次 +0x58，并把原生返回值原样链式调用。
+    mach_vm_address_t       smlQueryOriginalLive{0}, externalInterfacesOriginal{0};
+    UInt32                  smlLiveCount{0}, externalInterfacesCount{0};
+    // CAIL 侧提交入口（[engine+0x18]->vt[0x2B8] 得到的客户端对象的 +0xD0）只在运行期可见。
+    mach_vm_address_t       cailSubmitOriginal{0}, cailClient{0};
+    UInt32                  cailSubmitCount{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -243,14 +250,125 @@ namespace
         return smlQueryImpl(self, selector, isEncode, flag, out, smlQueryOriginalBase);
     }
 
+    int smlQueryLive(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out)
+    {
+        if (smlQueryOriginalLive == 0) { return -1; }
+        return smlQueryImpl(self, selector, isEncode, flag, out, smlQueryOriginalLive);
+    }
+
+    // 读对象真实 vptr 的 +0x58；未接管时换成 smlQueryLive（保留原值供链式调用）。
+    void attachLiveSML(void* object)
+    {
+        if (!object) { return; }
+        auto** const vptr = *reinterpret_cast<void***>(object);
+        if (!vptr) { return; }
+        auto&      slot    = vptr[0x58 / sizeof(void*)];
+        const auto current = reinterpret_cast<mach_vm_address_t>(slot);
+        NRed::singleton().setProp32("NRedVCN1SMLSlotLow", static_cast<UInt32>(current));
+        if (current == reinterpret_cast<mach_vm_address_t>(&smlQueryLive)
+            || current == reinterpret_cast<mach_vm_address_t>(&smlQueryGFX9)
+            || current == reinterpret_cast<mach_vm_address_t>(&smlQueryPlain))
+        {
+            NRed::singleton().setProp32("NRedVCN1SMLLiveHooked", 1);
+            return;
+        }
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return; }
+        smlQueryOriginalLive = current;
+        slot                 = reinterpret_cast<void*>(&smlQueryLive);
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        NRed::singleton().setProp32("NRedVCN1SMLLiveHooked", 1);
+        const auto count = __atomic_fetch_add(&smlLiveCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) {
+            SYSLOG("VCN1", "live SML hooked: object=%p vptr=%p slot=%p", object, vptr,
+                   reinterpret_cast<void*>(current));
+        }
+    }
+
+    // CAIL 提交：initHardwareCail 用 selector 8/9/1 提交消息，失败即返回 false；
+    // 逐个 selector 记录返回值，直接指出是哪一步被拒。
+    int cailSubmit(void* client, const UInt32 selector, const UInt64 arg, void* message)
+    {
+        const auto result = reinterpret_cast<int (*)(void*, UInt32, UInt64, void*)>(cailSubmitOriginal)(client, selector,
+                                                                                                        arg, message);
+        NRed::singleton().setProp32("NRedVCN1CailLastSelector", selector);
+        NRed::singleton().setProp32("NRedVCN1CailLastResult", static_cast<UInt32>(result));
+        const char* property = nullptr;
+        switch (selector) {
+            case 1: property = "NRedVCN1CailSubmit1"; break;
+            case 6: property = "NRedVCN1CailSubmit6"; break;
+            case 7: property = "NRedVCN1CailSubmit7"; break;
+            case 8: property = "NRedVCN1CailSubmit8"; break;
+            case 9: property = "NRedVCN1CailSubmit9"; break;
+            default: break;
+        }
+        if (property) { NRed::singleton().setProp32(property, static_cast<UInt32>(result)); }
+        const auto count = __atomic_fetch_add(&cailSubmitCount, 1U, __ATOMIC_RELAXED);
+        if (count < 32) {
+            SYSLOG("VCN1", "CAIL submit selector=%u arg=0x%llX result=%d", selector, arg, result);
+        }
+        return result;
+    }
+
+    void attachCailSubmit(void* interface)
+    {
+        if (!interface || cailClient != 0) { return; }
+        auto* const vptr = *reinterpret_cast<void***>(interface);
+        if (!vptr) { return; }
+        using ClientGetter = void* (*)(void*);
+        auto* const getter = reinterpret_cast<ClientGetter>(vptr[0x2B8 / sizeof(void*)]);
+        if (!getter) { return; }
+        auto* const client = getter(interface);
+        if (!client) { return; }
+        auto** const clientVptr = *reinterpret_cast<void***>(client);
+        if (!clientVptr) { return; }
+        auto&      slot    = clientVptr[0xD0 / sizeof(void*)];
+        const auto current = reinterpret_cast<mach_vm_address_t>(slot);
+        if (current == reinterpret_cast<mach_vm_address_t>(&cailSubmit)) {
+            cailClient = reinterpret_cast<mach_vm_address_t>(client);
+            return;
+        }
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return; }
+        cailSubmitOriginal = current;
+        slot               = reinterpret_cast<void*>(&cailSubmit);
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        cailClient = reinterpret_cast<mach_vm_address_t>(client);
+        NRed::singleton().setProp32("NRedVCN1CailHooked", 1);
+        SYSLOG("VCN1", "CAIL submit hooked: interface=%p client=%p slot=%p", interface, client,
+               reinterpret_cast<void*>(current));
+    }
+
+    // +0x338 是 SML 接口指针（由 services->vt[0x850] 创建）：一出现就接管其查询槽。
+    void externalInterfaces(void* self)
+    {
+        reinterpret_cast<void (*)(void*)>(externalInterfacesOriginal)(self);
+        void* sml{nullptr};
+        memcpy(&sml, static_cast<UInt8*>(self) + 0x338, sizeof(sml));
+        NRed::singleton().setProp32("NRedVCN1SMLPresent", sml != nullptr);
+        attachLiveSML(sml);
+        const auto count = __atomic_fetch_add(&externalInterfacesCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "initializeExternalInterfaces self=%p sml=%p", self, sml); }
+    }
+
     // 引擎 init(interface, engineType)：成功后 +0x250=VCN 基址、+0x254=isEncode（24H32 已核对）。
     bool uvd7v2Init(void* self, void* interface, const UInt32 engineType)
     {
+        void* sml{nullptr};
+        if (interface) { memcpy(&sml, static_cast<UInt8*>(interface) + 0x338, sizeof(sml)); }
+        attachLiveSML(sml);
         const auto result =
             reinterpret_cast<bool (*)(void*, void*, UInt32)>(uvd7v2InitOriginal)(self, interface, engineType);
         UInt32 base = 0, isEncode = 0;
         memcpy(&base, static_cast<UInt8*>(self) + 0x250, sizeof(base));
         memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
+        // Raven/Picasso 的 VCN 基址就是 vega10_ip_offset.h 的 VCN_BASE__INST0_SEG0；
+        // 原生 SML 在 APU 上不提供该值，统一覆写，保证 initHardware 的 MMIO 偏移正确。
+        if (result && vcn1Device() && (engineType == 5 || engineType == 6)) {
+            constexpr UInt32 vcnBase{0x7800};
+            memcpy(static_cast<UInt8*>(self) + 0x250, &vcnBase, sizeof(vcnBase));
+            base = vcnBase;
+            NRed::singleton().setProp32("NRedVCN1EngineBaseForced", 1);
+        }
+        NRed::singleton().setProp32(engineType == 6 ? "NRedVCN1EngineBaseEnc" : "NRedVCN1EngineBaseDec", base);
         NRed::singleton().setProp32("NRedVCN1EngineInitResult", result);
         NRed::singleton().setProp32("NRedVCN1EngineInitType", engineType);
         NRed::singleton().setProp32("NRedVCN1EngineBase", base);
@@ -264,6 +382,11 @@ namespace
 
     bool uvd7v2InitHardware(void* self)
     {
+        UInt8 early{0}, skipFirmware{0};
+        memcpy(&early, static_cast<UInt8*>(self) + 0x10, sizeof(early));
+        memcpy(&skipFirmware, static_cast<UInt8*>(self) + 0x25D, sizeof(skipFirmware));
+        NRed::singleton().setProp32("NRedVCN1HardwareEarlyFlag", early);
+        NRed::singleton().setProp32("NRedVCN1HardwareSkipFirmware", skipFirmware);
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7v2InitHardwareOriginal)(self);
         NRed::singleton().setProp32("NRedVCN1LastHardwareInit", result);
         auto count = __atomic_fetch_add(&uvd7v2InitHardwareCount, 1U, __ATOMIC_RELAXED);
@@ -282,6 +405,16 @@ namespace
     }
     bool uvd7v2InitHardwareCail(void* self, const bool flag)
     {
+        void* interface{nullptr};
+        memcpy(&interface, static_cast<UInt8*>(self) + 0x18, sizeof(interface));
+        attachCailSubmit(interface);
+        UInt32 firmware{0}, firmwareSize{0}, ringCount{0};
+        memcpy(&firmware, static_cast<UInt8*>(self) + 0x280, sizeof(firmware));
+        memcpy(&firmwareSize, static_cast<UInt8*>(self) + 0x29C, sizeof(firmwareSize));
+        memcpy(&ringCount, static_cast<UInt8*>(self) + 0x2B8, sizeof(ringCount));
+        NRed::singleton().setProp32("NRedVCN1FirmwareAddress", firmware);
+        NRed::singleton().setProp32("NRedVCN1FirmwareSize", firmwareSize);
+        NRed::singleton().setProp32("NRedVCN1RingCount", ringCount);
         const auto result = reinterpret_cast<bool (*)(void*, bool)>(uvd7v2InitHardwareCailOriginal)(self, flag);
         NRed::singleton().setProp32("NRedVCN1InitHardwareCail", result);
         auto count = __atomic_fetch_add(&uvd7v2InitHardwareCailCount, 1U, __ATOMIC_RELAXED);
@@ -293,7 +426,7 @@ namespace
     bool prepareVCN1(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
     {
         mach_vm_address_t engineInit{0}, engineInitHardware{0}, engineVTable{0}, smlVTable{0}, smlVTableBase{0};
-        mach_vm_address_t engineLoadUVDFW{0}, engineInitHardwareCail{0};
+        mach_vm_address_t engineLoadUVDFW{0}, engineInitHardwareCail{0}, externalInterfacesFunction{0};
         bool ok = resolve(patcher, id, "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine10gMetaClassE", uvd7v2EngineMC, slide,
                           size);
         ok &= resolve(patcher, id,
@@ -309,6 +442,9 @@ namespace
         ok &= resolve(patcher, id, "__ZTV34AMDRadeonX5000_AMDSMLGFX9Interface", smlVTable, slide, size);
         // 原生 createSMLInterface 按配置创建 GFX9 或基类实例；两张虚表都要接管。
         resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDSMLInterface", smlVTableBase, slide, size);
+        // +0x338 的 SML 由该函数挂载；运行期 vptr 接管依赖它，取不到也不阻断静态路径。
+        resolve(patcher, id, "__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
+                externalInterfacesFunction, slide, size);
         if (!ok) { return false; }
         // __ZTV 的两个头部槽不属于槽位地址；init=+0x118、initHardware=+0x368（24H32 已核对）。
         const auto slot = [engineVTable, slide, size](const UInt32 offset) -> mach_vm_address_t {
@@ -345,6 +481,16 @@ namespace
         if (!smlGFX9 && !smlBase) { return false; }
         NRed::singleton().setProp32("NRedVCN1SMLGFX9Hooked", smlGFX9);
         NRed::singleton().setProp32("NRedVCN1SMLBaseHooked", smlBase);
+        // 写回校验：只读页或写保护失效时，ioreg 立刻可见，不必再猜。
+        mach_vm_address_t smlGFX9Now{0}, smlBaseNow{0};
+        memcpy(&smlGFX9Now, reinterpret_cast<void*>(smlVTable + 16 + 0x58), sizeof(smlGFX9Now));
+        if (smlVTableBase != 0) {
+            memcpy(&smlBaseNow, reinterpret_cast<void*>(smlVTableBase + 16 + 0x58), sizeof(smlBaseNow));
+        }
+        NRed::singleton().setProp32("NRedVCN1SMLGFX9Verify",
+                                    smlGFX9Now == reinterpret_cast<mach_vm_address_t>(&smlQueryGFX9));
+        NRed::singleton().setProp32("NRedVCN1SMLBaseVerify",
+                                    smlBaseNow == reinterpret_cast<mach_vm_address_t>(&smlQueryPlain));
         // init/initHardware/loadUVDFW/initHardwareCail 路由仅作诊断，失败不影响接入。
         KernelPatcher::RouteRequest routes[] = {
             {"__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine4initEP30AMDRadeonX5000_IAMDHWInterface20_eAMD_HW_ENGINE_TYPE",
@@ -355,6 +501,11 @@ namespace
              uvd7v2InitHardwareCailOriginal},
         };
         if (!patcher.routeMultiple(id, routes, arrsize(routes), slide, size)) { patcher.clearError(); }
+        if (externalInterfacesFunction != 0) {
+            KernelPatcher::RouteRequest route{"__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
+                                              externalInterfaces, externalInterfacesOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
         return true;
     }
 
