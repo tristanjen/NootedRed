@@ -97,11 +97,27 @@ hash 匹配，作者静态数据可复用）。
 
 ## 3. 已核实/待办
 
-- 已核实：系统 15.8.1 与作者档案逐函数匹配；`NRedVCNRejected=5` 基线；显示链路全绿。
-- 待办（内核）：SML `+0x58`(0x0C) 的实现与 APU 基址注入；ring 命令寄存器偏移
-  与 Raven 对照；GFXOFF/时钟（AccelUVDContext::setClocks→SMU11）；
-  `AMDGFX9GraphicsAccelerator::newVideoContext` 的上下文选择；
-  kernel ABI 守卫（参照 `build_vcn_kernel_patch.py` 为 UVD7v2 相关 vtable 生成）。
-- 待办（用户态）：`vcn_capabilities.py` 允许 VCN1 分类（15D8→family 4）；
-  生成 `UserSequoiaVideoData` 的 15D8 identify 载荷；FairPlay 解码子集沿用；
-  编码相关补丁（Vcn2 系）不进入 15D8 条目。
+- 已核实：15.8.1 与作者档案逐函数匹配；用户态 15D8 补丁实机事务通过；UVD7v2 双引擎实机入槽。
+- 待办：`loadUVDFW`/`initHardwareCail` 失败子步骤定位（诊断已上线）；
+  IOConnect 0x104/0x106 视频上下文与解码会话的端到端验收；
+  Chrome/长时稳定性与 FairPlay。
+
+## 4. 实机首轮验收发现（15.8.1，2026-10-30）
+
+- 用户态全链路通过：`DynamicMatched/DynamicApplied=1`、`UserApplied=16`、`DecoderPID` 与
+  `GVASelectionFix=1`——15D8→family 4 补丁在真实进程事务中工作。
+- `NRedVCN1Prepared/EnginesAllocated=1`；`NRedVCN1LastHardwareInit=0`（initHardware 被调但失败）。
+- **`notifyGfxAccess` 符号前缀**：Sequoia 24H32 上是 `__ZN30…`（长度 30），fork 原代码的
+  `__ZN29…` resolve 失败并毒化整个 `ok`，导致 X5000 五条路由（acceleratorStart/newShared/
+  newClient/newVideo/createSML）全部未装（`NRedVCNX5000Prepared=0`）。已改为 30→29 双尝试。
+- **引擎初始化流程**：`AMDHardware::initializeHWEngines` 按槽 0..10 调
+  `engine->init(engine, hardware, slotIndex)`；UVD7v2::init 内
+  `hw = hardware->vt[+0x2C0]()`（返回 hardware+0x338 的 SML 成员）后
+  `hw->vt[+0x58](hw, 0xC, isEncode, 1, &base)`。
+- **SML 实例类**：原生 `IAMDSMLInterface::createSMLInterface(config)`——config 掩码
+  `0xFFF8FFFF` 为 0 时创建 `AMDSMLGFX9Interface`，否则创建基类 `AMDSMLInterface`。
+  两张虚表的 +0x58 都指向 AMDSupport 里的同一原生查询；只挂 GFX9 表会被基类实例绕过
+  （实机 `SMLBaseServed` 缺失即此因）。现在两张表都接管：先观察原生返回再固定应答 0x7800。
+- `initHardware` 的两个子步骤已分别挂钩诊断：`loadUVDFW`（SML/PSP 固件下载）与
+  `initHardwareCail`（CAIL 寄存器初始化）；引擎 init 成功后的 `+0x250` 基址与
+  `+0x254` isEncode 也会发布（`NRedVCN1Engine*`）。下一轮 ioreg 将区分失败子步骤。

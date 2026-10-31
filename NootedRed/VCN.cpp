@@ -24,8 +24,11 @@ namespace
     // VCN1（Raven/Picasso）全部使用 X5000 原生类，不加载 X6000。
     bool                    vcn1Prepared{false};
     OSMetaClass*            uvd7v2EngineMC{nullptr};
-    mach_vm_address_t       smlQueryOriginal{0}, uvd7v2InitHardwareOriginal{0};
+    mach_vm_address_t       smlQueryOriginalGFX9{0}, smlQueryOriginalBase{0};
+    mach_vm_address_t       uvd7v2InitOriginal{0}, uvd7v2InitHardwareOriginal{0};
+    mach_vm_address_t       uvd7v2LoadUVDFWOriginal{0}, uvd7v2InitHardwareCailOriginal{0};
     UInt32                  uvd7v2InitHardwareCount{0}, smlQueryServedCount{0};
+    UInt32                  uvd7v2InitCount{0}, uvd7v2LoadUVDFWCount{0}, uvd7v2InitHardwareCailCount{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -208,17 +211,55 @@ namespace
         return result;
     }
 
-    // UVD7v2 引擎 init 经 SML 查询选择子 0x0C 取 VCN 基址；Raven/Picasso 与 Vega10 同基址表。
-    int smlQueryBase(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out)
+    // SML 查询 +0x58：选择子 0x0C 取 VCN 基址。原生实现按 CAIL 家族应答；先观察原生结果，
+    // 再以 Raven 基址表（与 Vega10 共表）应答，保证 APU 侧总是 0x7800。
+    int smlQueryImpl(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out,
+                     const mach_vm_address_t original)
     {
         if (selector == 0xC && out != nullptr) {
-            *static_cast<UInt32*>(out) = 0x7800;    // VCN_BASE__INST0_SEG0
+            UInt32 nativeBase = 0;
+            const int native = reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32, void*)>(original)(
+                self, selector, isEncode, flag, &nativeBase);
+            NRed::singleton().setProp32("NRedVCN1SMLNativeStatus", static_cast<UInt32>(native));
+            NRed::singleton().setProp32("NRedVCN1SMLNativeBase", nativeBase);
+            *static_cast<UInt32*>(out) = 0x7800;    // VCN_BASE__INST0_SEG0（Raven 与 Vega10 同表）
             auto count = __atomic_fetch_add(&smlQueryServedCount, 1U, __ATOMIC_RELAXED);
-            if (count < 16) { SYSLOG("VCN1", "SML base query served: isEncode=%u flag=%u", isEncode, flag); }
+            NRed::singleton().setProp32("NRedVCN1SMLBaseServed", count + 1);
+            if (count < 16) {
+                SYSLOG("VCN1", "SML base query: native=%d nativeBase=0x%X served=0x7800 isEncode=%u", native, nativeBase,
+                       isEncode);
+            }
             return 0;
         }
-        return reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32, void*)>(smlQueryOriginal)(self, selector,
-                                                                                                 isEncode, flag, out);
+        return reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32, void*)>(original)(self, selector, isEncode, flag,
+                                                                                        out);
+    }
+    int smlQueryGFX9(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out)
+    {
+        return smlQueryImpl(self, selector, isEncode, flag, out, smlQueryOriginalGFX9);
+    }
+    int smlQueryPlain(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out)
+    {
+        return smlQueryImpl(self, selector, isEncode, flag, out, smlQueryOriginalBase);
+    }
+
+    // 引擎 init(interface, engineType)：成功后 +0x250=VCN 基址、+0x254=isEncode（24H32 已核对）。
+    bool uvd7v2Init(void* self, void* interface, const UInt32 engineType)
+    {
+        const auto result =
+            reinterpret_cast<bool (*)(void*, void*, UInt32)>(uvd7v2InitOriginal)(self, interface, engineType);
+        UInt32 base = 0, isEncode = 0;
+        memcpy(&base, static_cast<UInt8*>(self) + 0x250, sizeof(base));
+        memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
+        NRed::singleton().setProp32("NRedVCN1EngineInitResult", result);
+        NRed::singleton().setProp32("NRedVCN1EngineInitType", engineType);
+        NRed::singleton().setProp32("NRedVCN1EngineBase", base);
+        NRed::singleton().setProp32("NRedVCN1EngineIsEncode", isEncode);
+        auto count = __atomic_fetch_add(&uvd7v2InitCount, 1U, __ATOMIC_RELAXED);
+        if (count < 16) {
+            SYSLOG("VCN1", "engine init type=%u result=%u base=0x%X isEncode=%u", engineType, result, base, isEncode);
+        }
+        return result;
     }
 
     bool uvd7v2InitHardware(void* self)
@@ -230,10 +271,29 @@ namespace
         return result;
     }
 
+    // initHardware 的两个子步骤：固件下载（SML/PSP）与 CAIL 硬件初始化。
+    bool uvd7v2LoadUVDFW(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(uvd7v2LoadUVDFWOriginal)(self);
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFW", result);
+        auto count = __atomic_fetch_add(&uvd7v2LoadUVDFWCount, 1U, __ATOMIC_RELAXED);
+        if (count < 16) { SYSLOG("VCN1", "loadUVDFW result=%u", result); }
+        return result;
+    }
+    bool uvd7v2InitHardwareCail(void* self, const bool flag)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*, bool)>(uvd7v2InitHardwareCailOriginal)(self, flag);
+        NRed::singleton().setProp32("NRedVCN1InitHardwareCail", result);
+        auto count = __atomic_fetch_add(&uvd7v2InitHardwareCailCount, 1U, __ATOMIC_RELAXED);
+        if (count < 16) { SYSLOG("VCN1", "initHardwareCail flag=%u result=%u", flag, result); }
+        return result;
+    }
+
     // VCN1 守卫与钩子：UVD7v2 虚表槽位与具名符号一致后，才接管 SML 基址查询（选择子 0x0C）。
     bool prepareVCN1(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
     {
-        mach_vm_address_t engineInit{0}, engineInitHardware{0}, engineVTable{0}, smlVTable{0};
+        mach_vm_address_t engineInit{0}, engineInitHardware{0}, engineVTable{0}, smlVTable{0}, smlVTableBase{0};
+        mach_vm_address_t engineLoadUVDFW{0}, engineInitHardwareCail{0};
         bool ok = resolve(patcher, id, "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine10gMetaClassE", uvd7v2EngineMC, slide,
                           size);
         ok &= resolve(patcher, id,
@@ -242,8 +302,13 @@ namespace
                       engineInit, slide, size);
         ok &= resolve(patcher, id, "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine12initHardwareEv", engineInitHardware, slide,
                       size);
+        ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine9loadUVDFWEv", engineLoadUVDFW, slide, size);
+        ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine16initHardwareCailEb", engineInitHardwareCail,
+                      slide, size);
         ok &= resolve(patcher, id, "__ZTV32AMDRadeonX5000_AMDUVD7v2HWEngine", engineVTable, slide, size);
         ok &= resolve(patcher, id, "__ZTV34AMDRadeonX5000_AMDSMLGFX9Interface", smlVTable, slide, size);
+        // 原生 createSMLInterface 按配置创建 GFX9 或基类实例；两张虚表都要接管。
+        resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDSMLInterface", smlVTableBase, slide, size);
         if (!ok) { return false; }
         // __ZTV 的两个头部槽不属于槽位地址；init=+0x118、initHardware=+0x368（24H32 已核对）。
         const auto slot = [engineVTable, slide, size](const UInt32 offset) -> mach_vm_address_t {
@@ -260,18 +325,36 @@ namespace
                    reinterpret_cast<void*>(engineInitHardware));
             return false;
         }
-        const mach_vm_address_t smlSlot = smlVTable + 16 + 0x58;
-        if (smlVTable < slide || smlSlot > slide + size - sizeof(void*)) { return false; }
-        memcpy(&smlQueryOriginal, reinterpret_cast<void*>(smlSlot), sizeof(smlQueryOriginal));
-        if (smlQueryOriginal == 0) { return false; }
+        const auto hookSmlSlot = [slide, size](const mach_vm_address_t table, const mach_vm_address_t hook,
+                                               mach_vm_address_t& original) -> bool {
+            const mach_vm_address_t slotAddress = table + 16 + 0x58;
+            if (table < slide || slotAddress > slide + size - sizeof(void*)) { return false; }
+            memcpy(&original, reinterpret_cast<void*>(slotAddress), sizeof(original));
+            if (original == 0) { return false; }
+            memcpy(reinterpret_cast<void*>(slotAddress), &hook, sizeof(hook));
+            return true;
+        };
         if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
-        const mach_vm_address_t hook = reinterpret_cast<mach_vm_address_t>(&smlQueryBase);
-        memcpy(reinterpret_cast<void*>(smlSlot), &hook, sizeof(hook));
+        const bool smlGFX9 = hookSmlSlot(smlVTable, reinterpret_cast<mach_vm_address_t>(&smlQueryGFX9),
+                                         smlQueryOriginalGFX9);
+        const bool smlBase = smlVTableBase != 0
+                                 ? hookSmlSlot(smlVTableBase, reinterpret_cast<mach_vm_address_t>(&smlQueryPlain),
+                                               smlQueryOriginalBase)
+                                 : false;
         MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-        // initHardware 路由仅作诊断，失败不影响接入。
-        KernelPatcher::RouteRequest route{"__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine12initHardwareEv", uvd7v2InitHardware,
-                                          uvd7v2InitHardwareOriginal};
-        if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        if (!smlGFX9 && !smlBase) { return false; }
+        NRed::singleton().setProp32("NRedVCN1SMLGFX9Hooked", smlGFX9);
+        NRed::singleton().setProp32("NRedVCN1SMLBaseHooked", smlBase);
+        // init/initHardware/loadUVDFW/initHardwareCail 路由仅作诊断，失败不影响接入。
+        KernelPatcher::RouteRequest routes[] = {
+            {"__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine4initEP30AMDRadeonX5000_IAMDHWInterface20_eAMD_HW_ENGINE_TYPE",
+             uvd7v2Init, uvd7v2InitOriginal},
+            {"__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine12initHardwareEv", uvd7v2InitHardware, uvd7v2InitHardwareOriginal},
+            {"__ZN29AMDRadeonX5000_AMDUVDHWEngine9loadUVDFWEv", uvd7v2LoadUVDFW, uvd7v2LoadUVDFWOriginal},
+            {"__ZN29AMDRadeonX5000_AMDUVDHWEngine16initHardwareCailEb", uvd7v2InitHardwareCail,
+             uvd7v2InitHardwareCailOriginal},
+        };
+        if (!patcher.routeMultiple(id, routes, arrsize(routes), slide, size)) { patcher.clearError(); }
         return true;
     }
 
@@ -412,8 +495,10 @@ void VCN::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide
                           slide, size);
             ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDAccelShared11SurfaceCopyEPjyP12IOAccelEvent", copy5000,
                           slide, size);
-            ok &=
-                resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", notifyAccess, slide, size);
+        // Sequoia (24H32) 的正确前缀是 30；旧构建可能是 29，两者都尝试。
+        ok &= resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", notifyAccess, slide, size)
+              || resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", notifyAccess, slide,
+                         size);
             KernelPatcher::RouteRequest routes[] = {
                 {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator5startEP9IOService", acceleratorStart,
                  acceleratorStartOriginal},
