@@ -362,6 +362,10 @@ void X5000::wrapSetupAndInitializeHWCapabilities(void* const self)
         singleton().hasUVD0Field(self) = true;
         singleton().hasUVD1Field(self) = false;
     }
+    // 视频上下文只在 hasUVD0/hasUVD1 为 1 时建队列，把实际字节公布出来便于对照 ioreg。
+    NRed::singleton().setProp32("NRedVCN1HasUVD0", singleton().hasUVD0Field(self) ? 1 : 0);
+    NRed::singleton().setProp32("NRedVCN1HasUVD1", singleton().hasUVD1Field(self) ? 1 : 0);
+    NRed::singleton().setProp32("NRedVCN1HasVCE", singleton().hasVCEField(self) ? 1 : 0);
     singleton().hasSDMAPagingQueueField(self)    = false;
     singleton().hasGetAllClockLimitsField(self)  = false;
     if (currentKernelVersion() >= MACOS_10_15) { singleton().dccDisplayableSupportField(self) = true; }

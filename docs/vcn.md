@@ -27,7 +27,11 @@ IsEncode/BaseForced）、`HardwareInitDec/Enc`、`HardwareBaseDec/Enc`、`CailDe
 NativeBase）、`HardwareEarlyFlag`、`HardwareSkipFirmware`、`LastHardwareInit`、`InitHardwareCail`、
 `FirmwareAddress`、`RingCount`、`RingArrayLow`、`CailHooked`、`CailClientLow/CailVptrLow/CailSubmitLow`、
 `CailSubmit1/6/7/8/9`、`CailLastSelector`、`CailLastResult`，以及固件消息路径的
-`FwMsgOpcode/FwMsgResult/FwMsgCount`。
+`FwMsgOpcode/FwMsgResult/FwMsgCount`；视频上下文链的 `HasUVD0/HasUVD1/HasVCE`（硬件能力结构
++0xB4/+0xB5/+0xB6 的实际字节）、`NewCtxFlag/NewCtxForced/NewCtxResult`（加速器 +0x1F10 的 bit3
+闸门）、`AccelVideoStart`、`VideoCtxStart`、`VcQueueUVD0/UVD1/VCE`（上下文 +0x1240/+0x1248/+0x1250
+上的队列）、`CapResult/CapUVD0/CapUVD1/CapVCE`、`NewCtxType/NewCtxCodec/NewCtxStatus`、`UvdCtxInit`、
+`ReqCap/ReqCapMode`。
 
 代际依据 [Linux 内核 AMD 硬件组件表](https://www.kernel.org/doc/html/v6.17/gpu/amdgpu/amd-hardware-list-info.html)。
 同一视频代际是复用现有桥接的依据，不代表 Apple 驱动已经支持或新设备已经硬解成功。

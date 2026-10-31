@@ -170,3 +170,44 @@ hash 匹配，作者静态数据可复用）。
   `FirmwareAddress(`+0x280`)==0`，需要找固件登记方（HWLibs 的 `_CailUvdLoadEngine` 或
   `AMDAccelVideoContext` 的会话建立），并检查 `Start/Power/Rings/Channels` 是否依次通过。
 
+
+## 7. 第五轮：视频上下文链（15.8.1，2026-10-31）
+
+- 第四轮 ioreg（`a93454f`）只有 `EngineInitResult=1/Type=5/BaseDec=0x7800`、`RingsDec=1`、
+  `ChannelsDec=1`；`Hardware*/LoadUVDFW/FwMsg*/Cail*/Start/Power` 全部缺失 →
+  `AMDUVDHWEngine::start`、`AMDUVD7HWEngine::initHardware`、`initHardwareCail` 从未执行，
+  视频上下文根本没有创建（环与通道在 `AMDHWEngine::init` 阶段就分配完，不依赖 start）。
+- 调用链证据：`AMDUVDHWEngine::start`（0x43D007C）在 0x43D00FF 调 `vt[0x368]`=initHardware；
+  `AMDAccelUVDContext::init`（0x4393A9C）在 0x4393B9B、`AMDAccelVideoContext::contextStart`
+  （0x437D086）也各自调 `vt[0x390]`=initHardwareCail —— 只要上下文建起来，`Cail*`/`Hardware*` 就会出现。
+- **第一道闸门**：`AMDGFX9GraphicsAccelerator::newVideoContext`（0x4391ED8）=
+  `if ((*(byte*)(this+0x1F10) & 8) == 0) return 0; else new Vega10VideoContext(0x1278)`。
+  X5000 `__TEXT` 中直接写 +0x1F10 的指令命中 0 处 → 该字节由整块能力结构写入。
+- `hardware->vt[0x158]` = 0x43C6E18 = `return self + 0x30`（`AMDVega10Hardware::getHWInfo`）⇒
+  `Vega10VideoContext::contextStart` 读的 `info->hasUVD0/1/VCE`（+0x84/0x85/0x86）就是
+  **hardware+0xB4/0xB5/0xB6**，与 fork 在 `>=13` 分支的字段偏移一致，偏移本身没问题。
+- `AMDAccelVideoContext::getHWInfo`（0x437E9F8）填 `sHardwareInfo[0..0x45]`：`[0x44]=1` 由
+  hardware+0xB5（hasUVD1）决定、`[0x45]` 由 hardware+0xB8 决定；UVD0 能力来自
+  `hardware->vt[0x1C0]()` 返回结构体（`puVar3`）的 +0x120/+0x124。
+- `AMDVega10Hardware::setupAndInitializeHWCapabilities`（0x43C6B8E）只写 +0x64/+0x6C/+0xA0/+0xBC，
+  **不写 0xB4..0xB7** → hasUVD*/hasVCE 由 fork 的 wrap 决定；现在 wrap 之后立即发布
+  `HasUVD0/HasUVD1/HasVCE`，可直接与 `VcQueue*` 对照。
+- `Vega10VideoContext::getCapabilities`（0x4395160）把 caps[0..3] 取自 `+0x1240` 队列的 `vt[0x270]`、
+  caps[4..7] 取自 `+0x1248`、caps[10..11] 取自 `+0x1250`；这三个队列是
+  `Vega10VideoContext::contextStart`（0x4394AAA）按 hasUVD0/1/VCE 建的，队列为空则 caps 全 0。
+- `Vega10VideoContext::newContext`（0x439532C）：`createInfo+8 < 6` 走解码分支；失败码
+  `0xE00002C0`（`accel+0xC78` bit1）、`0xE00002BE`（AccelUVDContext 分配失败/芯片闸门/requestCapability）、
+  `0xE00002C7`（`engine->vt[0x118]` init 失败）。
+- 本轮实现：
+  - 在已有的 `newVideo` 路由里接管闸门（该符号在 X5000 路由表中已占用，只能路由一次）：
+    VCN1 时把 `+0x1F10 |= 8` 再调用原生，发布 `NewCtxFlag/NewCtxForced/NewCtxResult`。
+  - 新增 6 条诊断路由：`AMDAccelVideoContext::contextStart`（`AccelVideoStart`）、
+    `AMDVega10VideoContext::contextStart`（`VideoCtxStart`、`VcQueueUVD0/UVD1/VCE`）、
+    `getCapabilities`（`CapResult/CapUVD0/CapUVD1/CapVCE`）、`newContext`
+    （`NewCtxType/NewCtxCodec/NewCtxStatus`）、`AMDAccelUVDContext::init`（`UvdCtxInit`）、
+    `requestCapability`（`ReqCap/ReqCapMode`）。
+  - SML 基址改为「原生非 0 优先」：实机原生选择子 0x0C 返回 `0x7E00`（此前被硬写成 0x7800 覆盖），
+    只有原生为 0 时才退回 `VCN_BASE__INST0_SEG0 = 0x7800`。
+- 判读：`NewCtxFlag` 出现而 `NewCtxResult=0` → 闸门未开；`VcQueueUVD0=0` → hasUVD0 字节没生效；
+  `CapUVD0=0` → 队列能力为 0（用户态不会选硬解）；`NewCtxStatus` 给出 newContext 的具体失败码；
+  `UvdCtxInit=0` 且 `CailDec=0` → 卡在 CAIL 消息层。
