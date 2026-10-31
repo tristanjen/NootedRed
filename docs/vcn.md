@@ -21,7 +21,7 @@ VCN1 的接入不加载 X6000：内核侧在 `X5000::allocateHWEngines` 内按 V
 `VCN_BASE__INST0_SEG0`（`0x7800`）写回引擎 `+0x250`。详见 [VCN1 分析](vcn1-analysis.md)。
 
 诊断字段为 `NRedVCN1*`：`Prepared`、`EnginesAllocated`、`EngineInit*`（Result/Type/Base/BaseDec/BaseEnc/
-IsEncode/BaseForced）、`HardwareInitDec/Enc`、`HardwareBaseDec/Enc`、`CailDec/Enc`、`CailDecFailed/CailEncFailed`（两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector）、`SML*`（Present/SlotLow/LiveHooked/GFX9Verify/BaseVerify/BaseServed/NativeStatus/
+IsEncode/BaseForced）、`HardwareInitDec/Enc`、`HardwareBaseDec/Enc`、`CailDec/Enc`、`CailDecFailed/CailEncFailed`（两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector）；`StartDec/Enc`、`PowerDec/Enc`（bit1=上电标志，bit0=结果）、`RingsDec/Enc`、`ChannelsDec/Enc` 记录引擎启动各阶段、`SML*`（Present/SlotLow/LiveHooked/GFX9Verify/BaseVerify/BaseServed/NativeStatus/
 NativeBase）、`HardwareEarlyFlag`、`HardwareSkipFirmware`、`LastHardwareInit`、`InitHardwareCail`、
 `FirmwareAddress`、`FirmwareSize`、`RingCount`、`CailHooked`、`CailSubmit1/6/7/8/9`、`CailLastSelector`、
 `CailLastResult`。

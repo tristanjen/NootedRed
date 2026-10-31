@@ -38,6 +38,8 @@ namespace
     UInt32                  cailSubmitCount{0};
     // 两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector。
     UInt32                  cailEncode{0}, cailFailed[2]{0, 0}, cailDecResult{0}, cailEncResult{0};
+    mach_vm_address_t       engineStartOriginal{0}, enginePowerOriginal{0};
+    mach_vm_address_t       engineRingsOriginal{0}, engineChannelsOriginal{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -402,6 +404,44 @@ namespace
         return result;
     }
 
+    // 每个引擎在 +0x254 记录 isEncode；按它分开发布结果，避免后一次调用覆盖前一次。
+    void setEngineProp(const void* self, const char* decode, const char* encode, const UInt32 value)
+    {
+        UInt32 isEncode{0};
+        if (self) { memcpy(&isEncode, static_cast<const UInt8*>(self) + 0x254, sizeof(isEncode)); }
+        NRed::singleton().setProp32((isEncode & 1) ? encode : decode, value);
+    }
+
+    bool uvdEngineStart(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(engineStartOriginal)(self);
+        setEngineProp(self, "NRedVCN1StartDec", "NRedVCN1StartEnc", result);
+        SYSLOG("VCN1", "UVDHWEngine::start result=%u", result);
+        return result;
+    }
+
+    bool uvdPowerOnOff(void* self, const bool on)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*, bool)>(enginePowerOriginal)(self, on);
+        setEngineProp(self, "NRedVCN1PowerDec", "NRedVCN1PowerEnc", (on ? 2U : 0U) | (result ? 1U : 0U));
+        SYSLOG("VCN1", "UVDHWEngine::powerOnOff on=%u result=%u", on, result);
+        return result;
+    }
+
+    bool uvdAllocateRings(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(engineRingsOriginal)(self);
+        setEngineProp(self, "NRedVCN1RingsDec", "NRedVCN1RingsEnc", result);
+        return result;
+    }
+
+    bool uvdAllocateChannels(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(engineChannelsOriginal)(self);
+        setEngineProp(self, "NRedVCN1ChannelsDec", "NRedVCN1ChannelsEnc", result);
+        return result;
+    }
+
     // initHardware 的两个子步骤：固件下载（SML/PSP）与 CAIL 硬件初始化。
     bool uvd7v2LoadUVDFW(void* self)
     {
@@ -443,6 +483,7 @@ namespace
     {
         mach_vm_address_t engineInit{0}, engineInitHardware{0}, engineVTable{0}, smlVTable{0}, smlVTableBase{0};
         mach_vm_address_t engineLoadUVDFW{0}, engineInitHardwareCail{0}, externalInterfacesFunction{0};
+        mach_vm_address_t engineStart{0}, enginePower{0}, engineRings{0}, engineChannels{0};
         bool ok = resolve(patcher, id, "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine10gMetaClassE", uvd7v2EngineMC, slide,
                           size);
         ok &= resolve(patcher, id,
@@ -458,6 +499,12 @@ namespace
         ok &= resolve(patcher, id, "__ZTV34AMDRadeonX5000_AMDSMLGFX9Interface", smlVTable, slide, size);
         // 原生 createSMLInterface 按配置创建 GFX9 或基类实例；两张虚表都要接管。
         resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDSMLInterface", smlVTableBase, slide, size);
+        // 引擎启动/上电/环与通道分配：定位失败点在 CAIL 之前还是之内。
+        resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine5startEv", engineStart, slide, size);
+        resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine10powerOnOffEb", enginePower, slide, size);
+        resolve(patcher, id, "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine15allocateHWRingsEv", engineRings, slide, size);
+        resolve(patcher, id, "__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine18allocateHWChannelsEv", engineChannels, slide,
+                size);
         // +0x338 的 SML 由该函数挂载；运行期 vptr 接管依赖它，取不到也不阻断静态路径。
         resolve(patcher, id, "__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
                 externalInterfacesFunction, slide, size);
@@ -520,6 +567,26 @@ namespace
         if (externalInterfacesFunction != 0) {
             KernelPatcher::RouteRequest route{"__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
                                               externalInterfaces, externalInterfacesOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (engineStart != 0) {
+            KernelPatcher::RouteRequest route{"__ZN29AMDRadeonX5000_AMDUVDHWEngine5startEv", uvdEngineStart,
+                                              engineStartOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (enginePower != 0) {
+            KernelPatcher::RouteRequest route{"__ZN29AMDRadeonX5000_AMDUVDHWEngine10powerOnOffEb", uvdPowerOnOff,
+                                              enginePowerOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (engineRings != 0) {
+            KernelPatcher::RouteRequest route{"__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine15allocateHWRingsEv",
+                                              uvdAllocateRings, engineRingsOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (engineChannels != 0) {
+            KernelPatcher::RouteRequest route{"__ZN32AMDRadeonX5000_AMDUVD7v2HWEngine18allocateHWChannelsEv",
+                                              uvdAllocateChannels, engineChannelsOriginal};
             if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
         }
         return true;
