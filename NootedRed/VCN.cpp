@@ -38,6 +38,9 @@ namespace
     UInt32                  cailSubmitCount{0};
     // 两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector。
     UInt32                  cailEncode{0}, cailFailed[2]{0, 0}, cailDecResult{0}, cailEncResult{0};
+    // 原生首条固件消息被判为不支持时，退回不带该消息的序列再试一次；单独记录该次失败。
+    UInt32                  cailRetryFailed[2]{0, 0};
+    bool                    cailRetryActive{false};
     mach_vm_address_t       engineStartOriginal{0}, enginePowerOriginal{0};
     mach_vm_address_t       engineRingsOriginal{0}, engineChannelsOriginal{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
@@ -296,6 +299,14 @@ namespace
                                                                                                         arg, message);
         NRed::singleton().setProp32("NRedVCN1CailLastSelector", selector);
         NRed::singleton().setProp32("NRedVCN1CailLastResult", static_cast<UInt32>(result));
+        if (message != nullptr) {
+            UInt32 opcode{0};
+            memcpy(&opcode, message, sizeof(opcode));
+            NRed::singleton().setProp32("NRedVCN1CailMsgOpcode", opcode);
+        }
+        if (result != 0 && cailRetryActive && cailRetryFailed[cailEncode & 1] == 0) {
+            cailRetryFailed[cailEncode & 1] = selector;
+        }
         const char* property = nullptr;
         switch (selector) {
             case 1: property = "NRedVCN1CailSubmit1"; break;
@@ -466,7 +477,19 @@ namespace
         UInt32 isEncode{0};
         memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
         cailEncode = isEncode & 1;
-        const auto result = reinterpret_cast<bool (*)(void*, bool)>(uvd7v2InitHardwareCailOriginal)(self, flag);
+        auto result = reinterpret_cast<bool (*)(void*, bool)>(uvd7v2InitHardwareCailOriginal)(self, flag);
+        NRed::singleton().setProp32("NRedVCN1CailFlag", flag);
+        // flag=1 会在共享下载序列前多提交一条消息类，APU 侧的 CAIL 客户端把它判为不支持；
+        // 退回 flag=0（跳过该类消息）再走一次，判断失败是否只来自这一条。
+        if (!result && vcn1Device()) {
+            NRed::singleton().setProp32("NRedVCN1CailRetry", 1);
+            cailRetryActive = true;
+            result          = reinterpret_cast<bool (*)(void*, bool)>(uvd7v2InitHardwareCailOriginal)(self, false);
+            cailRetryActive = false;
+            NRed::singleton().setProp32("NRedVCN1CailRetryResult", result);
+            NRed::singleton().setProp32(isEncode & 1 ? "NRedVCN1CailRetryFailedEnc" : "NRedVCN1CailRetryFailedDec",
+                                        cailRetryFailed[isEncode & 1]);
+        }
         NRed::singleton().setProp32("NRedVCN1InitHardwareCail", result);
         (isEncode ? cailEncResult : cailDecResult) = result;
         NRed::singleton().setProp32("NRedVCN1CailDec", cailDecResult);
