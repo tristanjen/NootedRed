@@ -36,6 +36,8 @@ namespace
     // CAIL 侧提交入口（[engine+0x18]->vt[0x2B8] 得到的客户端对象的 +0xD0）只在运行期可见。
     mach_vm_address_t       cailSubmitOriginal{0}, cailClient{0};
     UInt32                  cailSubmitCount{0};
+    // 两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector。
+    UInt32                  cailEncode{0}, cailFailed[2]{0, 0}, cailDecResult{0}, cailEncResult{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -302,6 +304,7 @@ namespace
             default: break;
         }
         if (property) { NRed::singleton().setProp32(property, static_cast<UInt32>(result)); }
+        if (result != 0 && cailFailed[cailEncode & 1] == 0) { cailFailed[cailEncode & 1] = selector; }
         const auto count = __atomic_fetch_add(&cailSubmitCount, 1U, __ATOMIC_RELAXED);
         if (count < 32) {
             SYSLOG("VCN1", "CAIL submit selector=%u arg=0x%llX result=%d", selector, arg, result);
@@ -382,13 +385,18 @@ namespace
 
     bool uvd7v2InitHardware(void* self)
     {
-        UInt8 early{0}, skipFirmware{0};
+        UInt8  early{0}, skipFirmware{0};
+        UInt32 isEncode{0}, base{0};
         memcpy(&early, static_cast<UInt8*>(self) + 0x10, sizeof(early));
         memcpy(&skipFirmware, static_cast<UInt8*>(self) + 0x25D, sizeof(skipFirmware));
+        memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
+        memcpy(&base, static_cast<UInt8*>(self) + 0x250, sizeof(base));
         NRed::singleton().setProp32("NRedVCN1HardwareEarlyFlag", early);
         NRed::singleton().setProp32("NRedVCN1HardwareSkipFirmware", skipFirmware);
+        NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareBaseEnc" : "NRedVCN1HardwareBaseDec", base);
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7v2InitHardwareOriginal)(self);
         NRed::singleton().setProp32("NRedVCN1LastHardwareInit", result);
+        NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareInitEnc" : "NRedVCN1HardwareInitDec", result);
         auto count = __atomic_fetch_add(&uvd7v2InitHardwareCount, 1U, __ATOMIC_RELAXED);
         if (count < 16) { SYSLOG("VCN1", "UVD7v2 initHardware result=%u", result); }
         return result;
@@ -415,8 +423,16 @@ namespace
         NRed::singleton().setProp32("NRedVCN1FirmwareAddress", firmware);
         NRed::singleton().setProp32("NRedVCN1FirmwareSize", firmwareSize);
         NRed::singleton().setProp32("NRedVCN1RingCount", ringCount);
+        UInt32 isEncode{0};
+        memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
+        cailEncode = isEncode & 1;
         const auto result = reinterpret_cast<bool (*)(void*, bool)>(uvd7v2InitHardwareCailOriginal)(self, flag);
         NRed::singleton().setProp32("NRedVCN1InitHardwareCail", result);
+        (isEncode ? cailEncResult : cailDecResult) = result;
+        NRed::singleton().setProp32("NRedVCN1CailDec", cailDecResult);
+        NRed::singleton().setProp32("NRedVCN1CailEnc", cailEncResult);
+        NRed::singleton().setProp32("NRedVCN1CailDecFailed", cailFailed[0]);
+        NRed::singleton().setProp32("NRedVCN1CailEncFailed", cailFailed[1]);
         auto count = __atomic_fetch_add(&uvd7v2InitHardwareCailCount, 1U, __ATOMIC_RELAXED);
         if (count < 16) { SYSLOG("VCN1", "initHardwareCail flag=%u result=%u", flag, result); }
         return result;
