@@ -275,3 +275,38 @@ NRedVCNDecoderPID（说明 AMDRadeonVADriver2 真的被打了补丁并选中硬�
 
 构建提示：生成器在这台机器上一次完整运行要几分钟，因为每次 xcrun clang 调用在沙箱里要 8–10 秒
 （compile_payload），不是卡死；用 nohup ... & 跑完再看 NootedRed/UserSequoiaVideoData.hpp 是否变化。
+## 10. 第九轮准备：客户端身份与 VCN 基址
+
+第七轮留下了两个必须用实机数据才能定下来的点：CAIL 客户端 `[hw+0x340]` 是什么对象，以及引擎的
+`+0x250` 该用哪一个 VCN 基址。
+
+身份判定不能再依赖滑动后的绝对地址，因此改用**虚表差值**：`AMDUVD7HWEngine` 的 `__ZTV`
+（实机 0x45A0E20）作为参照，把对象 `*(void**)` 与它相减，差值不随 KASLR 变化，可以和切片里的静态
+差值直接对照：
+
+| 类 | `__ZTV` | 相对 UVD7 的差值 |
+| --- | --- | --- |
+| `AMDVega10Hardware` | 0x459C5C0 | −18528 |
+| `AMDVega12Hardware` | 0x459D100 | −15648 |
+| `AMDVega20Hardware` | 0x459DC40 | −12768 |
+| `AMDHardware` | 0x459F088 | −7576 |
+| `AMDUVDHWEngine` | 0x45A01C8 | −3160 |
+| `AMDUVD7HWEngine` | 0x45A0E20 | 0 |
+| `AMDSMLInterface` | 0x45A7CF0 | +28368 |
+| `AMDSMLCPMsg` | 0x45A8C60 | +32320 |
+| `AMDSMLGFX9Interface` | 0x45A8EE8 | +32968 |
+
+新属性 `NRedVCN1DHwZtv`、`NRedVCN1DEngineZtv`、`NRedVCN1DSmlZtv`、`NRedVCN1DClientZtv` 分别是
+硬件对象、引擎对象、`[hw+0x338]`、`[hw+0x340]` 的虚表差值。只要客户端不是上表里的类，它的差值就能在
+X5000 切片的 `__ZTV` 表里唯一反查（`build/vcn/list_ztv.py`）。
+
+基址方面，第五轮起 `smlQueryImpl` 已经改成原生优先，实机原生选择子 0x0C 返回 **0x7E00**，但 `uvd7Init`
+仍然无条件把它改成 0x7800（`EngineBaseForced=1`）。这次改为**只在原生值缺失或越界（不在 0x7000–0x8FFF）
+时**才退回 0x7800，并新增 `EngineBaseNative` 记录覆写前的值。理由：0x7E00 是 Apple 按本机 ASIC 算出来的，
+0x7800 只是 Vega10 的 `VCN_BASE__INST0_SEG0` 猜测；`initHardware` 用这个基址去写 `base+0x500` 的两个
+寄存器，基址错会波及 UVD 块的后续状态。
+
+判读：`DSmlZtv=+32968` 说明实例是 `AMDSMLGFX9Interface`（静态补丁有效），`+28368` 是基类
+`AMDSMLInterface`，`+32320` 是 `AMDSMLCPMsg`（**这一张表此前从未被静态补丁覆盖**，也是第四轮
+`SMLBaseServed` 缺失的合理来源）；`DClientZtv` 若等于 `+32320`，说明 CAIL 提交走的是 SML CP 消息通道，
+失败就落在 CP 消息环而不是 CAIL 的 caps 表。

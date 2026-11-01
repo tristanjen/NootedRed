@@ -28,6 +28,9 @@ namespace
     mach_vm_address_t       uvd7InitOriginal{0}, uvd7InitHardwareOriginal{0}, fwMessageOriginal{0};
     UInt32                  fwMessageCount{0};
     mach_vm_address_t       uvd7LoadUVDFWOriginal{0}, uvd7InitHardwareCailOriginal{0};
+    // AMDUVD7HWEngine 的 __ZTV；对象虚表与它相减得到不随 KASLR 变化的类差值。
+    mach_vm_address_t       uvd7VTable{0};
+    UInt32                  vtableDelta(const void* object);
     UInt32                  uvd7InitHardwareCount{0}, smlQueryServedCount{0};
     UInt32                  uvd7InitCount{0}, uvd7LoadUVDFWCount{0}, uvd7InitHardwareCailCount{0};
     // VCN1 的 SML 实例由 services 的 +0x850 工厂创建，未必落在静态打补丁的两张虚表上；
@@ -418,9 +421,23 @@ namespace
         void* sml{nullptr};
         memcpy(&sml, static_cast<UInt8*>(self) + 0x338, sizeof(sml));
         NRed::singleton().setProp32("NRedVCN1SMLPresent", sml != nullptr);
+        void* client{nullptr};
+        memcpy(&client, static_cast<UInt8*>(self) + 0x340, sizeof(client));
+        NRed::singleton().setProp32("NRedVCN1DSmlZtv", vtableDelta(sml));
+        NRed::singleton().setProp32("NRedVCN1DClientZtv", vtableDelta(client));
         attachLiveSML(sml);
         const auto count = __atomic_fetch_add(&externalInterfacesCount, 1U, __ATOMIC_RELAXED);
         if (count < 8) { SYSLOG("VCN1", "initializeExternalInterfaces self=%p sml=%p", self, sml); }
+    }
+
+    // 对象虚表与 UVD7 引擎虚表的差值不随 KASLR 滑动变化，用它静态判定实例属于哪个类。
+    UInt32 vtableDelta(const void* object)
+    {
+        if (!object || uvd7VTable == 0) { return 0; }
+        void* vptr{nullptr};
+        memcpy(&vptr, object, sizeof(vptr));
+        // 无符号相减后截断：负差值以补码出现，与静态 __ZTV 表逐项对照时按 32 位解释即可。
+        return static_cast<UInt32>(reinterpret_cast<mach_vm_address_t>(vptr) - uvd7VTable);
     }
 
     // 引擎 init(interface, engineType)：成功后 +0x250=VCN 基址、+0x254=isEncode（24H32 已核对）。
@@ -434,19 +451,25 @@ namespace
         UInt32 base = 0, isEncode = 0;
         memcpy(&base, static_cast<UInt8*>(self) + 0x250, sizeof(base));
         memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
-        // Raven/Picasso 的 VCN 基址就是 vega10_ip_offset.h 的 VCN_BASE__INST0_SEG0；
-        // 原生 SML 在 APU 上不提供该值，统一覆写，保证 initHardware 的 MMIO 偏移正确。
+        // 原生 SML 查询在 APU 上给出的是本机 VCN 基址（实机 0x7E00），只有它缺失或越界时才
+        // 退回 vega10_ip_offset.h 的 VCN_BASE__INST0_SEG0，避免把 Apple 算好的值覆盖掉。
+        NRed::singleton().setProp32("NRedVCN1EngineBaseNative", base);
         if (result && vcn1Device() && (engineType == 5 || engineType == 6)) {
-            constexpr UInt32 vcnBase{0x7800};
-            memcpy(static_cast<UInt8*>(self) + 0x250, &vcnBase, sizeof(vcnBase));
-            base = vcnBase;
-            NRed::singleton().setProp32("NRedVCN1EngineBaseForced", 1);
+            constexpr UInt32 vcnBaseFallback{0x7800};
+            if (base < 0x7000 || base > 0x8FFF) {
+                memcpy(static_cast<UInt8*>(self) + 0x250, &vcnBaseFallback, sizeof(vcnBaseFallback));
+                base = vcnBaseFallback;
+                NRed::singleton().setProp32("NRedVCN1EngineBaseForced", 1);
+            }
         }
         NRed::singleton().setProp32(engineType == 6 ? "NRedVCN1EngineBaseEnc" : "NRedVCN1EngineBaseDec", base);
         NRed::singleton().setProp32("NRedVCN1EngineInitResult", result);
         NRed::singleton().setProp32("NRedVCN1EngineInitType", engineType);
         NRed::singleton().setProp32("NRedVCN1EngineBase", base);
         NRed::singleton().setProp32("NRedVCN1EngineIsEncode", isEncode);
+        // 实例身份：硬件对象、引擎对象各自的虚表相对 UVD7 虚表的偏移。
+        NRed::singleton().setProp32("NRedVCN1DHwZtv", vtableDelta(interface));
+        NRed::singleton().setProp32("NRedVCN1DEngineZtv", vtableDelta(self));
         auto count = __atomic_fetch_add(&uvd7InitCount, 1U, __ATOMIC_RELAXED);
         if (count < 16) {
             SYSLOG("VCN1", "engine init type=%u result=%u base=0x%X isEncode=%u", engineType, result, base, isEncode);
@@ -718,6 +741,7 @@ namespace
         ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine16initHardwareCailEb", engineInitHardwareCail,
                       slide, size);
         ok &= resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDUVD7HWEngine", engineVTable, slide, size);
+        uvd7VTable = engineVTable;
         ok &= resolve(patcher, id, "__ZTV34AMDRadeonX5000_AMDSMLGFX9Interface", smlVTable, slide, size);
         // 原生 createSMLInterface 按配置创建 GFX9 或基类实例；两张虚表都要接管。
         resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDSMLInterface", smlVTableBase, slide, size);
