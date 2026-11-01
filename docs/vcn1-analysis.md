@@ -242,3 +242,36 @@ bit3 本来就是置位的，`NewCtxForced` 并未改动它）、`NewCtxResult=1
 `IOServiceOpen` 的路由）；`SelLast` 停在某个选择子就顺该方法继续跟；出现 `HWInfoStatus` 而
 `HWInfoTail=0` 则是上报的能力结构自相矛盾。同步抓全量属性（`grep '"NRed'`），
 `NRedVCNUser*/NRedVCNDynamic*` 才反映用户态补丁此刻的真实状态。
+
+## 9. 第六轮实机：用户态补丁表根本没有 Picasso
+
+第六轮 ioreg 只多了三个新属性，却把空窗的原因指了出来：
+
+- SelSeen=1（仅 bit0）、SelLast=0x100、SelCount=9：用户态确实打开了 video context 的用户客户端，
+  但只用过选择子 0x100（getHWInfo 那一个），之后再没有 0x101/0x102 之类的方法调用。
+- HWInfoStatus=0、HWInfoFirst=142、HWInfoMid=0、HWInfoTail=0：能力结构已返回给用户态。
+- **NRedVCNUserRejected=3，同时 NRedVCNUserEnabled、NRedVCNUserApplied、NRedVCNDecoderPID
+  全部缺失** —— 这是决定性的一条。
+
+NootedRed/UserVideoDecode.cpp:441 的语义是「找不到设备补丁表就整条用户态链退出」：
+
+    devicePatches = sequoia ? UserSequoiaVideoData::findDevice(deviceID) : UserVideoDecodeData::findDevice(deviceID);
+    if (!devicePatches) { NRed::singleton().setProp32("NRedVCNUserRejected", 3); return; }
+
+而 NootedRed/UserSequoiaVideoData.hpp 是 tools/build_video_decode_patch.py 生成的，仓库里那一份只有
+0x15E7/0x1636/0x1638/0x164C 四个 VCN2 设备（git log -- NootedRed/UserSequoiaVideoData.hpp 只有上游
+ac1a08e 一次提交），生成时 VCNCapabilities 里还没有 0x15D8。于是这台机器上：
+
+1. identify 没被改写成 family 4 —— 未打补丁的 VADriver2 对 0x15D8 仍然判成未知家族；
+2. 因此 VADriver2 从不选择 AMD 硬解，AppleGVA 也就不会来问 caps、不会建解码上下文；
+3. 内核侧那条链（NewCtxResult=1、VideoCtxStart=1、VcQueueUVD0=1）虽然已经通了，但没人使用它。
+
+修复就是重新生成补丁表：python3 tools/build_video_decode_patch.py --sequoia-cache
+/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld，新表里多出 {0x15D8, Patches15D8}，
+它的 identify 载荷注入 family 4，VCN2_ENCODE_LABELS 里的编码器条目按 VCN1 规则退化为原样字节。
+
+判读：装上新 kext 后 NRedVCNUserRejected 应当消失并出现 NRedVCNUserEnabled=1、NRedVCNUserApplied、
+NRedVCNDecoderPID（说明 AMDRadeonVADriver2 真的被打了补丁并选中硬解），SelSeen 也应超出 bit0。
+
+构建提示：生成器在这台机器上一次完整运行要几分钟，因为每次 xcrun clang 调用在沙箱里要 8–10 秒
+（compile_payload），不是卡死；用 nohup ... & 跑完再看 NootedRed/UserSequoiaVideoData.hpp 是否变化。
