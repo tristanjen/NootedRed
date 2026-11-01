@@ -75,6 +75,7 @@ X5000::X5000()
         this->shCountField                 = 0x5C;
         this->hwMaxCUsField                = 0x80;
         this->hasUVD0Field                 = 0x90;
+        this->hasUVD1Field                 = 0x91;
         this->hasVCEField                  = 0x92;
         this->hasVCN0Field                 = 0x93;
         this->hasSDMAPagingQueueField      = 0xA4;
@@ -92,6 +93,7 @@ X5000::X5000()
         this->shCountField                 = 0x5C;
         this->hwMaxCUsField                = 0x80;
         this->hasUVD0Field                 = 0x90;
+        this->hasUVD1Field                 = 0x91;
         this->hasVCEField                  = 0x92;
         this->hasVCN0Field                 = 0x93;
         this->hasSDMAPagingQueueField      = 0xA4;
@@ -114,6 +116,7 @@ X5000::X5000()
             this->shCountField                 = 0x64;
             this->hwMaxCUsField                = 0x98;
             this->hasUVD0Field                 = 0xAC;
+            this->hasUVD1Field                 = 0xAD;
             this->hasVCEField                  = 0xAE;
             this->hasVCN0Field                 = 0xAF;
             this->hasSDMAPagingQueueField      = 0xC0;
@@ -128,6 +131,7 @@ X5000::X5000()
             this->shCountField               = 0x6C;
             this->hwMaxCUsField              = 0xA0;
             this->hasUVD0Field               = 0xB4;
+            this->hasUVD1Field               = 0xB5;
             this->hasVCEField                = 0xB6;
             this->hasVCN0Field               = 0xB7;
             this->hasSDMAPagingQueueField    = 0xBF;
@@ -339,6 +343,14 @@ bool X5000::allocateHWEngines(void* const self)
         (singleton().pm4EngineField + kAMDHWEngineTypeVCN0 * sizeof(void*))(self) = engine;
         if (!engine) { singleton().hasVCN0Field(self) = false; }
     }
+    else if (VCN::vcn1Ready()) {
+        // VCN1（Vega10 世代）：原生只有一个 UVD7 引擎，固件走 SML 寄存器写消息而不是 CAIL。
+        auto* decodeEngine = VCN::allocateUVD7Engine();
+        (singleton().pm4EngineField + kAMDHWEngineTypeUVD0 * sizeof(void*))(self) = decodeEngine;
+        const bool allocated = decodeEngine != nullptr;
+        if (!allocated) { singleton().hasUVD0Field(self) = false; }
+        NRed::singleton().setProp32("NRedVCN1EnginesAllocated", allocated);
+    }
 
     return true;
 }
@@ -366,6 +378,15 @@ void X5000::wrapSetupAndInitializeHWCapabilities(void* const self)
     singleton().hasUVD0Field(self)               = false;
     singleton().hasVCEField(self)                = false;
     singleton().hasVCN0Field(self)               = VCN::ready();
+    if (VCN::vcn1Ready()) {
+        // VCN1：单个 UVD7 引擎只承担解码；Vega10 的编码在 VCE，Raven 没有对应类。
+        singleton().hasUVD0Field(self) = true;
+        singleton().hasUVD1Field(self) = false;
+    }
+    // 视频上下文只在 hasUVD0/hasUVD1 为 1 时建队列，把实际字节公布出来便于对照 ioreg。
+    NRed::singleton().setProp32("NRedVCN1HasUVD0", singleton().hasUVD0Field(self) ? 1 : 0);
+    NRed::singleton().setProp32("NRedVCN1HasUVD1", singleton().hasUVD1Field(self) ? 1 : 0);
+    NRed::singleton().setProp32("NRedVCN1HasVCE", singleton().hasVCEField(self) ? 1 : 0);
     singleton().hasSDMAPagingQueueField(self)    = false;
     singleton().hasGetAllClockLimitsField(self)  = false;
     if (currentKernelVersion() >= MACOS_10_15) { singleton().dccDisplayableSupportField(self) = true; }

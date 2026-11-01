@@ -21,6 +21,29 @@ namespace
                                   KernelPatcher::KextInfo::Unloaded};
     bool                    requested{false}, has5000{false}, has6000{false}, hooks{false}, engineAllocated{false};
     bool                    loadAttempted{false}, loadCompleted{false};
+    // VCN1（Raven/Picasso）全部使用 X5000 原生类，不加载 X6000。
+    bool                    vcn1Prepared{false};
+    OSMetaClass*            uvd7EngineMC{nullptr};
+    mach_vm_address_t       smlQueryOriginalGFX9{0}, smlQueryOriginalBase{0};
+    mach_vm_address_t       uvd7InitOriginal{0}, uvd7InitHardwareOriginal{0}, fwMessageOriginal{0};
+    UInt32                  fwMessageCount{0};
+    mach_vm_address_t       uvd7LoadUVDFWOriginal{0}, uvd7InitHardwareCailOriginal{0};
+    UInt32                  uvd7InitHardwareCount{0}, smlQueryServedCount{0};
+    UInt32                  uvd7InitCount{0}, uvd7LoadUVDFWCount{0}, uvd7InitHardwareCailCount{0};
+    // VCN1 的 SML 实例由 services 的 +0x850 工厂创建，未必落在静态打补丁的两张虚表上；
+    // 运行期按对象真实 vptr 再接管一次 +0x58，并把原生返回值原样链式调用。
+    mach_vm_address_t       smlQueryOriginalLive{0}, externalInterfacesOriginal{0};
+    UInt32                  smlLiveCount{0}, externalInterfacesCount{0};
+    // CAIL 侧提交入口（[engine+0x18]->vt[0x2B8] 得到的客户端对象的 +0xD0）只在运行期可见。
+    mach_vm_address_t       cailSubmitOriginal{0}, cailClient{0};
+    UInt32                  cailSubmitCount{0};
+    // 两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector。
+    UInt32                  cailEncode{0}, cailFailed[2]{0, 0}, cailDecResult{0}, cailEncResult{0};
+    // 原生首条固件消息被判为不支持时，退回不带该消息的序列再试一次；单独记录该次失败。
+    UInt32                  cailRetryFailed[2]{0, 0};
+    bool                    cailRetryActive{false};
+    mach_vm_address_t       engineStartOriginal{0}, enginePowerOriginal{0};
+    mach_vm_address_t       engineRingsOriginal{0}, engineChannelsOriginal{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -28,6 +51,19 @@ namespace
     mach_vm_address_t       copy5000{0}, copy6000{0}, sml5000{0}, sml6000{0}, initHardwareOriginal{0};
     mach_vm_address_t       signalOriginal{0};
     void                    (*notifyAccess)(void*){nullptr};
+    // 用户态视频链：加速器 +0x1F10 的 bit3 是 newVideoContext 的闸门；
+    // Vega10VideoContext 的 contextStart/newContext/getCapabilities 与
+    // AMDAccelUVDContext 的 init/requestCapability 决定 AppleGVA 能否拿到硬件解码能力。
+    mach_vm_address_t accelVideoContextStartOriginal{0}, videoContextStartOriginal{0};
+    mach_vm_address_t videoGetCapabilitiesOriginal{0}, videoNewContextOriginal{0};
+    mach_vm_address_t uvdContextInitOriginal{0}, uvdRequestCapabilityOriginal{0};
+    UInt32            newVideoContextCount{0}, accelVideoContextStartCount{0}, videoContextStartCount{0};
+    UInt32            videoGetCapabilitiesCount{0}, videoNewContextCount{0};
+    UInt32            uvdContextInitCount{0}, uvdRequestCapabilityCount{0};
+    // 用户客户端分派与 hwInfo 回报：确定 AppleGVA 在 contextStart 之后实际请求了哪些 selector，
+    // 以及 getHWInfo 给出的能力字节（driver 依此决定是否继续创建解码上下文）。
+    mach_vm_address_t accelDispatchOriginal{0}, accelHWInfoOriginal{0};
+    UInt32            accelDispatchCount{0}, accelDispatchSeen{0}, accelHWInfoCount{0};
     OSMetaClass*            engineClass{nullptr};
     OSMetaClass*            sharedClass{nullptr};
     OSMetaClass*            clientClass{nullptr};
@@ -47,6 +83,12 @@ namespace
         return requested && VCNCapabilities::rejection(NRed::singleton().getDeviceID(), currentKernelVersion()) == 0;
     }
 
+    bool vcn1Device()
+    {
+        const auto* capability = VCNCapabilities::findDevice(NRed::singleton().getDeviceID());
+        return capability && capability->generation == VCNCapabilities::Generation::VCN1 && capability->vaFamily != 0;
+    }
+
     bool acceleratorStart(void* self, IOService* provider)
     {
         auto  original = reinterpret_cast<bool (*)(void*, IOService*)>(acceleratorStartOriginal);
@@ -58,13 +100,23 @@ namespace
         }
         bool expected = false;
         if (__atomic_compare_exchange_n(&loadAttempted, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            // 在驱动 start 内请求可选加载，避免插件库依赖和加载回调内的递归请求。
-            const auto status   = OSKextLoadKextWithIdentifier("com.apple.kext.AMDRadeonX6000");
-            const bool complete = status == kOSReturnSuccess && has5000 && has6000 && hooks;
-            __atomic_store_n(&loadCompleted, complete, __ATOMIC_RELEASE);
-            NRed::singleton().setProp32("NRedVCNNativeLoadStatus", static_cast<UInt32>(status));
-            NRed::singleton().setProp32("NRedVCNNativeLoadReady", complete);
-            SYSLOG("VCN", "native load status=0x%X prepared=%u", status, complete);
+            if (vcn1Device()) {
+                // VCN1 全部使用 X5000 原生类；无需可选加载 X6000。
+                const bool complete = has5000 && vcn1Prepared;
+                __atomic_store_n(&loadCompleted, complete, __ATOMIC_RELEASE);
+                NRed::singleton().setProp32("NRedVCNNativeLoadStatus", kOSReturnSuccess);
+                NRed::singleton().setProp32("NRedVCNNativeLoadReady", complete);
+                SYSLOG("VCN", "VCN1 native path prepared=%u", complete);
+            }
+            else {
+                // 在驱动 start 内请求可选加载，避免插件库依赖和加载回调内的递归请求。
+                const auto status   = OSKextLoadKextWithIdentifier("com.apple.kext.AMDRadeonX6000");
+                const bool complete = status == kOSReturnSuccess && has5000 && has6000 && hooks;
+                __atomic_store_n(&loadCompleted, complete, __ATOMIC_RELEASE);
+                NRed::singleton().setProp32("NRedVCNNativeLoadStatus", static_cast<UInt32>(status));
+                NRed::singleton().setProp32("NRedVCNNativeLoadReady", complete);
+                SYSLOG("VCN", "native load status=0x%X prepared=%u", status, complete);
+            }
         }
         const auto result = original(self, provider);
         NRed::singleton().setProp32("NRedVCNAcceleratorStarted", result);
@@ -142,9 +194,29 @@ namespace
         if (VCN::allocated()) { return clientClass->alloc(); }
         return reinterpret_cast<void* (*)()>(newClientOriginal)();
     }
+    // AMDGFX9GraphicsAccelerator::newVideoContext 只在 self+0x1F10 的 bit3 置位时实例化视频上下文；
+    // APU 上该位未置位时内核永远拿不到视频上下文，能力查询也就不会发生。
+    void* allocateVideoContext(void* self)
+    {
+        using Function = void* (*)(void*);
+        UInt8  flags{0};
+        if (self) { memcpy(&flags, static_cast<UInt8*>(self) + 0x1F10, sizeof(flags)); }
+        const auto count = __atomic_fetch_add(&newVideoContextCount, 1U, __ATOMIC_RELAXED);
+        NRed::singleton().setProp32("NRedVCN1NewCtxFlag", flags);
+        if (self && vcn1Device() && (flags & 0x8) == 0) {
+            static_cast<UInt8*>(self)[0x1F10] = static_cast<UInt8>(flags | 0x8);
+            NRed::singleton().setProp32("NRedVCN1NewCtxForced", 1);
+        }
+        auto* result = reinterpret_cast<Function>(newVideoOriginal)(self);
+        NRed::singleton().setProp32("NRedVCN1NewCtxResult", result != nullptr);
+        if (count < 8) { SYSLOG("VCN1", "newVideoContext flags=0x%X result=%p", static_cast<UInt32>(flags), result); }
+        return result;
+    }
     void* newVideo(void* self)
     {
         if (VCN::allocated()) { return reinterpret_cast<void* (*)(void*)>(newVideo6000)(self); }
+        // VCN1 走原生 X5000 路径，这里只接管闸门，其余原样转发。
+        if (vcn1Device()) { return allocateVideoContext(self); }
         return reinterpret_cast<void* (*)(void*)>(newVideoOriginal)(self);
     }
     bool clientStart(void* self, void* provider)
@@ -185,6 +257,632 @@ namespace
         auto count = __atomic_fetch_add(&hardwareInitCount, 1U, __ATOMIC_RELAXED);
         if (count < 16) { SYSLOG("VCN", "initHardware channel=%u result=%u", channel, result); }
         return result;
+    }
+
+    // SML 查询 +0x58：选择子 0x0C 取 VCN 基址。原生实现按 CAIL 家族应答；先观察原生结果，
+    // 再以 Raven 基址表（与 Vega10 共表）应答，保证 APU 侧总是 0x7800。
+    int smlQueryImpl(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out,
+                     const mach_vm_address_t original)
+    {
+        if (selector == 0xC && out != nullptr) {
+            UInt32 nativeBase = 0;
+            const int native = reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32, void*)>(original)(
+                self, selector, isEncode, flag, &nativeBase);
+            NRed::singleton().setProp32("NRedVCN1SMLNativeStatus", static_cast<UInt32>(native));
+            NRed::singleton().setProp32("NRedVCN1SMLNativeBase", nativeBase);
+            // Raven 上原生 SML 也会给出 VCN 基址（实机 0x7E00）；原生非 0 时以原生为准，
+            // 只有原生缺省时才退回 vega10_ip_offset.h 的 VCN_BASE__INST0_SEG0。
+            constexpr UInt32 vcnBaseFallback{0x7800};
+            *static_cast<UInt32*>(out) = nativeBase != 0 ? nativeBase : vcnBaseFallback;
+            auto count = __atomic_fetch_add(&smlQueryServedCount, 1U, __ATOMIC_RELAXED);
+            NRed::singleton().setProp32("NRedVCN1SMLBaseServed", count + 1);
+            if (count < 16) {
+                SYSLOG("VCN1", "SML base query: native=%d nativeBase=0x%X served=0x7800 isEncode=%u", native, nativeBase,
+                       isEncode);
+            }
+            return 0;
+        }
+        return reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32, void*)>(original)(self, selector, isEncode, flag,
+                                                                                        out);
+    }
+    int smlQueryGFX9(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out)
+    {
+        return smlQueryImpl(self, selector, isEncode, flag, out, smlQueryOriginalGFX9);
+    }
+    int smlQueryPlain(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out)
+    {
+        return smlQueryImpl(self, selector, isEncode, flag, out, smlQueryOriginalBase);
+    }
+
+    int smlQueryLive(void* self, const UInt32 selector, const UInt32 isEncode, const UInt32 flag, void* out)
+    {
+        if (smlQueryOriginalLive == 0) { return -1; }
+        return smlQueryImpl(self, selector, isEncode, flag, out, smlQueryOriginalLive);
+    }
+
+    // 读对象真实 vptr 的 +0x58；未接管时换成 smlQueryLive（保留原值供链式调用）。
+    void attachLiveSML(void* object)
+    {
+        if (!object) { return; }
+        auto** const vptr = *reinterpret_cast<void***>(object);
+        if (!vptr) { return; }
+        auto&      slot    = vptr[0x58 / sizeof(void*)];
+        const auto current = reinterpret_cast<mach_vm_address_t>(slot);
+        NRed::singleton().setProp32("NRedVCN1SMLSlotLow", static_cast<UInt32>(current));
+        if (current == reinterpret_cast<mach_vm_address_t>(&smlQueryLive)
+            || current == reinterpret_cast<mach_vm_address_t>(&smlQueryGFX9)
+            || current == reinterpret_cast<mach_vm_address_t>(&smlQueryPlain))
+        {
+            NRed::singleton().setProp32("NRedVCN1SMLLiveHooked", 1);
+            return;
+        }
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return; }
+        smlQueryOriginalLive = current;
+        slot                 = reinterpret_cast<void*>(&smlQueryLive);
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        NRed::singleton().setProp32("NRedVCN1SMLLiveHooked", 1);
+        const auto count = __atomic_fetch_add(&smlLiveCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) {
+            SYSLOG("VCN1", "live SML hooked: object=%p vptr=%p slot=%p", object, vptr,
+                   reinterpret_cast<void*>(current));
+        }
+    }
+
+    // CAIL 提交：initHardwareCail 用 selector 8/9/1 提交消息，失败即返回 false；
+    // 逐个 selector 记录返回值，直接指出是哪一步被拒。
+    int cailSubmit(void* client, const UInt32 selector, const UInt64 arg, void* message)
+    {
+        const auto result = reinterpret_cast<int (*)(void*, UInt32, UInt64, void*)>(cailSubmitOriginal)(client, selector,
+                                                                                                        arg, message);
+        NRed::singleton().setProp32("NRedVCN1CailLastSelector", selector);
+        NRed::singleton().setProp32("NRedVCN1CailLastResult", static_cast<UInt32>(result));
+        if (message != nullptr) {
+            UInt32 opcode{0};
+            memcpy(&opcode, message, sizeof(opcode));
+            NRed::singleton().setProp32("NRedVCN1CailMsgOpcode", opcode);
+        }
+        if (result != 0 && cailRetryActive && cailRetryFailed[cailEncode & 1] == 0) {
+            cailRetryFailed[cailEncode & 1] = selector;
+        }
+        const char* property = nullptr;
+        switch (selector) {
+            case 1: property = "NRedVCN1CailSubmit1"; break;
+            case 6: property = "NRedVCN1CailSubmit6"; break;
+            case 7: property = "NRedVCN1CailSubmit7"; break;
+            case 8: property = "NRedVCN1CailSubmit8"; break;
+            case 9: property = "NRedVCN1CailSubmit9"; break;
+            default: break;
+        }
+        if (property) { NRed::singleton().setProp32(property, static_cast<UInt32>(result)); }
+        if (result != 0 && cailFailed[cailEncode & 1] == 0) { cailFailed[cailEncode & 1] = selector; }
+        const auto count = __atomic_fetch_add(&cailSubmitCount, 1U, __ATOMIC_RELAXED);
+        if (count < 32) {
+            SYSLOG("VCN1", "CAIL submit selector=%u arg=0x%llX result=%d", selector, arg, result);
+        }
+        return result;
+    }
+
+    void attachCailSubmit(void* interface)
+    {
+        if (!interface || cailClient != 0) { return; }
+        auto* const vptr = *reinterpret_cast<void***>(interface);
+        if (!vptr) { return; }
+        using ClientGetter = void* (*)(void*);
+        auto* const getter = reinterpret_cast<ClientGetter>(vptr[0x2B8 / sizeof(void*)]);
+        if (!getter) { return; }
+        auto* const client = getter(interface);
+        if (!client) { return; }
+        auto** const clientVptr = *reinterpret_cast<void***>(client);
+        if (!clientVptr) { return; }
+        auto&      slot    = clientVptr[0xD0 / sizeof(void*)];
+        const auto current = reinterpret_cast<mach_vm_address_t>(slot);
+        if (current == reinterpret_cast<mach_vm_address_t>(&cailSubmit)) {
+            cailClient = reinterpret_cast<mach_vm_address_t>(client);
+            return;
+        }
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return; }
+        cailSubmitOriginal = current;
+        slot               = reinterpret_cast<void*>(&cailSubmit);
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        cailClient = reinterpret_cast<mach_vm_address_t>(client);
+        NRed::singleton().setProp32("NRedVCN1CailHooked", 1);
+        NRed::singleton().setProp32("NRedVCN1CailClientLow",
+                                    static_cast<UInt32>(reinterpret_cast<uintptr_t>(client)));
+        // 客户端身份发布给 ioreg，便于按 vptr/提交函数地址反查它所属的 fileset。
+        NRed::singleton().setProp32("NRedVCN1CailVptrLow",
+                                    static_cast<UInt32>(reinterpret_cast<uintptr_t>(clientVptr)));
+        NRed::singleton().setProp32("NRedVCN1CailSubmitLow", static_cast<UInt32>(current));
+        SYSLOG("VCN1", "CAIL submit hooked: interface=%p client=%p slot=%p", interface, client,
+               reinterpret_cast<void*>(current));
+    }
+
+    // UVD7（Vega10/VCN1）把固件下发改写成 SML 寄存器写消息；commitUVDFWMsg 是这条路径的出口。
+    UInt8 uvd7CommitFWMessage(void* self, void* message, const UInt64 arg1, const UInt64 arg2, const UInt64 arg3)
+    {
+        UInt32 opcode{0};
+        if (message != nullptr) { memcpy(&opcode, message, sizeof(opcode)); }
+        const auto result = reinterpret_cast<UInt8 (*)(void*, void*, UInt64, UInt64, UInt64)>(fwMessageOriginal)(
+            self, message, arg1, arg2, arg3);
+        NRed::singleton().setProp32("NRedVCN1FwMsgOpcode", opcode);
+        NRed::singleton().setProp32("NRedVCN1FwMsgResult", result);
+        const auto count = __atomic_fetch_add(&fwMessageCount, 1U, __ATOMIC_RELAXED);
+        NRed::singleton().setProp32("NRedVCN1FwMsgCount", count + 1);
+        if (count < 16) { SYSLOG("VCN1", "commitUVDFWMsg opcode=0x%X arg1=%llu result=%u", opcode, arg1, result); }
+        return result;
+    }
+
+    // +0x338 是 SML 接口指针（由 services->vt[0x850] 创建）：一出现就接管其查询槽。
+    void externalInterfaces(void* self)
+    {
+        reinterpret_cast<void (*)(void*)>(externalInterfacesOriginal)(self);
+        void* sml{nullptr};
+        memcpy(&sml, static_cast<UInt8*>(self) + 0x338, sizeof(sml));
+        NRed::singleton().setProp32("NRedVCN1SMLPresent", sml != nullptr);
+        attachLiveSML(sml);
+        const auto count = __atomic_fetch_add(&externalInterfacesCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "initializeExternalInterfaces self=%p sml=%p", self, sml); }
+    }
+
+    // 引擎 init(interface, engineType)：成功后 +0x250=VCN 基址、+0x254=isEncode（24H32 已核对）。
+    bool uvd7Init(void* self, void* interface, const UInt32 engineType)
+    {
+        void* sml{nullptr};
+        if (interface) { memcpy(&sml, static_cast<UInt8*>(interface) + 0x338, sizeof(sml)); }
+        attachLiveSML(sml);
+        const auto result =
+            reinterpret_cast<bool (*)(void*, void*, UInt32)>(uvd7InitOriginal)(self, interface, engineType);
+        UInt32 base = 0, isEncode = 0;
+        memcpy(&base, static_cast<UInt8*>(self) + 0x250, sizeof(base));
+        memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
+        // Raven/Picasso 的 VCN 基址就是 vega10_ip_offset.h 的 VCN_BASE__INST0_SEG0；
+        // 原生 SML 在 APU 上不提供该值，统一覆写，保证 initHardware 的 MMIO 偏移正确。
+        if (result && vcn1Device() && (engineType == 5 || engineType == 6)) {
+            constexpr UInt32 vcnBase{0x7800};
+            memcpy(static_cast<UInt8*>(self) + 0x250, &vcnBase, sizeof(vcnBase));
+            base = vcnBase;
+            NRed::singleton().setProp32("NRedVCN1EngineBaseForced", 1);
+        }
+        NRed::singleton().setProp32(engineType == 6 ? "NRedVCN1EngineBaseEnc" : "NRedVCN1EngineBaseDec", base);
+        NRed::singleton().setProp32("NRedVCN1EngineInitResult", result);
+        NRed::singleton().setProp32("NRedVCN1EngineInitType", engineType);
+        NRed::singleton().setProp32("NRedVCN1EngineBase", base);
+        NRed::singleton().setProp32("NRedVCN1EngineIsEncode", isEncode);
+        auto count = __atomic_fetch_add(&uvd7InitCount, 1U, __ATOMIC_RELAXED);
+        if (count < 16) {
+            SYSLOG("VCN1", "engine init type=%u result=%u base=0x%X isEncode=%u", engineType, result, base, isEncode);
+        }
+        return result;
+    }
+
+    bool uvd7InitHardware(void* self)
+    {
+        UInt8  early{0}, skipFirmware{0};
+        UInt32 isEncode{0}, base{0};
+        memcpy(&early, static_cast<UInt8*>(self) + 0x10, sizeof(early));
+        memcpy(&skipFirmware, static_cast<UInt8*>(self) + 0x25D, sizeof(skipFirmware));
+        memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
+        memcpy(&base, static_cast<UInt8*>(self) + 0x250, sizeof(base));
+        NRed::singleton().setProp32("NRedVCN1HardwareEarlyFlag", early);
+        NRed::singleton().setProp32("NRedVCN1HardwareSkipFirmware", skipFirmware);
+        NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareBaseEnc" : "NRedVCN1HardwareBaseDec", base);
+        const auto result = reinterpret_cast<bool (*)(void*)>(uvd7InitHardwareOriginal)(self);
+        NRed::singleton().setProp32("NRedVCN1LastHardwareInit", result);
+        NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareInitEnc" : "NRedVCN1HardwareInitDec", result);
+        auto count = __atomic_fetch_add(&uvd7InitHardwareCount, 1U, __ATOMIC_RELAXED);
+        if (count < 16) { SYSLOG("VCN1", "UVD7 initHardware result=%u", result); }
+        return result;
+    }
+
+    // 每个引擎在 +0x254 记录 isEncode；按它分开发布结果，避免后一次调用覆盖前一次。
+    void setEngineProp(const void* self, const char* decode, const char* encode, const UInt32 value)
+    {
+        UInt32 isEncode{0};
+        if (self) { memcpy(&isEncode, static_cast<const UInt8*>(self) + 0x254, sizeof(isEncode)); }
+        NRed::singleton().setProp32((isEncode & 1) ? encode : decode, value);
+    }
+
+    bool uvdEngineStart(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(engineStartOriginal)(self);
+        setEngineProp(self, "NRedVCN1StartDec", "NRedVCN1StartEnc", result);
+        SYSLOG("VCN1", "UVDHWEngine::start result=%u", result);
+        return result;
+    }
+
+    bool uvdPowerOnOff(void* self, const bool on)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*, bool)>(enginePowerOriginal)(self, on);
+        setEngineProp(self, "NRedVCN1PowerDec", "NRedVCN1PowerEnc", (on ? 2U : 0U) | (result ? 1U : 0U));
+        SYSLOG("VCN1", "UVDHWEngine::powerOnOff on=%u result=%u", on, result);
+        return result;
+    }
+
+    bool uvdAllocateRings(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(engineRingsOriginal)(self);
+        setEngineProp(self, "NRedVCN1RingsDec", "NRedVCN1RingsEnc", result);
+        return result;
+    }
+
+    bool uvdAllocateChannels(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(engineChannelsOriginal)(self);
+        setEngineProp(self, "NRedVCN1ChannelsDec", "NRedVCN1ChannelsEnc", result);
+        return result;
+    }
+
+    // initHardware 的两个子步骤：固件下载（SML/PSP）与 CAIL 硬件初始化。
+    bool uvd7LoadUVDFW(void* self)
+    {
+        const auto result = reinterpret_cast<bool (*)(void*)>(uvd7LoadUVDFWOriginal)(self);
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFW", result);
+        auto count = __atomic_fetch_add(&uvd7LoadUVDFWCount, 1U, __ATOMIC_RELAXED);
+        if (count < 16) { SYSLOG("VCN1", "loadUVDFW result=%u", result); }
+        return result;
+    }
+    bool uvd7InitHardwareCail(void* self, const bool flag)
+    {
+        void* interface{nullptr};
+        memcpy(&interface, static_cast<UInt8*>(self) + 0x18, sizeof(interface));
+        attachCailSubmit(interface);
+        // +0x280=固件 GPU 地址(u64)、+0x29C=环数量、+0x2B8=环描述数组指针（UVD7 已核对）。
+        UInt64 firmware{0};
+        UInt32 ringCount{0}, ringArray{0};
+        memcpy(&firmware, static_cast<UInt8*>(self) + 0x280, sizeof(firmware));
+        memcpy(&ringCount, static_cast<UInt8*>(self) + 0x29C, sizeof(ringCount));
+        memcpy(&ringArray, static_cast<UInt8*>(self) + 0x2B8, sizeof(ringArray));
+        NRed::singleton().setProp32("NRedVCN1FirmwareAddress", static_cast<UInt32>(firmware));
+        NRed::singleton().setProp32("NRedVCN1RingCount", ringCount);
+        NRed::singleton().setProp32("NRedVCN1RingArrayLow", ringArray);
+        UInt32 isEncode{0};
+        memcpy(&isEncode, static_cast<UInt8*>(self) + 0x254, sizeof(isEncode));
+        cailEncode = isEncode & 1;
+        auto result = reinterpret_cast<bool (*)(void*, bool)>(uvd7InitHardwareCailOriginal)(self, flag);
+        NRed::singleton().setProp32("NRedVCN1CailFlag", flag);
+        // flag=1 会在共享下载序列前多提交一条消息类，APU 侧的 CAIL 客户端把它判为不支持；
+        // 退回 flag=0（跳过该类消息）再走一次，判断失败是否只来自这一条。
+        if (!result && vcn1Device()) {
+            NRed::singleton().setProp32("NRedVCN1CailRetry", 1);
+            cailRetryActive = true;
+            result          = reinterpret_cast<bool (*)(void*, bool)>(uvd7InitHardwareCailOriginal)(self, false);
+            cailRetryActive = false;
+            NRed::singleton().setProp32("NRedVCN1CailRetryResult", result);
+            NRed::singleton().setProp32(isEncode & 1 ? "NRedVCN1CailRetryFailedEnc" : "NRedVCN1CailRetryFailedDec",
+                                        cailRetryFailed[isEncode & 1]);
+        }
+        NRed::singleton().setProp32("NRedVCN1InitHardwareCail", result);
+        (isEncode ? cailEncResult : cailDecResult) = result;
+        NRed::singleton().setProp32("NRedVCN1CailDec", cailDecResult);
+        NRed::singleton().setProp32("NRedVCN1CailEnc", cailEncResult);
+        NRed::singleton().setProp32("NRedVCN1CailDecFailed", cailFailed[0]);
+        NRed::singleton().setProp32("NRedVCN1CailEncFailed", cailFailed[1]);
+        auto count = __atomic_fetch_add(&uvd7InitHardwareCailCount, 1U, __ATOMIC_RELAXED);
+        if (count < 16) { SYSLOG("VCN1", "initHardwareCail flag=%u result=%u", flag, result); }
+        return result;
+    }
+
+    UInt8 accelVideoContextStart(void* self)
+    {
+        using Function    = UInt8 (*)(void*);
+        auto  original    = reinterpret_cast<Function>(accelVideoContextStartOriginal);
+        const auto result = original(self);
+        NRed::singleton().setProp32("NRedVCN1AccelVideoStart", result);
+        auto count = __atomic_fetch_add(&accelVideoContextStartCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "AccelVideoContext::contextStart result=%u", result); }
+        return result;
+    }
+
+    // Vega10VideoContext::contextStart 只在 hardware+0xB4/0xB5/0xB6（hasUVD0/1/VCE）为 1 时
+    // 才把 UVD0/UVD1/VCE 队列建到 +0x1240/+0x1248/+0x1250；队列为空时 getCapabilities 全 0。
+    UInt8 videoContextStart(void* self)
+    {
+        using Function    = UInt8 (*)(void*);
+        auto  original    = reinterpret_cast<Function>(videoContextStartOriginal);
+        const auto result = original(self);
+        if (self) {
+            void *uvd0{nullptr}, *uvd1{nullptr}, *vce{nullptr};
+            memcpy(&uvd0, static_cast<UInt8*>(self) + 0x1240, sizeof(uvd0));
+            memcpy(&uvd1, static_cast<UInt8*>(self) + 0x1248, sizeof(uvd1));
+            memcpy(&vce, static_cast<UInt8*>(self) + 0x1250, sizeof(vce));
+            NRed::singleton().setProp32("NRedVCN1VcQueueUVD0", uvd0 != nullptr);
+            NRed::singleton().setProp32("NRedVCN1VcQueueUVD1", uvd1 != nullptr);
+            NRed::singleton().setProp32("NRedVCN1VcQueueVCE", vce != nullptr);
+        }
+        NRed::singleton().setProp32("NRedVCN1VideoCtxStart", result);
+        auto count = __atomic_fetch_add(&videoContextStartCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "Vega10VideoContext::contextStart result=%u", result); }
+        return result;
+    }
+
+    // caps 数组：0..3=UVD0 环能力、4..7=UVD1、10..11=VCE；前两组分别取自 +0x1240/+0x1248 上的队列。
+    UInt32 videoGetCapabilities(void* self, void* caps, UInt64* out)
+    {
+        using Function    = UInt32 (*)(void*, void*, UInt64*);
+        auto  original    = reinterpret_cast<Function>(videoGetCapabilitiesOriginal);
+        const auto result = original(self, caps, out);
+        if (caps) {
+            UInt64 words[12];
+            memcpy(words, caps, sizeof(words));
+            NRed::singleton().setProp32("NRedVCN1CapUVD0", static_cast<UInt32>(words[0]));
+            NRed::singleton().setProp32("NRedVCN1CapUVD1", static_cast<UInt32>(words[4]));
+            NRed::singleton().setProp32("NRedVCN1CapVCE", static_cast<UInt32>(words[10]));
+        }
+        NRed::singleton().setProp32("NRedVCN1CapResult", result);
+        auto count = __atomic_fetch_add(&videoGetCapabilitiesCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "getCapabilities result=0x%X", result); }
+        return result;
+    }
+
+    // createInfo+4=codec、+8=类型（<6 为解码）；返回值决定用户态是否拿到硬件上下文。
+    UInt32 videoNewContext(void* self, const void* createInfo, void* returnInfo, const UInt64 argument, UInt64* out)
+    {
+        using Function    = UInt32 (*)(void*, const void*, void*, UInt64, UInt64*);
+        auto  original    = reinterpret_cast<Function>(videoNewContextOriginal);
+        UInt32 type{0}, codec{0};
+        if (createInfo) {
+            memcpy(&type, static_cast<const UInt8*>(createInfo) + 8, sizeof(type));
+            memcpy(&codec, static_cast<const UInt8*>(createInfo) + 4, sizeof(codec));
+        }
+        const auto result = original(self, createInfo, returnInfo, argument, out);
+        NRed::singleton().setProp32("NRedVCN1NewCtxType", type);
+        NRed::singleton().setProp32("NRedVCN1NewCtxCodec", codec);
+        NRed::singleton().setProp32("NRedVCN1NewCtxStatus", result);
+        auto count = __atomic_fetch_add(&videoNewContextCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "video newContext type=%u codec=%u result=0x%X", type, codec, result); }
+        return result;
+    }
+
+    bool uvdContextInit(void* self, void* accelerator, void* videoContext, const void* createInfo)
+    {
+        using Function    = bool (*)(void*, void*, void*, const void*);
+        auto  original    = reinterpret_cast<Function>(uvdContextInitOriginal);
+        const auto result = original(self, accelerator, videoContext, createInfo);
+        NRed::singleton().setProp32("NRedVCN1UvdCtxInit", result);
+        auto count = __atomic_fetch_add(&uvdContextInitCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "AccelUVDContext::init result=%u", result); }
+        return result;
+    }
+
+    bool uvdRequestCapability(void* self, void* returnInfo)
+    {
+        using Function    = bool (*)(void*, void*);
+        auto  original    = reinterpret_cast<Function>(uvdRequestCapabilityOriginal);
+        const auto result = original(self, returnInfo);
+        UInt32 mode{0};
+        if (returnInfo) { memcpy(&mode, returnInfo, sizeof(mode)); }
+        NRed::singleton().setProp32("NRedVCN1ReqCapMode", mode);
+        NRed::singleton().setProp32("NRedVCN1ReqCap", result);
+        auto count = __atomic_fetch_add(&uvdRequestCapabilityCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "requestCapability mode=%u result=%u", mode, result); }
+        return result;
+    }
+
+    // IOUserClient::getTargetAndMethodForIndex：selector 0x100..0x111 都从这里分派，
+    // 记录 driver 实际请求过的 selector 位图，直接指出它在 contextStart 之后停在哪一步。
+    void* accelDispatch(void* self, void** target, UInt32 index)
+    {
+        using Function = void* (*)(void*, void**, UInt32);
+        if (index >= 0x100 && index <= 0x111) {
+            accelDispatchSeen |= 1U << (index - 0x100);
+            NRed::singleton().setProp32("NRedVCN1SelSeen", accelDispatchSeen);
+            NRed::singleton().setProp32("NRedVCN1SelLast", index);
+        }
+        const auto count = __atomic_fetch_add(&accelDispatchCount, 1U, __ATOMIC_RELAXED);
+        NRed::singleton().setProp32("NRedVCN1SelCount", count + 1);
+        if (count < 24) { SYSLOG("VCN1", "getTargetAndMethodForIndex index=0x%X", index); }
+        return reinterpret_cast<Function>(accelDispatchOriginal)(self, target, index);
+    }
+
+    // getHWInfo 把硬件能力结构拷给 AppleGVA；status 与关键字决定 driver 是否继续建解码上下文。
+    UInt32 accelGetHWInfo(void* self, void* info)
+    {
+        using Function    = UInt32 (*)(void*, void*);
+        const auto result = reinterpret_cast<Function>(accelHWInfoOriginal)(self, info);
+        NRed::singleton().setProp32("NRedVCN1HWInfoStatus", result);
+        if (info) {
+            UInt32 first{0}, mid{0}, tail{0};
+            memcpy(&first, static_cast<UInt8*>(info) + 0x00, sizeof(first));
+            memcpy(&mid, static_cast<UInt8*>(info) + 0x40, sizeof(mid));
+            memcpy(&tail, static_cast<UInt8*>(info) + 0x44, sizeof(tail));
+            NRed::singleton().setProp32("NRedVCN1HWInfoFirst", first);
+            NRed::singleton().setProp32("NRedVCN1HWInfoMid", mid);
+            NRed::singleton().setProp32("NRedVCN1HWInfoTail", tail);
+        }
+        auto count = __atomic_fetch_add(&accelHWInfoCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "getHWInfo status=0x%X count=%u", result, count + 1); }
+        return result;
+    }
+
+    // VCN1 守卫与钩子：UVD7 虚表槽位与具名符号一致后，才接管 SML 基址查询（选择子 0x0C）。
+    bool prepareVCN1(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
+    {
+        mach_vm_address_t engineInit{0}, engineInitHardware{0}, engineVTable{0}, smlVTable{0}, smlVTableBase{0};
+        mach_vm_address_t engineLoadUVDFW{0}, engineInitHardwareCail{0}, externalInterfacesFunction{0};
+        mach_vm_address_t engineStart{0}, enginePower{0}, engineRings{0}, engineChannels{0};
+        mach_vm_address_t accelVideoStartFunction{0}, videoStartFunction{0};
+        mach_vm_address_t videoCapsFunction{0}, videoNewContextFunction{0};
+        mach_vm_address_t uvdContextInitFunction{0}, uvdRequestCapabilityFunction{0};
+        mach_vm_address_t accelDispatchFunction{0}, accelHWInfoFunction{0};
+        bool ok = resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDUVD7HWEngine10gMetaClassE", uvd7EngineMC, slide,
+                          size);
+        ok &= resolve(patcher, id,
+                      "__ZN30AMDRadeonX5000_AMDUVD7HWEngine4initEP30AMDRadeonX5000_IAMDHWInterface20_eAMD_HW_ENGINE_"
+                      "TYPE",
+                      engineInit, slide, size);
+        ok &= resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDUVD7HWEngine12initHardwareEv", engineInitHardware, slide,
+                      size);
+        ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine9loadUVDFWEv", engineLoadUVDFW, slide, size);
+        mach_vm_address_t fwMessageFunction{0};
+        resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDUVD7HWEngine14commitUVDFWMsgEP12_SML_UVD_MSGyyy",
+                fwMessageFunction, slide, size);
+        ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine16initHardwareCailEb", engineInitHardwareCail,
+                      slide, size);
+        ok &= resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDUVD7HWEngine", engineVTable, slide, size);
+        ok &= resolve(patcher, id, "__ZTV34AMDRadeonX5000_AMDSMLGFX9Interface", smlVTable, slide, size);
+        // 原生 createSMLInterface 按配置创建 GFX9 或基类实例；两张虚表都要接管。
+        resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDSMLInterface", smlVTableBase, slide, size);
+        // 引擎启动/上电/环与通道分配：定位失败点在 CAIL 之前还是之内。
+        resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine5startEv", engineStart, slide, size);
+        resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine10powerOnOffEb", enginePower, slide, size);
+        resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDUVD7HWEngine15allocateHWRingsEv", engineRings, slide, size);
+        resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDUVD7HWEngine18allocateHWChannelsEv", engineChannels, slide,
+                size);
+        // +0x338 的 SML 由该函数挂载；运行期 vptr 接管依赖它，取不到也不阻断静态路径。
+        resolve(patcher, id, "__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
+                externalInterfacesFunction, slide, size);
+        // 视频上下文链：上下文启动、能力查询与 UVD 上下文初始化（加速器闸门走已有的 newVideo 路由）。
+        resolve(patcher, id, "__ZN35AMDRadeonX5000_AMDAccelVideoContext12contextStartEv", accelVideoStartFunction,
+                slide, size);
+        resolve(patcher, id, "__ZN36AMDRadeonX5000_AMDVega10VideoContext12contextStartEv", videoStartFunction, slide,
+                size);
+        resolve(patcher, id, "__ZN36AMDRadeonX5000_AMDVega10VideoContext15getCapabilitiesEP22sAMDHWEngineCapabilityPy",
+                videoCapsFunction, slide, size);
+        resolve(patcher, id,
+                "__ZN36AMDRadeonX5000_AMDVega10VideoContext10newContextEP23sVideoContextCreateInfoP23sVideoContextReturnInfoyPy",
+                videoNewContextFunction, slide, size);
+        resolve(patcher, id,
+                "__ZN33AMDRadeonX5000_AMDAccelUVDContext4initEP37AMDRadeonX5000_AMDGraphicsAcceleratorP35AMDRadeonX5000_AMDAccelVideoContextP23sVideoContextCreateInfo",
+                uvdContextInitFunction, slide, size);
+        resolve(patcher, id, "__ZN33AMDRadeonX5000_AMDAccelUVDContext17requestCapabilityEP23sVideoContextReturnInfo",
+                uvdRequestCapabilityFunction, slide, size);
+        // 用户客户端分派与能力回报：定位 driver 在 contextStart 之后的请求序列。
+        resolve(patcher, id, "__ZN35AMDRadeonX5000_AMDAccelVideoContext26getTargetAndMethodForIndexEPP9IOServicej",
+                accelDispatchFunction, slide, size);
+        resolve(patcher, id, "__ZN35AMDRadeonX5000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo",
+                accelHWInfoFunction, slide, size);
+        if (!ok) { return false; }
+        // __ZTV 的两个头部槽不属于槽位地址；init=+0x118、initHardware=+0x368（24H32 已核对）。
+        const auto slot = [engineVTable, slide, size](const UInt32 offset) -> mach_vm_address_t {
+            if (engineVTable < slide || offset > size || engineVTable + 16 + offset > slide + size - sizeof(void*)) {
+                return 0;
+            }
+            mach_vm_address_t target{0};
+            memcpy(&target, reinterpret_cast<void*>(engineVTable + 16 + offset), sizeof(target));
+            return target;
+        };
+        if (slot(0x118) != engineInit || slot(0x368) != engineInitHardware) {
+            SYSLOG("VCN1", "UVD7 vtable mismatch: init=%p/%p hw=%p/%p", reinterpret_cast<void*>(slot(0x118)),
+                   reinterpret_cast<void*>(engineInit), reinterpret_cast<void*>(slot(0x368)),
+                   reinterpret_cast<void*>(engineInitHardware));
+            return false;
+        }
+        const auto hookSmlSlot = [slide, size](const mach_vm_address_t table, const mach_vm_address_t hook,
+                                               mach_vm_address_t& original) -> bool {
+            const mach_vm_address_t slotAddress = table + 16 + 0x58;
+            if (table < slide || slotAddress > slide + size - sizeof(void*)) { return false; }
+            memcpy(&original, reinterpret_cast<void*>(slotAddress), sizeof(original));
+            if (original == 0) { return false; }
+            memcpy(reinterpret_cast<void*>(slotAddress), &hook, sizeof(hook));
+            return true;
+        };
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
+        const bool smlGFX9 = hookSmlSlot(smlVTable, reinterpret_cast<mach_vm_address_t>(&smlQueryGFX9),
+                                         smlQueryOriginalGFX9);
+        const bool smlBase = smlVTableBase != 0
+                                 ? hookSmlSlot(smlVTableBase, reinterpret_cast<mach_vm_address_t>(&smlQueryPlain),
+                                               smlQueryOriginalBase)
+                                 : false;
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        if (!smlGFX9 && !smlBase) { return false; }
+        NRed::singleton().setProp32("NRedVCN1SMLGFX9Hooked", smlGFX9);
+        NRed::singleton().setProp32("NRedVCN1SMLBaseHooked", smlBase);
+        // 写回校验：只读页或写保护失效时，ioreg 立刻可见，不必再猜。
+        mach_vm_address_t smlGFX9Now{0}, smlBaseNow{0};
+        memcpy(&smlGFX9Now, reinterpret_cast<void*>(smlVTable + 16 + 0x58), sizeof(smlGFX9Now));
+        if (smlVTableBase != 0) {
+            memcpy(&smlBaseNow, reinterpret_cast<void*>(smlVTableBase + 16 + 0x58), sizeof(smlBaseNow));
+        }
+        NRed::singleton().setProp32("NRedVCN1SMLGFX9Verify",
+                                    smlGFX9Now == reinterpret_cast<mach_vm_address_t>(&smlQueryGFX9));
+        NRed::singleton().setProp32("NRedVCN1SMLBaseVerify",
+                                    smlBaseNow == reinterpret_cast<mach_vm_address_t>(&smlQueryPlain));
+        // init/initHardware/loadUVDFW/initHardwareCail 路由仅作诊断，失败不影响接入。
+        KernelPatcher::RouteRequest routes[] = {
+            {"__ZN30AMDRadeonX5000_AMDUVD7HWEngine4initEP30AMDRadeonX5000_IAMDHWInterface20_eAMD_HW_ENGINE_TYPE",
+             uvd7Init, uvd7InitOriginal},
+            {"__ZN30AMDRadeonX5000_AMDUVD7HWEngine12initHardwareEv", uvd7InitHardware, uvd7InitHardwareOriginal},
+            {"__ZN29AMDRadeonX5000_AMDUVDHWEngine9loadUVDFWEv", uvd7LoadUVDFW, uvd7LoadUVDFWOriginal},
+            {"__ZN29AMDRadeonX5000_AMDUVDHWEngine16initHardwareCailEb", uvd7InitHardwareCail,
+             uvd7InitHardwareCailOriginal},
+        };
+        if (!patcher.routeMultiple(id, routes, arrsize(routes), slide, size)) { patcher.clearError(); }
+        if (fwMessageFunction != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN30AMDRadeonX5000_AMDUVD7HWEngine14commitUVDFWMsgEP12_SML_UVD_MSGyyy", uvd7CommitFWMessage,
+                fwMessageOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (externalInterfacesFunction != 0) {
+            KernelPatcher::RouteRequest route{"__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
+                                              externalInterfaces, externalInterfacesOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (engineStart != 0) {
+            KernelPatcher::RouteRequest route{"__ZN29AMDRadeonX5000_AMDUVDHWEngine5startEv", uvdEngineStart,
+                                              engineStartOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (enginePower != 0) {
+            KernelPatcher::RouteRequest route{"__ZN29AMDRadeonX5000_AMDUVDHWEngine10powerOnOffEb", uvdPowerOnOff,
+                                              enginePowerOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (engineRings != 0) {
+            KernelPatcher::RouteRequest route{"__ZN30AMDRadeonX5000_AMDUVD7HWEngine15allocateHWRingsEv",
+                                              uvdAllocateRings, engineRingsOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (engineChannels != 0) {
+            KernelPatcher::RouteRequest route{"__ZN30AMDRadeonX5000_AMDUVD7HWEngine18allocateHWChannelsEv",
+                                              uvdAllocateChannels, engineChannelsOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (accelVideoStartFunction != 0) {
+            KernelPatcher::RouteRequest route{"__ZN35AMDRadeonX5000_AMDAccelVideoContext12contextStartEv",
+                                              accelVideoContextStart, accelVideoContextStartOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (videoStartFunction != 0) {
+            KernelPatcher::RouteRequest route{"__ZN36AMDRadeonX5000_AMDVega10VideoContext12contextStartEv",
+                                              videoContextStart, videoContextStartOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (videoCapsFunction != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN36AMDRadeonX5000_AMDVega10VideoContext15getCapabilitiesEP22sAMDHWEngineCapabilityPy",
+                videoGetCapabilities, videoGetCapabilitiesOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (videoNewContextFunction != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN36AMDRadeonX5000_AMDVega10VideoContext10newContextEP23sVideoContextCreateInfoP23sVideoContextReturnInfoyPy",
+                videoNewContext, videoNewContextOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (uvdContextInitFunction != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN33AMDRadeonX5000_AMDAccelUVDContext4initEP37AMDRadeonX5000_AMDGraphicsAcceleratorP35AMDRadeonX5000_AMDAccelVideoContextP23sVideoContextCreateInfo",
+                uvdContextInit, uvdContextInitOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (uvdRequestCapabilityFunction != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN33AMDRadeonX5000_AMDAccelUVDContext17requestCapabilityEP23sVideoContextReturnInfo",
+                uvdRequestCapability, uvdRequestCapabilityOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (accelDispatchFunction != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN35AMDRadeonX5000_AMDAccelVideoContext26getTargetAndMethodForIndexEPP9IOServicej", accelDispatch,
+                accelDispatchOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (accelHWInfoFunction != 0) {
+            KernelPatcher::RouteRequest route{"__ZN35AMDRadeonX5000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo",
+                                              accelGetHWInfo, accelHWInfoOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        return true;
     }
 
     bool install(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size)
@@ -260,11 +958,13 @@ namespace
 void VCN::init()
 {
     requested = checkKernelArgument("-NRedVideoFix");
+    // X6000 仅 VCN2.2 设备需要可选加载；注册保持不变，加载决策在 acceleratorStart 内按设备分流。
     if (requested) { lilu.onKextLoadForce(&x6000); }
 }
 bool VCN::ready()
 {
-    return supported() && __atomic_load_n(&loadCompleted, __ATOMIC_ACQUIRE) && has5000 && has6000 && hooks;
+    return supported() && !vcn1Device() && __atomic_load_n(&loadCompleted, __ATOMIC_ACQUIRE) && has5000 && has6000
+           && hooks;
 }
 bool  VCN::allocated() { return ready() && engineAllocated; }
 void* VCN::allocateEngine()
@@ -278,6 +978,16 @@ void* VCN::allocateEngine()
     if (!engineAllocated) { __atomic_store_n(&loadCompleted, false, __ATOMIC_RELEASE); }
     NRed::singleton().setProp32("NRedVCNEngineAllocated", engineAllocated);
     return engine;
+}
+
+bool VCN::vcn1Ready() { return supported() && vcn1Device() && vcn1Prepared && uvd7EngineMC != nullptr; }
+void* VCN::allocateUVD7Engine()
+{
+    if (!vcn1Ready()) {
+        NRed::singleton().setProp32("NRedVCN1AllocationSkipped", requested);
+        return nullptr;
+    }
+    return uvd7EngineMC->alloc();
 }
 
 void VCN::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size)
@@ -305,36 +1015,45 @@ void VCN::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide
         auto& target  = old ? pairs[i].oldClass : pairs[i].newClass;
         ok           &= resolve(patcher, id, name, target, slide, size);
     }
-    if (old) {
-        ok &= resolve(patcher, id, "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient5startEP9IOService", clientStart5000,
-                      slide, size);
-        ok &= resolve(patcher, id, "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient4stopEP9IOService", clientStop5000,
-                      slide, size);
-        ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDAccelShared11SurfaceCopyEPjyP12IOAccelEvent", copy5000,
-                      slide, size);
-        ok &=
-            resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", notifyAccess, slide, size);
-        KernelPatcher::RouteRequest routes[] = {
-            {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator5startEP9IOService", acceleratorStart,
-             acceleratorStartOriginal},
-            {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator9newSharedEv", newShared, newSharedOriginal},
-            {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator19newSharedUserClientEv", newClient, newClientOriginal},
-            {"__ZN41AMDRadeonX5000_AMDGFX9GraphicsAccelerator15newVideoContextEv", newVideo, newVideoOriginal},
-            {"__ZN31AMDRadeonX5000_IAMDSMLInterface18createSMLInterfaceEj", createSML, sml5000},
-        };
-        if (ok) {
-            ok = patcher.routeMultiple(id, routes, arrsize(routes), slide, size);
-            patcher.clearError();
-        }
-        has5000 = ok;
-        if (ok) {
-            KernelPatcher::RouteRequest route{"__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass", safeCast,
-                                              safeCastOriginal};
-            ok = patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1);
-            patcher.clearError();
+        if (old) {
+            ok &= resolve(patcher, id, "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient5startEP9IOService", clientStart5000,
+                          slide, size);
+            ok &= resolve(patcher, id, "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient4stopEP9IOService", clientStop5000,
+                          slide, size);
+            ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDAccelShared11SurfaceCopyEPjyP12IOAccelEvent", copy5000,
+                          slide, size);
+        // Sequoia (24H32) 的正确前缀是 30；旧构建可能是 29，两者都尝试。
+        ok &= resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", notifyAccess, slide, size)
+              || resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", notifyAccess, slide,
+                         size);
+            KernelPatcher::RouteRequest routes[] = {
+                {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator5startEP9IOService", acceleratorStart,
+                 acceleratorStartOriginal},
+                {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator9newSharedEv", newShared, newSharedOriginal},
+                {"__ZN37AMDRadeonX5000_AMDGraphicsAccelerator19newSharedUserClientEv", newClient, newClientOriginal},
+                {"__ZN41AMDRadeonX5000_AMDGFX9GraphicsAccelerator15newVideoContextEv", newVideo, newVideoOriginal},
+                {"__ZN31AMDRadeonX5000_IAMDSMLInterface18createSMLInterfaceEj", createSML, sml5000},
+            };
+            if (ok) {
+                ok = patcher.routeMultiple(id, routes, arrsize(routes), slide, size);
+                patcher.clearError();
+            }
             has5000 = ok;
+            if (ok) {
+                KernelPatcher::RouteRequest route{"__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass", safeCast,
+                                                  safeCastOriginal};
+                ok = patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1);
+                patcher.clearError();
+                has5000 = ok;
+            }
+            if (vcn1Device()) {
+                // VCN1：X5000 原生 UVD7 引擎与 SML 基址查询；与 VCN2 桥接互不影响。
+                vcn1Prepared = prepareVCN1(patcher, id, slide, size);
+                NRed::singleton().setProp32("NRedVCN1Prepared", vcn1Prepared);
+                if (!vcn1Prepared) { NRed::singleton().setProp32("NRedVCN1AbiRejected", 1); }
+                SYSLOG("VCN", "VCN1 prepared=%u", vcn1Prepared);
+            }
         }
-    }
     else {
         ok &= resolve(patcher, id, "__ZN30AMDRadeonX6000_AMDVCN2HWEngine10gMetaClassE", engineClass, slide, size);
         ok &= resolve(patcher, id, "__ZN29AMDRadeonX6000_AMDAccelShared10gMetaClassE", sharedClass, slide, size);

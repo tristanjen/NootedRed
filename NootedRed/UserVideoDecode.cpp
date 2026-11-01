@@ -520,7 +520,7 @@ namespace
             fairPlayDecode = true;
             if (pid > 0) { fairPlayPID = static_cast<UInt32>(pid); }
         }
-        if (!VCN::allocated() || !devicePatches) {
+        if ((!VCN::allocated() && !VCN::vcn1Ready()) || !devicePatches) {
             stage(Stage::NoMap, fairPlayPID);
             return result;
         }
@@ -669,7 +669,13 @@ namespace
                 stage(Stage::CodeRead, fairPlayPID);
                 return result;
             }
-            if (memcmp(saved[i].bytes, site.original, site.size) == 0) { ++originals; }
+            // VCN1 的编码器补丁按设备退化为原样；这些条目既视作 original 也视作 patched，
+            // 否则事务重入时永远进不了 Already 判定。
+            const bool identity = memcmp(site.original, site.replacement, site.size) == 0;
+            if (memcmp(saved[i].bytes, site.original, site.size) == 0) {
+                ++originals;
+                if (identity) { ++patched; }
+            }
             else if (memcmp(saved[i].bytes, site.replacement, site.size) == 0) {
                 ++patched;
             }

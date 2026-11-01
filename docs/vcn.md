@@ -3,15 +3,37 @@
 ## 范围
 
 实验性接入按 `VCNCapabilities.hpp` 的能力表选择设备，内核与用户态共用这一判定。
-当前开放 PCI `1002:15E7 / 1636 / 1638 / 164C` 的 VCN 2.2 路径；
-`1002:15D8 / 15DD` 保留分类但不接入 VCN1。能力表必须与 NRed 原有设备分类一致，
+当前开放 PCI `1002:15E7 / 1636 / 1638 / 164C` 的 VCN 2.2 路径与 `1002:15D8` 的 VCN1 路径；
+`1002:15DD` 保留分类但暂不接入。能力表必须与 NRed 原有设备分类一致，
 生成器发现重复、遗漏或未经核实的 VA 分类时拒绝生成。
 
 | PCI ID | NRed 家族 | 视频代际 | 本次接入 |
 | --- | --- | --- | --- |
-| `15D8 / 15DD` | Picasso / Raven（含 Raven2） | VCN 1.x | 拒绝，尚未实现 VCN1 桥接 |
+| `15D8` | Picasso | VCN 1.x | 实验路径：X5000 原生 `AMDUVD7HWEngine` 单引擎（UVD0 解码，Vega10 世代），固件经 SML 寄存器写消息 `commitUVDFWMsg` 下载；SML 基址查询按 Raven 表返回 0x7800；用户态映射 VA 分类 4（Vega 20）；Vcn2 编码器补丁按设备退化为原样 |
+| `15DD` | Raven（含 Raven2） | VCN 1.x | 拒绝，尚未实现 |
 | `1636 / 164C` | Renoir 系列 | VCN 2.2 | 显式启用的实验路径，待实机验收 |
 | `1638 / 15E7` | Cezanne / Barcelo 系列 | VCN 2.2 | 保留 Cezanne 路径，新增设备待实机验收 |
+
+VCN1 的接入不加载 X6000：内核侧在 `X5000::allocateHWEngines` 内按 Vega10 原生形态分配**一个**
+`AMDUVD7HWEngine`（引擎数组槽 5=UVD0），能力位只置 `hasUVD0`；Vega10 的编码在 VCE，Raven 没有对应类。
+IP 基址查询（选择子 0x0C）先按两张 `AMDSML*` 虚表的 +0x58 静态接管；运行期若 `AMDHardware+0x338`
+的实例落在别的类上，`initializeExternalInterfaces` 与引擎 `init` 会按对象真实 vptr 再接管一次，
+并把 Raven 表的 `VCN_BASE__INST0_SEG0`（`0x7800`）写回引擎 `+0x250`。固件下载走 SML 队列
+（`UVDHWEngine::loadUVDFW`）与寄存器写消息（`AMDUVD7HWEngine::commitUVDFWMsg`），不经 CAIL。
+详见 [VCN1 分析](vcn1-analysis.md)。
+
+诊断字段为 `NRedVCN1*`：`Prepared`、`EnginesAllocated`、`EngineInit*`（Result/Type/Base/BaseDec/BaseEnc/
+IsEncode/BaseForced）、`HardwareInitDec/Enc`、`HardwareBaseDec/Enc`、`CailDec/Enc`、`CailDecFailed/CailEncFailed`（两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector）；`StartDec/Enc`、`PowerDec/Enc`（bit1=上电标志，bit0=结果）、`RingsDec/Enc`、`ChannelsDec/Enc` 记录引擎启动各阶段；本轮新增 `SMLPresent/SMLSlotLow/SMLLiveHooked`、`CailFlag`、`CailMsgOpcode`、`CailRetry/CailRetryResult/CailRetryFailedDec|Enc`、`SML*`（Present/SlotLow/LiveHooked/GFX9Verify/BaseVerify/BaseServed/NativeStatus/
+NativeBase）、`HardwareEarlyFlag`、`HardwareSkipFirmware`、`LastHardwareInit`、`InitHardwareCail`、
+`FirmwareAddress`、`RingCount`、`RingArrayLow`、`CailHooked`、`CailClientLow/CailVptrLow/CailSubmitLow`、
+`CailSubmit1/6/7/8/9`、`CailLastSelector`、`CailLastResult`，以及固件消息路径的
+`FwMsgOpcode/FwMsgResult/FwMsgCount`；视频上下文链的 `HasUVD0/HasUVD1/HasVCE`（硬件能力结构
++0xB4/+0xB5/+0xB6 的实际字节）、`NewCtxFlag/NewCtxForced/NewCtxResult`（加速器 +0x1F10 的 bit3
+闸门）、`AccelVideoStart`、`VideoCtxStart`、`VcQueueUVD0/UVD1/VCE`（上下文 +0x1240/+0x1248/+0x1250
+上的队列）、`CapResult/CapUVD0/CapUVD1/CapVCE`、`NewCtxType/NewCtxCodec/NewCtxStatus`、`UvdCtxInit`、
+`ReqCap/ReqCapMode`，以及用户客户端观测的 `SelSeen/SelLast/SelCount`（video context 的
+`getTargetAndMethodForIndex` 收到过的 0x100..0x111 选择子位图与次数）与
+`HWInfoStatus/HWInfoFirst/HWInfoMid/HWInfoTail`（`getHWInfo` 的返回码与能力结构 0x00/0x40/0x44 处的值）。
 
 代际依据 [Linux 内核 AMD 硬件组件表](https://www.kernel.org/doc/html/v6.17/gpu/amdgpu/amd-hardware-list-info.html)。
 同一视频代际是复用现有桥接的依据，不代表 Apple 驱动已经支持或新设备已经硬解成功。

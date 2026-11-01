@@ -2,6 +2,7 @@
 #include <algorithm>
 static std::map<uint64_t,std::vector<uint8_t>> blocks;
 static std::map<uint64_t,int> protections;
+static unsigned dbgId=0,dbgPhase=0;
 static std::vector<uint64_t> imageAddresses,functionAddresses;
 static std::vector<std::string> imagePaths;
 struct MockSection { std::string segment,name; uint64_t address,size; };
@@ -114,7 +115,11 @@ template<typename Patch>static void pages(const Patch* patches,unsigned count){
  }
 }
 static int writer(const void* p,uint64_t a,size_t n){
- writes++;for(auto page=a&~uint64_t(4095);page<=((a+n-1)&~uint64_t(4095));page+=4096)assert(protections.at(page)==3);
+ writes++;for(auto page=a&~uint64_t(4095);page<=((a+n-1)&~uint64_t(4095));page+=4096){
+  auto it=protections.find(page);
+  if(it==protections.end()){fprintf(stderr,"writer miss: page=%llx id=%x phase=%u protections=%zu\n",(unsigned long long)page,dbgId,dbgPhase,protections.size());abort();}
+  assert(it->second==3);
+ }
  if(writes==failWrite){put(a,p,n>2?2:n);return 1;}put(a,p,n);return 0;
 }
 static void rx(){for(auto[a,p]:protections){(void)a;assert(p==5);}}
