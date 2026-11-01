@@ -31,7 +31,9 @@ NativeBase）、`HardwareEarlyFlag`、`HardwareSkipFirmware`、`LastHardwareInit
 +0xB4/+0xB5/+0xB6 的实际字节）、`NewCtxFlag/NewCtxForced/NewCtxResult`（加速器 +0x1F10 的 bit3
 闸门）、`AccelVideoStart`、`VideoCtxStart`、`VcQueueUVD0/UVD1/VCE`（上下文 +0x1240/+0x1248/+0x1250
 上的队列）、`CapResult/CapUVD0/CapUVD1/CapVCE`、`NewCtxType/NewCtxCodec/NewCtxStatus`、`UvdCtxInit`、
-`ReqCap/ReqCapMode`。
+`ReqCap/ReqCapMode`，以及用户客户端观测的 `SelSeen/SelLast/SelCount`（video context 的
+`getTargetAndMethodForIndex` 收到过的 0x100..0x111 选择子位图与次数）与
+`HWInfoStatus/HWInfoFirst/HWInfoMid/HWInfoTail`（`getHWInfo` 的返回码与能力结构 0x00/0x40/0x44 处的值）。
 
 代际依据 [Linux 内核 AMD 硬件组件表](https://www.kernel.org/doc/html/v6.17/gpu/amdgpu/amd-hardware-list-info.html)。
 同一视频代际是复用现有桥接的依据，不代表 Apple 驱动已经支持或新设备已经硬解成功。

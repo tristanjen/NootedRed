@@ -211,3 +211,34 @@ hash 匹配，作者静态数据可复用）。
 - 判读：`NewCtxFlag` 出现而 `NewCtxResult=0` → 闸门未开；`VcQueueUVD0=0` → hasUVD0 字节没生效；
   `CapUVD0=0` → 队列能力为 0（用户态不会选硬解）；`NewCtxStatus` 给出 newContext 的具体失败码；
   `UvdCtxInit=0` 且 `CailDec=0` → 卡在 CAIL 消息层。
+
+## 8. 第五轮实机：上下文打通后的空窗
+
+第五轮 ioreg（Safari 播放 1080p）把上一节推断的整条链全部点亮：`NewCtxFlag=255`（加速器 +0x1F10 的
+bit3 本来就是置位的，`NewCtxForced` 并未改动它）、`NewCtxResult=1`、`AccelVideoStart=1`、
+`VideoCtxStart=1`、`VcQueueUVD0=1`（UVD1/VCE 为 0，与 `HasUVD0=1/HasUVD1=0/HasVCE=0` 一致），
+引擎侧 `EngineInitResult=1`、`EngineInitType=5`、`EngineBase=0x7800`（`EngineBaseForced=1`）、
+`RingsDec=1`、`ChannelsDec=1`，SML 侧 `SMLPresent=1`、`SMLLiveHooked=1`、`SMLGFX9Verify=1`、
+`SMLBaseVerify=1`、`SMLNativeStatus=0`、`SMLNativeBase=0x7E00`、`SMLBaseServed=5`。
+
+空窗在上下文之后：`CapUVD0/CapResult`、`NewCtxType/NewCtxCodec/NewCtxStatus`、`UvdCtxInit`、
+`ReqCap*`、`Cail*`、`FwMsg*`、`LoadUVDFW`、`HardwareInitDec`、`StartDec`、`PowerDec` 一个都没出现。
+也就是说 video context 建好、start 成功，随后既没有人来问能力（`getCapabilities` 未被调用），
+也没有人来建解码上下文（`newContext` 未被调用）；引擎的 `initHardware`（下载固件）在 `init` 之后
+从未进入。`AMDHardware::initializeHWEngines` 与 `startHWEngines` 的钩子也没有触发。
+
+下一处要定位的是「谁在用这个 video context」：`AMDAccelVideoContext` 同时是
+`IOAccelContext2`/`IOUserClient` 的子类，用户态（AppleGVA 的 `AMDRadeonVADriver2`）与它的全部交互
+都经过虚函数 `getTargetAndMethodForIndex(IOService**, uint32_t)`（0x437DA62，index 只接受
+0x100..0x111，方法表基址 0x4584730，条目 0x30 字节；`*target` 被写成 self，`this+0x10E8`
+指向该方法表）。因此本轮加了两个探针：
+
+- `getTargetAndMethodForIndex` 钩子：按 index 置 `SelSeen` 位图（bit0 = 0x100），并记录
+  `SelLast/SelCount`，前 24 次打印 `VCN1 ... index=0x%X`。
+- `getHWInfo`（0x437E9F8）钩子：记录返回码与能力结构 0x00/0x40/0x44 处的值。0x44 由
+  hardware+0xB5（`hasUVD1`）决定，正是用户态判「有没有第二个 UVD」的槽位。
+
+判读：`SelCount=0` 说明用户态从没拿到这个 video context 的用户客户端（问题在加速器上报或
+`IOServiceOpen` 的路由）；`SelLast` 停在某个选择子就顺该方法继续跟；出现 `HWInfoStatus` 而
+`HWInfoTail=0` 则是上报的能力结构自相矛盾。同步抓全量属性（`grep '"NRed'`），
+`NRedVCNUser*/NRedVCNDynamic*` 才反映用户态补丁此刻的真实状态。

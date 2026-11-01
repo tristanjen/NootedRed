@@ -60,6 +60,10 @@ namespace
     UInt32            newVideoContextCount{0}, accelVideoContextStartCount{0}, videoContextStartCount{0};
     UInt32            videoGetCapabilitiesCount{0}, videoNewContextCount{0};
     UInt32            uvdContextInitCount{0}, uvdRequestCapabilityCount{0};
+    // 用户客户端分派与 hwInfo 回报：确定 AppleGVA 在 contextStart 之后实际请求了哪些 selector，
+    // 以及 getHWInfo 给出的能力字节（driver 依此决定是否继续创建解码上下文）。
+    mach_vm_address_t accelDispatchOriginal{0}, accelHWInfoOriginal{0};
+    UInt32            accelDispatchCount{0}, accelDispatchSeen{0}, accelHWInfoCount{0};
     OSMetaClass*            engineClass{nullptr};
     OSMetaClass*            sharedClass{nullptr};
     OSMetaClass*            clientClass{nullptr};
@@ -653,6 +657,42 @@ namespace
         return result;
     }
 
+    // IOUserClient::getTargetAndMethodForIndex：selector 0x100..0x111 都从这里分派，
+    // 记录 driver 实际请求过的 selector 位图，直接指出它在 contextStart 之后停在哪一步。
+    void* accelDispatch(void* self, void** target, UInt32 index)
+    {
+        using Function = void* (*)(void*, void**, UInt32);
+        if (index >= 0x100 && index <= 0x111) {
+            accelDispatchSeen |= 1U << (index - 0x100);
+            NRed::singleton().setProp32("NRedVCN1SelSeen", accelDispatchSeen);
+            NRed::singleton().setProp32("NRedVCN1SelLast", index);
+        }
+        const auto count = __atomic_fetch_add(&accelDispatchCount, 1U, __ATOMIC_RELAXED);
+        NRed::singleton().setProp32("NRedVCN1SelCount", count + 1);
+        if (count < 24) { SYSLOG("VCN1", "getTargetAndMethodForIndex index=0x%X", index); }
+        return reinterpret_cast<Function>(accelDispatchOriginal)(self, target, index);
+    }
+
+    // getHWInfo 把硬件能力结构拷给 AppleGVA；status 与关键字决定 driver 是否继续建解码上下文。
+    UInt32 accelGetHWInfo(void* self, void* info)
+    {
+        using Function    = UInt32 (*)(void*, void*);
+        const auto result = reinterpret_cast<Function>(accelHWInfoOriginal)(self, info);
+        NRed::singleton().setProp32("NRedVCN1HWInfoStatus", result);
+        if (info) {
+            UInt32 first{0}, mid{0}, tail{0};
+            memcpy(&first, static_cast<UInt8*>(info) + 0x00, sizeof(first));
+            memcpy(&mid, static_cast<UInt8*>(info) + 0x40, sizeof(mid));
+            memcpy(&tail, static_cast<UInt8*>(info) + 0x44, sizeof(tail));
+            NRed::singleton().setProp32("NRedVCN1HWInfoFirst", first);
+            NRed::singleton().setProp32("NRedVCN1HWInfoMid", mid);
+            NRed::singleton().setProp32("NRedVCN1HWInfoTail", tail);
+        }
+        auto count = __atomic_fetch_add(&accelHWInfoCount, 1U, __ATOMIC_RELAXED);
+        if (count < 8) { SYSLOG("VCN1", "getHWInfo status=0x%X count=%u", result, count + 1); }
+        return result;
+    }
+
     // VCN1 守卫与钩子：UVD7 虚表槽位与具名符号一致后，才接管 SML 基址查询（选择子 0x0C）。
     bool prepareVCN1(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
     {
@@ -662,6 +702,7 @@ namespace
         mach_vm_address_t accelVideoStartFunction{0}, videoStartFunction{0};
         mach_vm_address_t videoCapsFunction{0}, videoNewContextFunction{0};
         mach_vm_address_t uvdContextInitFunction{0}, uvdRequestCapabilityFunction{0};
+        mach_vm_address_t accelDispatchFunction{0}, accelHWInfoFunction{0};
         bool ok = resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDUVD7HWEngine10gMetaClassE", uvd7EngineMC, slide,
                           size);
         ok &= resolve(patcher, id,
@@ -704,6 +745,11 @@ namespace
                 uvdContextInitFunction, slide, size);
         resolve(patcher, id, "__ZN33AMDRadeonX5000_AMDAccelUVDContext17requestCapabilityEP23sVideoContextReturnInfo",
                 uvdRequestCapabilityFunction, slide, size);
+        // 用户客户端分派与能力回报：定位 driver 在 contextStart 之后的请求序列。
+        resolve(patcher, id, "__ZN35AMDRadeonX5000_AMDAccelVideoContext26getTargetAndMethodForIndexEPP9IOServicej",
+                accelDispatchFunction, slide, size);
+        resolve(patcher, id, "__ZN35AMDRadeonX5000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo",
+                accelHWInfoFunction, slide, size);
         if (!ok) { return false; }
         // __ZTV 的两个头部槽不属于槽位地址；init=+0x118、initHardware=+0x368（24H32 已核对）。
         const auto slot = [engineVTable, slide, size](const UInt32 offset) -> mach_vm_address_t {
@@ -823,6 +869,17 @@ namespace
             KernelPatcher::RouteRequest route{
                 "__ZN33AMDRadeonX5000_AMDAccelUVDContext17requestCapabilityEP23sVideoContextReturnInfo",
                 uvdRequestCapability, uvdRequestCapabilityOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (accelDispatchFunction != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN35AMDRadeonX5000_AMDAccelVideoContext26getTargetAndMethodForIndexEPP9IOServicej", accelDispatch,
+                accelDispatchOriginal};
+            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+        }
+        if (accelHWInfoFunction != 0) {
+            KernelPatcher::RouteRequest route{"__ZN35AMDRadeonX5000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo",
+                                              accelGetHWInfo, accelHWInfoOriginal};
             if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
         }
         return true;
