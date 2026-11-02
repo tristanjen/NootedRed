@@ -373,6 +373,23 @@ namespace
     }
 
 // 早期初始化（X=0x10）与完整初始化（X=0x18）：前者只挂回调，后者才装载 VBIOS 并建适配器。
+    // 客户端字段在早期初始化里才被填满（+0x15/0x16 是 VBIOS 签名，+0x20038 是 CAIL 适配器），
+    // 所以每次调用之后都重新读一遍，避免 ioreg 里留下启动阶段的陈旧读数。
+    void publishCailClient(void* self)
+    {
+        if (!self) { return; }
+        UInt8   ready{0}, vbios{0}, signature{0};
+        UInt64  adapter{0};
+        memcpy(&ready, static_cast<UInt8*>(self) + 0x14, sizeof(ready));
+        memcpy(&vbios, static_cast<UInt8*>(self) + 0x15, sizeof(vbios));
+        memcpy(&signature, static_cast<UInt8*>(self) + 0x16, sizeof(signature));
+        memcpy(&adapter, static_cast<UInt8*>(self) + 0x20038, sizeof(adapter));
+        NRed::singleton().setProp32("NRedVCN1CailReady", ready);
+        NRed::singleton().setProp32("NRedVCN1CailVbios", vbios);
+        NRed::singleton().setProp32("NRedVCN1CailVbiosSignature", signature);
+        NRed::singleton().setProp32("NRedVCN1CailAdapterLow", static_cast<UInt32>(adapter));
+    }
+
     int cailEarlyInitialize(void* self, void* callbacks, void* init)
     {
         if (cailEarlyInitializeOriginal == 0) { return 0xE00002C0; }
@@ -380,6 +397,7 @@ namespace
                                                                                                         init);
         NRed::singleton().setProp32("NRedVCN1CailEarlyCalled", 1);
         NRed::singleton().setProp32("NRedVCN1CailEarly", static_cast<UInt32>(result));
+        publishCailClient(self);
         SYSLOG("VCN1", "CAIL earlyInitialize result=0x%X", result);
         return result;
     }
@@ -390,6 +408,7 @@ namespace
         const auto result = reinterpret_cast<int (*)(void*, void*)>(cailInitializeOriginal)(self, init);
         NRed::singleton().setProp32("NRedVCN1CailInitCalled", 1);
         NRed::singleton().setProp32("NRedVCN1CailInit", static_cast<UInt32>(result));
+        publishCailClient(self);
         SYSLOG("VCN1", "CAIL initialize result=0x%X", result);
         return result;
     }
