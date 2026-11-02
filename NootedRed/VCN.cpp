@@ -39,6 +39,8 @@ namespace
     UInt32                  smlLiveCount{0}, externalInterfacesCount{0};
     // CAIL 侧提交入口（[engine+0x18]->vt[0x2B8] 得到的客户端对象的 +0xD0）只在运行期可见。
     mach_vm_address_t       cailSubmitOriginal{0}, cailClient{0};
+    // CAIL 服务对象的早期/完整初始化槽：硬件侧调用它们之后 uvdControl 才会工作。
+    mach_vm_address_t       cailEarlyInitializeOriginal{0}, cailInitializeOriginal{0};
     UInt32                  cailSubmitCount{0};
     // 两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector。
     UInt32                  cailEncode{0}, cailFailed[2]{0, 0}, cailDecResult{0}, cailEncResult{0};
@@ -365,6 +367,28 @@ namespace
         return result;
     }
 
+// 早期初始化（X=0x10）与完整初始化（X=0x18）：前者只挂回调，后者才装载 VBIOS 并建适配器。
+    int cailEarlyInitialize(void* self, void* callbacks, void* init)
+    {
+        if (cailEarlyInitializeOriginal == 0) { return 0xE00002C0; }
+        const auto result = reinterpret_cast<int (*)(void*, void*, void*)>(cailEarlyInitializeOriginal)(self, callbacks,
+                                                                                                        init);
+        NRed::singleton().setProp32("NRedVCN1CailEarlyCalled", 1);
+        NRed::singleton().setProp32("NRedVCN1CailEarly", static_cast<UInt32>(result));
+        SYSLOG("VCN1", "CAIL earlyInitialize result=0x%X", result);
+        return result;
+    }
+
+    int cailInitialize(void* self, void* init)
+    {
+        if (cailInitializeOriginal == 0) { return 0xE00002C0; }
+        const auto result = reinterpret_cast<int (*)(void*, void*)>(cailInitializeOriginal)(self, init);
+        NRed::singleton().setProp32("NRedVCN1CailInitCalled", 1);
+        NRed::singleton().setProp32("NRedVCN1CailInit", static_cast<UInt32>(result));
+        SYSLOG("VCN1", "CAIL initialize result=0x%X", result);
+        return result;
+    }
+
     void attachCailSubmit(void* interface)
     {
         if (!interface || cailClient != 0) { return; }
@@ -395,6 +419,26 @@ namespace
         NRed::singleton().setProp32("NRedVCN1CailVptrLow",
                                     static_cast<UInt32>(reinterpret_cast<uintptr_t>(clientVptr)));
         NRed::singleton().setProp32("NRedVCN1CailSubmitLow", static_cast<UInt32>(current));
+        // uvdControl 自己在 [+0x14]==0 时直接返回 0xE00002C0：先把这份状态读出来。
+        UInt8 cailReady{0}, cailVbios{0};
+        memcpy(&cailReady, static_cast<UInt8*>(client) + 0x14, sizeof(cailReady));
+        memcpy(&cailVbios, static_cast<UInt8*>(client) + 0x15, sizeof(cailVbios));
+        UInt64 cailAdapter{0};
+        memcpy(&cailAdapter, static_cast<UInt8*>(client) + 0x20038, sizeof(cailAdapter));
+        NRed::singleton().setProp32("NRedVCN1CailReady", cailReady);
+        NRed::singleton().setProp32("NRedVCN1CailVbios", cailVbios);
+        NRed::singleton().setProp32("NRedVCN1CailAdapterLow", static_cast<UInt32>(cailAdapter));
+        const auto hookSlot = [clientVptr](const UInt32 offset, const mach_vm_address_t replacement,
+                                          mach_vm_address_t& original) {
+            auto& entry = clientVptr[offset / sizeof(void*)];
+            if (reinterpret_cast<mach_vm_address_t>(entry) == replacement || original != 0) { return; }
+            if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return; }
+            original = reinterpret_cast<mach_vm_address_t>(entry);
+            entry    = reinterpret_cast<void*>(replacement);
+            MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        };
+        hookSlot(0x10, reinterpret_cast<mach_vm_address_t>(&cailEarlyInitialize), cailEarlyInitializeOriginal);
+        hookSlot(0x18, reinterpret_cast<mach_vm_address_t>(&cailInitialize), cailInitializeOriginal);
         SYSLOG("VCN1", "CAIL submit hooked: interface=%p client=%p slot=%p", interface, client,
                reinterpret_cast<void*>(current));
     }
@@ -423,6 +467,9 @@ namespace
         NRed::singleton().setProp32("NRedVCN1SMLPresent", sml != nullptr);
         void* client{nullptr};
         memcpy(&client, static_cast<UInt8*>(self) + 0x340, sizeof(client));
+        void* services{nullptr};
+        memcpy(&services, static_cast<UInt8*>(self) + 0x320, sizeof(services));
+        NRed::singleton().setProp32("NRedVCN1DSvcZtv", vtableDelta(services));
         NRed::singleton().setProp32("NRedVCN1DSmlZtv", vtableDelta(sml));
         NRed::singleton().setProp32("NRedVCN1DClientZtv", vtableDelta(client));
         attachLiveSML(sml);

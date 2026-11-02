@@ -310,3 +310,50 @@ X5000 切片的 `__ZTV` 表里唯一反查（`build/vcn/list_ztv.py`）。
 `AMDSMLInterface`，`+32320` 是 `AMDSMLCPMsg`（**这一张表此前从未被静态补丁覆盖**，也是第四轮
 `SMLBaseServed` 缺失的合理来源）；`DClientZtv` 若等于 `+32320`，说明 CAIL 提交走的是 SML CP 消息通道，
 失败就落在 CP 消息环而不是 CAIL 的 caps 表。
+
+## 11. 第九轮实机：CAIL 客户端就是 AmdCailServices
+
+第九轮 41 条属性里，虚表差值把两件长期靠猜的事定死了（换算规则：静态差值 = 实测差值 − 0x10，
+因为对象 vptr 指向 `__ZTV` 符号 + 0x10）。
+
+| 对象 | 实测差值 | 归属 | 类 |
+| --- | --- | --- | --- |
+| 硬件对象 `[hw]` | −18496 | X5000 | `AMDVega10Hardware`（静态表 −18528） |
+| 引擎对象 | +16 | X5000 | `AMDUVD7HWEngine`（同表，符合 +0x10 规则） |
+| `[hw+0x338]` | 6232816 | **X5000HWLibs** | `AmdTtlServices`（`__ZTV14AmdTtlServices`=0x4B92900） |
+| `[hw+0x340]` | 6278000 | **X5000HWLibs** | `AmdCailServices`（`__ZTV15AmdCailServices`=0x4B9D980） |
+
+也就是说：`AMDHardware::initializeExternalInterfaces` 里 `vt[0x850]()` 拿到的是 Radeon 固件侧的
+TTL 服务，`vt[0x858]()` 拿到的是 CAIL 服务——**两者都不在 AMDRadeonX5000 里**，所以早先给 X5000 的
+`__ZTV34…AMDSMLGFX9Interface` 打 +0x58 补丁从来没有被调用过（实例根本不是那个类）。
+
+### 两个槽位的真正身份
+
+- `AmdTtlServices::queryHwBlockRegisterBase(hwblock_type, UInt16, UInt32, UInt32*)`（0x4671BC0，X=0x58）：
+  引擎询问 VCN 寄存器基址走的就是它，原生对 hwblock 0xC 返回 **0x7E00**（第九轮 `EngineBaseNative`、
+  `SMLNativeBase` 都是 0x7E00，且没有触发回退）。
+- `AmdCailServices::uvdControl(CailUvdFuncId, CailUvdInput*, CailUvdOutput*)`（0x485CC70，X=0xD0）：
+  `initHardwareCail` 的 `client->vt[0xD0](client, selector, 0, msg)` 就是它。入口两道闸门：
+  `cmp byte ptr [rdi+0x14], 0; je → 返回 0xE00002C0`，`dec esi; cmp esi,8; ja → 返回 0xE00002C7`（合法 id 1–9）。
+
+### 为什么第七轮所有提交都失败
+
+`AmdCailServices::initialize`（0x485A440）与 `earlyInitialize`（0x485A120）自己也都以
+`[+0x14] != 0` 为前提（否则分别返回 0xE00002C0）。`earlyInitialize` 之后做的事是：检查回调结构版本
+`[rsi] == 0x358`、VBIOS 镜像签名 `[+0x15]==0x55 && [+0x16]==0xAA`、调 `_CAILGetExtensionSize`
+（0x47EDBD0）分配 CAIL 适配器并存进 `[+0x20038]`；`initialize` 则把 `_CailInitialize` 的 +0x8…+0x40
+拷进 `self+0x20400…0x20438`、取 `[+0x51]` 写成 `+0x20448`，再调 `_CAILPostVBIOS`（0x47EDBDB）。
+
+而 `[+0x14]` 既不是构造器写的，也不是这两个函数写的（在 0x485A010–0x485D800 范围内没有任何
+`mov byte ptr [reg+0x14], imm`），说明它是**由上层（服务对象的宿主类）在把 CAIL 服务交出去之前置位的**。
+我们的 VCN1 路径把引擎挂进 X5000 之后直接进入 `initHardwareCail`，这一步没有发生，于是 `uvdControl`
+对 selector 1/8/9 一律回 0xE00002C0——与第七轮 `CailDecFailed=8`、`CailRetryResult=0` 完全吻合。
+
+### 本轮新增诊断
+
+`CailReady`（`[client+0x14]`）、`CailVbios`（`[client+0x15]`）、`CailAdapterLow`（`[+0x20038]` 低 32 位）、
+`CailEarly`/`CailEarlyCalled`（X=0x10）、`CailInit`/`CailInitCalled`（X=0x18）、`DSvcZtv`（`[hw+0x320]` 的差值）。
+
+判读：`CailReady=0` 而 `CailEarlyCalled`/`CailInitCalled` 都缺失 → 上层从未初始化 CAIL 服务，下一步要
+找到宿主的调用点（差值可先定位宿主类）；`CailReady=1` 但仍失败 → 问题在 `_CAILUvdControl` 内部，
+按 `CailLastResult` 的具体码继续查。

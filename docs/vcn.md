@@ -137,7 +137,7 @@ Apple TV 在线观看的密钥请求及系统网络／音频 panic 需要独立�
 `UserDynamicRejected` 表示内容或布局核验失败，`UserDynamicReads` 记录有上限的读取次数。
 `UserD04=1` 表示缓存不匹配，`UserD06=1` 表示代码不匹配；
 `SelSeen`/`SelLast`/`SelCount` 记录视频客户端实际请求过的 selector 位图与次数；`HWInfoStatus`/`HWInfoFirst`/`HWInfoMid`/`HWInfoTail` 是 `getHWInfo` 的返回码与字段快照；`DHwZtv`/`DEngineZtv`/`DSmlZtv`/`DClientZtv` 是硬件、引擎、SML、CAIL 客户端对象虚表相对 UVD7 虚表的差值（不随 KASLR 变化）；`EngineBaseNative` 是覆写前的原生 VCN 基址。
-`UserEnabled` 只表示 hook 注册，不能作为硬解成功证据。
+`CailReady`/`CailVbios`/`CailAdapterLow` 是 CAIL 服务对象的就绪字节、VBIOS 签名首字节与适配器句柄低 32 位；`CailEarly`/`CailInit` 记录其 X=0x10/0x18 初始化槽的返回值（`CailEarlyCalled`/`CailInitCalled` 表示是否被调用过）。\n`UserEnabled` 只表示 hook 注册，不能作为硬解成功证据。
 
 验收使用 `-NRedVideoFix`，记录 CPU/PCI、`sw_vers`、`uname -r`、诊断字段及解码器的
 `UsingHardwareAcceleratedVideoDecoder` 属性，并对 H.264/HEVC 输出与软件解码做像素比较。
