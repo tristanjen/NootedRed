@@ -56,6 +56,10 @@ namespace
     mach_vm_address_t       clientStart5000{0}, clientStop5000{0}, clientStart6000{0}, clientStop6000{0};
     mach_vm_address_t       copy5000{0}, copy6000{0}, sml5000{0}, sml6000{0}, initHardwareOriginal{0};
     mach_vm_address_t       signalOriginal{0};
+    // 诊断：视频上下文第一次查询能力时主动把解码引擎的 initHardware 跑一遍，
+    // 这样结论不再依赖「有没有真的播放视频」。
+    void*                   probeEngine{nullptr};
+    UInt32                  probeInitCount{0}, probeFwCount{0};
     void                    (*notifyAccess)(void*){nullptr};
     // 用户态视频链：加速器 +0x1F10 的 bit3 是 newVideoContext 的闸门；
     // Vega10VideoContext 的 contextStart/newContext/getCapabilities 与
@@ -552,6 +556,7 @@ namespace
         NRed::singleton().setProp32("NRedVCN1EngineInitType", engineType);
         NRed::singleton().setProp32("NRedVCN1EngineBase", base);
         NRed::singleton().setProp32("NRedVCN1EngineIsEncode", isEncode);
+        if (result && vcn1Device() && (isEncode & 1) == 0) { probeEngine = self; }
         // 实例身份：硬件对象、引擎对象各自的虚表相对 UVD7 虚表的偏移。
         NRed::singleton().setProp32("NRedVCN1DHwZtv", vtableDelta(interface));
         NRed::singleton().setProp32("NRedVCN1DEngineZtv", vtableDelta(self));
@@ -578,6 +583,43 @@ namespace
         NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareInitEnc" : "NRedVCN1HardwareInitDec", result);
         auto count = __atomic_fetch_add(&uvd7InitHardwareCount, 1U, __ATOMIC_RELAXED);
         if (count < 16) { SYSLOG("VCN1", "UVD7 initHardware result=%u", result); }
+        return result;
+    }
+
+    // 按实例虚表的槽位调用，走的仍是已路由的钩子，因此 initHardware 的观测值同样会更新。
+    mach_vm_address_t engineSlot(void* engine, const mach_vm_address_t offset)
+    {
+        void*    vptr{nullptr};
+        UInt64   target{0};
+        memcpy(&vptr, engine, sizeof(vptr));
+        if (!vptr) { return 0; }
+        memcpy(&target, static_cast<UInt8*>(vptr) + offset, sizeof(target));
+        return static_cast<mach_vm_address_t>(target);
+    }
+
+    bool probeHardwareInit()
+    {
+        if (!probeEngine || !vcn1Device()) { return false; }
+        if (__atomic_load_n(&probeInitCount, __ATOMIC_RELAXED) != 0) { return false; }
+        __atomic_add_fetch(&probeInitCount, 1U, __ATOMIC_RELAXED);
+        UInt8 skipFirmware{0};
+        memcpy(&skipFirmware, static_cast<UInt8*>(probeEngine) + 0x25D, sizeof(skipFirmware));
+        NRed::singleton().setProp32("NRedVCN1ProbeSkipFirmware", skipFirmware);
+        const auto init = engineSlot(probeEngine, 0x368);
+        NRed::singleton().setProp32("NRedVCN1ProbeSlotValid", init != 0);
+        auto result = init ? reinterpret_cast<bool (*)(void*)>(init)(probeEngine) : false;
+        NRed::singleton().setProp32("NRedVCN1ProbeInitResult", result);
+        // 固件下载原本被 +0x25D 跳过；单独跑一次，区分「固件没下载」与「CAIL 初始化失败」。
+        if (!result || skipFirmware != 0) {
+            const auto load = engineSlot(probeEngine, 0x338);
+            if (load && __atomic_load_n(&probeFwCount, __ATOMIC_RELAXED) == 0) {
+                __atomic_add_fetch(&probeFwCount, 1U, __ATOMIC_RELAXED);
+                const auto fw = reinterpret_cast<bool (*)(void*)>(load)(probeEngine);
+                NRed::singleton().setProp32("NRedVCN1ProbeFirmware", fw);
+                SYSLOG("VCN1", "probe loadUVDFW result=%u", fw);
+            }
+        }
+        SYSLOG("VCN1", "probe initHardware result=%u", result);
         return result;
     }
 
@@ -707,6 +749,7 @@ namespace
     {
         using Function    = UInt32 (*)(void*, void*, UInt64*);
         auto  original    = reinterpret_cast<Function>(videoGetCapabilitiesOriginal);
+        probeHardwareInit();
         const auto result = original(self, caps, out);
         if (caps) {
             UInt64 words[12];
