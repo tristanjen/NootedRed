@@ -41,6 +41,7 @@ namespace
     mach_vm_address_t       cailSubmitOriginal{0}, cailClient{0};
     // CAIL 服务对象的早期/完整初始化槽：硬件侧调用它们之后 uvdControl 才会工作。
     mach_vm_address_t       cailEarlyInitializeOriginal{0}, cailInitializeOriginal{0};
+    bool                    cailSlotsHooked{false};
     UInt32                  cailSubmitCount{0};
     // 两个引擎共用同一个 CAIL 客户端，按 isEncode 分开记录首个失败的 selector。
     UInt32                  cailEncode{0}, cailFailed[2]{0, 0}, cailDecResult{0}, cailEncResult{0};
@@ -389,6 +390,38 @@ namespace
         return result;
     }
 
+    void hookCailClient(void* client)
+    {
+        if (!client || cailSlotsHooked) { return; }
+        auto** const clientVptr = *reinterpret_cast<void***>(client);
+        if (!clientVptr) { return; }
+        cailSlotsHooked = true;
+        NRed::singleton().setProp32("NRedVCN1CailClientSeen", 1);
+        NRed::singleton().setProp32("NRedVCN1CailClientLow",
+                                    static_cast<UInt32>(reinterpret_cast<uintptr_t>(client)));
+        NRed::singleton().setProp32("NRedVCN1CailVptrLow",
+                                    static_cast<UInt32>(reinterpret_cast<uintptr_t>(clientVptr)));
+        UInt8 cailReady{0}, cailVbios{0};
+        memcpy(&cailReady, static_cast<UInt8*>(client) + 0x14, sizeof(cailReady));
+        memcpy(&cailVbios, static_cast<UInt8*>(client) + 0x15, sizeof(cailVbios));
+        UInt64 cailAdapter{0};
+        memcpy(&cailAdapter, static_cast<UInt8*>(client) + 0x20038, sizeof(cailAdapter));
+        NRed::singleton().setProp32("NRedVCN1CailReady", cailReady);
+        NRed::singleton().setProp32("NRedVCN1CailVbios", cailVbios);
+        NRed::singleton().setProp32("NRedVCN1CailAdapterLow", static_cast<UInt32>(cailAdapter));
+        const auto hookSlot = [clientVptr](const UInt32 offset, const mach_vm_address_t replacement,
+                                          mach_vm_address_t& original) {
+            auto& entry = clientVptr[offset / sizeof(void*)];
+            if (reinterpret_cast<mach_vm_address_t>(entry) == replacement || original != 0) { return; }
+            if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return; }
+            original = reinterpret_cast<mach_vm_address_t>(entry);
+            entry    = reinterpret_cast<void*>(replacement);
+            MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        };
+        hookSlot(0x10, reinterpret_cast<mach_vm_address_t>(&cailEarlyInitialize), cailEarlyInitializeOriginal);
+        hookSlot(0x18, reinterpret_cast<mach_vm_address_t>(&cailInitialize), cailInitializeOriginal);
+    }
+
     void attachCailSubmit(void* interface)
     {
         if (!interface || cailClient != 0) { return; }
@@ -459,6 +492,8 @@ namespace
     }
 
     // +0x338 是 SML 接口指针（由 services->vt[0x850] 创建）：一出现就接管其查询槽。
+    void hookCailClient(void* client);
+
     void externalInterfaces(void* self)
     {
         reinterpret_cast<void (*)(void*)>(externalInterfacesOriginal)(self);
@@ -472,6 +507,9 @@ namespace
         NRed::singleton().setProp32("NRedVCN1DSvcZtv", vtableDelta(services));
         NRed::singleton().setProp32("NRedVCN1DSmlZtv", vtableDelta(sml));
         NRed::singleton().setProp32("NRedVCN1DClientZtv", vtableDelta(client));
+        // 服务对象的 start 已经把 CAIL 实例交出来了：先按实例挂槽并读出就绪字节，
+        // 这样即使这一轮没有播放视频（initHardwareCail 不会被调用）也能看到闸门状态。
+        hookCailClient(client);
         attachLiveSML(sml);
         const auto count = __atomic_fetch_add(&externalInterfacesCount, 1U, __ATOMIC_RELAXED);
         if (count < 8) { SYSLOG("VCN1", "initializeExternalInterfaces self=%p sml=%p", self, sml); }
