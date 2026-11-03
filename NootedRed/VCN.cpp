@@ -736,6 +736,7 @@ namespace
         auto  original    = reinterpret_cast<Function>(accelVideoContextStartOriginal);
         const auto result = original(self);
         NRed::singleton().setProp32("NRedVCN1AccelVideoStart", result);
+        if (result) { probeHardwareInit(); }
         auto count = __atomic_fetch_add(&accelVideoContextStartCount, 1U, __ATOMIC_RELAXED);
         if (count < 8) { SYSLOG("VCN1", "AccelVideoContext::contextStart result=%u", result); }
         return result;
@@ -839,6 +840,8 @@ namespace
         }
         const auto count = __atomic_fetch_add(&accelDispatchCount, 1U, __ATOMIC_RELAXED);
         NRed::singleton().setProp32("NRedVCN1SelCount", count + 1);
+        // 用户客户端的第一次分派已经在解码会话之外，把硬件初始化提前跑掉，结论不再依赖播放。
+        if (count < 4) { probeHardwareInit(); }
         if (count < 24) { SYSLOG("VCN1", "getTargetAndMethodForIndex index=0x%X", index); }
         return reinterpret_cast<Function>(accelDispatchOriginal)(self, target, index);
     }
