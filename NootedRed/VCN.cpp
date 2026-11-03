@@ -1254,3 +1254,41 @@ void VCN::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide
     NRed::singleton().setProp32(old ? "NRedVCNX5000Prepared" : "NRedVCNX6000Prepared", ok);
     SYSLOG("VCN", "%s prepared=%u ready=%u", old ? "X5000" : "X6000", ok, ready());
 }
+
+// CAIL 库层：AmdCailServices::uvdControl 把任何非零返回都归一化成 0xE00002C7，
+// 钩到库函数本身才能看到真实原因（1=caps 未启用、2=非法 id、3=适配器未就绪、0xA=不支持）。
+static mach_vm_address_t cailUvdControlOriginal{0};
+
+static int cailUvdControlHook(void* adapter, const UInt32 function, void* input, void* output)
+{
+    const auto result = reinterpret_cast<int (*)(void*, UInt32, void*, void*)>(cailUvdControlOriginal)(adapter, function,
+                                                                                                      input, output);
+    NRed::singleton().setProp32("NRedVCN1CailLibFunc", function);
+    NRed::singleton().setProp32("NRedVCN1CailLibResult", static_cast<UInt32>(result));
+    if (adapter != nullptr) {
+        // 能力位图在适配器 +0x358（_CailCapsEnabled 取基址 +0x1E0）：0xD6 = word6 bit22、0x15B = word10 bit27。
+        UInt32 words[16]{};
+        memcpy(words, static_cast<UInt8*>(adapter) + 0x358, sizeof(words));
+        UInt32 set{0};
+        for (const auto word : words) { set += static_cast<UInt32>(__builtin_popcount(word)); }
+        NRed::singleton().setProp32("NRedVCN1CailCapBits", set);
+        NRed::singleton().setProp32("NRedVCN1CailCapD6", (words[6] >> 22) & 1U);
+        NRed::singleton().setProp32("NRedVCN1CailCap15B", (words[10] >> 27) & 1U);
+    }
+    static UInt32 count{0};
+    const auto    seen = __atomic_fetch_add(&count, 1U, __ATOMIC_RELAXED);
+    if (seen < 16) { SYSLOG("VCN1", "CAIL library uvdControl func=%u result=%d", function, result); }
+    return result;
+}
+
+void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
+{
+    if (!vcn1Device()) { return; }
+    KernelPatcher::RouteRequest route{"_CAILUvdControl", cailUvdControlHook, cailUvdControlOriginal};
+    if (!patcher.routeMultiple(id, &route, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 0);
+        return;
+    }
+    NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
+}

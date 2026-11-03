@@ -4,6 +4,7 @@
 // See LICENSE for details.
 
 #include "GoldenSettings.hpp"
+#include "VCN.hpp"
 #include <ASICCaps.hpp>
 #include <GPUDriversAMD/CAIL/ASICCaps.hpp>
 #include <GPUDriversAMD/CAIL/DevCaps.hpp>
@@ -570,6 +571,9 @@ X5000HWLibs::X5000HWLibs()
 void X5000HWLibs::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
 {
     if (kextRadeonX5000HWLibs.loadIndex != id) { return; }
+
+    // VCN1（Picasso）：CAIL 的 uvdControl 只暴露归一化错误码，必须在库层拿真实返回。
+    VCN::hookCailLibrary(patcher, id, slide, size);
 
     NRed::singleton().hwLateInit();
 

@@ -15,5 +15,7 @@ namespace VCN
     bool vcn1Ready();
     // 分配一个 X5000 原生 AMDUVD7HWEngine；VCN1 只有这一个视频引擎（解码），编码需另寻路径。
     void* allocateUVD7Engine();
+    // CAIL 库层（X5000HWLibs）：钩 _CAILUvdControl 拿真实返回码与能力位图。
+    void  hookCailLibrary(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size);
 
 }    // namespace VCN
