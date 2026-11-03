@@ -1261,6 +1261,16 @@ static mach_vm_address_t cailUvdControlOriginal{0};
 
 static int cailUvdControlHook(void* adapter, const UInt32 function, void* input, void* output)
 {
+    // _CAILUvdControl 要求能力位图里 0xD6(word6 bit22) 或 0x15B(word10 bit27) 至少一个置位，
+    // 而 Raven/Picasso 的静态 DDI 能力表两位都是 0，只能由驱动在运行期补上；先记为探针。
+    if (adapter != nullptr && function >= 1 && function <= 9) {
+        auto* const words = reinterpret_cast<UInt32*>(static_cast<UInt8*>(adapter) + 0x358);
+        NRed::singleton().setProp32("NRedVCN1CailCapW6Before", words[6]);
+        NRed::singleton().setProp32("NRedVCN1CailCapW10Before", words[10]);
+        words[6] |= 1U << 22;
+        words[10] |= 1U << 27;
+        NRed::singleton().setProp32("NRedVCN1CailCapForced", 1);
+    }
     const auto result = reinterpret_cast<int (*)(void*, UInt32, void*, void*)>(cailUvdControlOriginal)(adapter, function,
                                                                                                       input, output);
     NRed::singleton().setProp32("NRedVCN1CailLibFunc", function);
