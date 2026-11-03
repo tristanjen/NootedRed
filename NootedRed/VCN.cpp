@@ -351,6 +351,17 @@ namespace
             memcpy(&opcode, message, sizeof(opcode));
             NRed::singleton().setProp32("NRedVCN1CailMsgOpcode", opcode);
         }
+        // _CAILUvdControl 先用适配器状态决定返回值：+0xE34 的 bit2 必须置位、bit17 必须清零，
+        // 再看 caps 0xD6/0x15B。把这三个判据一起发布，失败就不再需要靠猜。
+        void* adapter{nullptr};
+        memcpy(&adapter, static_cast<UInt8*>(client) + 0x20038, sizeof(adapter));
+        if (adapter) {
+            UInt32 flags{0};
+            memcpy(&flags, static_cast<UInt8*>(adapter) + 0xE34, sizeof(flags));
+            NRed::singleton().setProp32("NRedVCN1CailAdapterFlags", flags);
+            NRed::singleton().setProp32("NRedVCN1CailGateBit2", (flags >> 2) & 1U);
+            NRed::singleton().setProp32("NRedVCN1CailGateBit17", (flags >> 17) & 1U);
+        }
         if (result != 0 && cailRetryActive && cailRetryFailed[cailEncode & 1] == 0) {
             cailRetryFailed[cailEncode & 1] = selector;
         }
