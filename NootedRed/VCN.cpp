@@ -1264,12 +1264,10 @@ static int cailUvdControlHook(void* adapter, const UInt32 function, void* input,
     // _CAILUvdControl 要求能力位图里 0xD6(word6 bit22) 或 0x15B(word10 bit27) 至少一个置位，
     // 而 Raven/Picasso 的静态 DDI 能力表两位都是 0，只能由驱动在运行期补上；先记为探针。
     if (adapter != nullptr && function >= 1 && function <= 9) {
-        auto* const words = reinterpret_cast<UInt32*>(static_cast<UInt8*>(adapter) + 0x358);
-        NRed::singleton().setProp32("NRedVCN1CailCapW6Before", words[6]);
-        NRed::singleton().setProp32("NRedVCN1CailCapW10Before", words[10]);
-        words[6] |= 1U << 22;
-        words[10] |= 1U << 27;
-        NRed::singleton().setProp32("NRedVCN1CailCapForced", 1);
+        // 只读：0xD6/0x15B 在实机上本来就已置位，失败来自 _CailUvdInit 内部的门。
+        const auto* const words = reinterpret_cast<const UInt32*>(static_cast<const UInt8*>(adapter) + 0x358);
+        NRed::singleton().setProp32("NRedVCN1CailCapW6", words[6]);
+        NRed::singleton().setProp32("NRedVCN1CailCapW10", words[10]);
     }
     const auto result = reinterpret_cast<int (*)(void*, UInt32, void*, void*)>(cailUvdControlOriginal)(adapter, function,
                                                                                                       input, output);
@@ -1291,6 +1289,35 @@ static int cailUvdControlHook(void* adapter, const UInt32 function, void* input,
     return result;
 }
 
+// _CailUvdInit(adapter, input)：id 1 的尾跳目标，真正的失败码从这里返回。
+static mach_vm_address_t cailUvdInitOriginal{0};
+
+static int cailUvdInitHook(void* adapter, void* input)
+{
+    if (adapter != nullptr) {
+        const auto read32 = [](const void* base, const size_t offset) {
+            UInt32 value{0};
+            memcpy(&value, static_cast<const UInt8*>(base) + offset, sizeof(value));
+            return value;
+        };
+        NRed::singleton().setProp32("NRedVCN1CailE48", read32(adapter, 0xE48));
+        NRed::singleton().setProp32("NRedVCN1CailUvdW6", read32(adapter, 0x370));
+        NRed::singleton().setProp32("NRedVCN1CailUvdW8", read32(adapter, 0x378));
+        NRed::singleton().setProp32("NRedVCN1CailInitPtr", read32(adapter, 0x12D8));
+        if (input != nullptr) {
+            NRed::singleton().setProp32("NRedVCN1CailInitVersion", read32(input, 0x0));
+            NRed::singleton().setProp32("NRedVCN1CailInitMode", read32(input, 0x144));
+        }
+    }
+    const auto result = reinterpret_cast<int (*)(void*, void*)>(cailUvdInitOriginal)(adapter, input);
+    NRed::singleton().setProp32("NRedVCN1CailInitResult", static_cast<UInt32>(result));
+    static UInt32 count{0};
+    if (__atomic_fetch_add(&count, 1U, __ATOMIC_RELAXED) < 8) {
+        SYSLOG("VCN1", "CAIL UvdInit result=%d", result);
+    }
+    return result;
+}
+
 void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
 {
     if (!vcn1Device()) { return; }
@@ -1300,5 +1327,11 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
         NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 0);
         return;
     }
+    KernelPatcher::RouteRequest initRoute{"_CailUvdInit", cailUvdInitHook, cailUvdInitOriginal};
+    if (!patcher.routeMultiple(id, &initRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1CailInitHooked", 0);
+    }
+    else { NRed::singleton().setProp32("NRedVCN1CailInitHooked", 1); }
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
