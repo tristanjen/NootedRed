@@ -1303,6 +1303,7 @@ static int cailUvdControlHook(void* adapter, const UInt32 function, void* input,
 
 // _CailUvdInit(adapter, input)：id 1 的尾跳目标，真正的失败码从这里返回。
 static mach_vm_address_t cailUvdInitOriginal{0};
+static mach_vm_address_t cailLibrarySlide{0};
 
 static int cailUvdInitHook(void* adapter, void* input)
 {
@@ -1315,7 +1316,17 @@ static int cailUvdInitHook(void* adapter, void* input)
         NRed::singleton().setProp32("NRedVCN1CailE48", read32(adapter, 0xE48));
         NRed::singleton().setProp32("NRedVCN1CailUvdW6", read32(adapter, 0x370));
         NRed::singleton().setProp32("NRedVCN1CailUvdW8", read32(adapter, 0x378));
-        NRed::singleton().setProp32("NRedVCN1CailInitPtr", read32(adapter, 0x12D8));
+        UInt32 lo{0}, hi{0};
+        memcpy(&lo, static_cast<const UInt8*>(adapter) + 0x12D8, sizeof(lo));
+        memcpy(&hi, static_cast<const UInt8*>(adapter) + 0x12DC, sizeof(hi));
+        NRed::singleton().setProp32("NRedVCN1CailInitPtr", lo);
+        NRed::singleton().setProp32("NRedVCN1CailInitPtrHi", hi);
+        // 减去 kext 的 slide 才能和符号表里的地址对上。
+        const auto ptr = (static_cast<mach_vm_address_t>(hi) << 32) | lo;
+        if (cailLibrarySlide != 0 && ptr > cailLibrarySlide) {
+            NRed::singleton().setProp32("NRedVCN1CailInitFunc", static_cast<UInt32>(ptr - cailLibrarySlide));
+        }
+        NRed::singleton().setProp32("NRedVCN1CailE15D0", read32(adapter, 0x15D0) & 0xFFU);
         if (input != nullptr) {
             NRed::singleton().setProp32("NRedVCN1CailInitVersion", read32(input, 0x0));
             NRed::singleton().setProp32("NRedVCN1CailInitMode", read32(input, 0x144));
@@ -1333,6 +1344,7 @@ static int cailUvdInitHook(void* adapter, void* input)
 void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
 {
     if (!vcn1Device()) { return; }
+    cailLibrarySlide = slide;
     KernelPatcher::RouteRequest route{"_CAILUvdControl", cailUvdControlHook, cailUvdControlOriginal};
     if (!patcher.routeMultiple(id, &route, 1, slide, size)) {
         patcher.clearError();
