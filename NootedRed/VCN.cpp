@@ -1263,11 +1263,23 @@ static int cailUvdControlHook(void* adapter, const UInt32 function, void* input,
 {
     // _CAILUvdControl 要求能力位图里 0xD6(word6 bit22) 或 0x15B(word10 bit27) 至少一个置位，
     // 而 Raven/Picasso 的静态 DDI 能力表两位都是 0，只能由驱动在运行期补上；先记为探针。
-    if (adapter != nullptr && function >= 1 && function <= 9) {
-        // 只读：0xD6/0x15B 在实机上本来就已置位，失败来自 _CailUvdInit 内部的门。
-        const auto* const words = reinterpret_cast<const UInt32*>(static_cast<const UInt8*>(adapter) + 0x358);
-        NRed::singleton().setProp32("NRedVCN1CailCapW6", words[6]);
-        NRed::singleton().setProp32("NRedVCN1CailCapW10", words[10]);
+    if (adapter != nullptr) {
+        auto* const words = reinterpret_cast<UInt32*>(static_cast<UInt8*>(adapter) + 0x358);
+        if (function >= 1 && function <= 9) {
+            // 只记一次「原始值」，避免被下面强制写入后的读数覆盖。
+            static bool loggedBase{false};
+            if (!loggedBase) {
+                loggedBase = true;
+                NRed::singleton().setProp32("NRedVCN1CailCapBase6", words[6]);
+                NRed::singleton().setProp32("NRedVCN1CailCapBase10", words[10]);
+            }
+            // Raven/Picasso 的静态 DDI 能力表没有 0xD6(word6 bit22)/0x15B(word10 bit27)，
+            // 而 _CAILUvdControl 要求二者之一置位才会走到 _CailUvdInit。
+            words[6] |= 1U << 22;
+            words[10] |= 1U << 27;
+            NRed::singleton().setProp32("NRedVCN1CailCapD6", (words[6] >> 22) & 1U);
+            NRed::singleton().setProp32("NRedVCN1CailCap15B", (words[10] >> 27) & 1U);
+        }
     }
     const auto result = reinterpret_cast<int (*)(void*, UInt32, void*, void*)>(cailUvdControlOriginal)(adapter, function,
                                                                                                       input, output);
