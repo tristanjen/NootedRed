@@ -1326,6 +1326,10 @@ static int cailUvdInitHook(void* adapter, void* input)
         if (cailLibrarySlide != 0 && ptr > cailLibrarySlide) {
             NRed::singleton().setProp32("NRedVCN1CailInitFunc", static_cast<UInt32>(ptr - cailLibrarySlide));
         }
+        // slide 的基准不明，改用与已钩函数 _CailUvdInit 的差值定位 ASIC 专用 init。
+        if (cailUvdInitOriginal != 0 && ptr > cailUvdInitOriginal) {
+            NRed::singleton().setProp32("NRedVCN1CailInitDelta", static_cast<UInt32>(ptr - cailUvdInitOriginal));
+        }
         NRed::singleton().setProp32("NRedVCN1CailE15D0", read32(adapter, 0x15D0) & 0xFFU);
         if (input != nullptr) {
             NRed::singleton().setProp32("NRedVCN1CailInitVersion", read32(input, 0x0));
