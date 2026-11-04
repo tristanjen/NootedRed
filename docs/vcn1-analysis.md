@@ -357,3 +357,15 @@ TTL 服务，`vt[0x858]()` 拿到的是 CAIL 服务——**两者都不在 AMDRa
 判读：`CailReady=0` 而 `CailEarlyCalled`/`CailInitCalled` 都缺失 → 上层从未初始化 CAIL 服务，下一步要
 找到宿主的调用点（差值可先定位宿主类）；`CailReady=1` 但仍失败 → 问题在 `_CAILUvdControl` 内部，
 按 `CailLastResult` 的具体码继续查。
+
+## 12. 第十轮：CAIL 能力闸门与 _CailUvdInit
+
+AmdCailServices::uvdControl(0x485CC70) 把任何非零 CAIL 返回都归一化成 0xE00002C7，所以在 HWLibs 层钩 _CAILUvdControl(0x47F05E7) 才能看到真实原因：
+
+- _CAILUvdControl：[adapter+0x14] 是设备在位闸门（构造器 0x485A010 用 0F 95 写入，读 PCI 0xFFFF 判定）；id 只接受 1..9；能力闸门 _CailCapsEnabled(adapter+0x178, 0xD6) 与 (…, 0x15B) 都关时返回 1，位图在 adapter+0x358（16 dword）；test byte [adapter+0xE34],4 为 0 返回 3，bit17 置位返回 0xA。
+- 原生 DDI 表 _CAIL_DDI_CAPS_PICASSO_A0(0x60F0440) 的 word6=0x20000000、word10=0x02000120，bit22（0xD6）与 bit27（0x15B）都是 0，所以 Picasso 上 CAIL 默认不给 UVD 能力，VCN1 必须自己置位。
+- _CailUvdInit(0x47F64BF) 门禁依次是 [adapter+0x15D0]&0x10、输入版本 0x148、[adapter+0xE48] bit8/bit20、[adapter+0x370]&4 与 [adapter+0x378]&0x48000，全部为 0 时走 call qword ptr [adapter+0x12D8]（ASIC 专用 UVD init），其返回值就是 initHardwareCail 的错误码。
+
+诊断字段：CailCapBase6/CailCapBase10（adapter 首次出现的原始能力位）、CailCapD6/CailCap15B（置位后）、CailLibFunc/CailLibResult（库层真实返回）、CailInitVersion/CailInitMode/CailE48/CailUvdW6/CailUvdW8/CailInitResult、CailInitPtr/CailInitPtrHi/CailInitFunc/CailInitDelta/CailE15D0。
+
+当前阻塞：[adapter+0x12D8] 指向的 ASIC init 返回 1。用 CailInitDelta（与 _CailUvdInit 的地址差）比对即可确认是哪一个：Tahiti 0x11297、Dummy 0x1D28D、Bonaire 0x23710、Tonga 0x30806、Ellesmere 0x39F96。
