@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `931b6d3` VPF: Include 0x15D8 in the VCN device mask；docs（本轮） |
+| 最新提交 | `366eea0` VCN1: Make _CailUvdInit idempotent and stub per adapter；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -50,38 +50,35 @@ ioreg -l | grep -o '"NRed[A-Za-z0-9]*" = [0-9a-fA-Fx]*' > ~/Desktop/vcn1-boot.tx
 - 视频上下文：`accel+0x1F10` bit3 本来就置位，`NewCtxResult=1`、`VideoCtxStart=1`、`VcQueueUVD0=1`。
 - 内核 VCN1 初始化：Greenland ASIC init 的 MCIL 等待用返回 0 的桩绕过后，`InitHardwareCail=1`、
   `HardwareInitDec=1`、`ProbeInitResult=1`（2026-11-07 实机）。
+- 用户态 VA：共享缓存补丁 Applied（`VCNUserApplied=16`、`VCNUserD15=1`）、`VCNDecoderPID` 出现、
+  `NewCtxStatus=0`、`UvdCtxInit=1`、`ReqCap=1`（2026-11-07 21:53 实机）。
 
 ## 当前阻塞点
 
-**内核侧已通**（2026-11-07 18:00 dump）：`CailInitDelta=0x5AFB7`、`CailFamily=0x8E`、`CailRevision=0x42`、
-`CailInitFirstResult=1`、`CailStubResult=0`、`CailInitResult=0`、`CailMcilLow`/`CailMcilWaitLow` 非零，
-`InitHardwareCail=1`、`CailDec=1`、`HardwareInitDec=1`、`ProbeInitResult=1`。`[adapter+0x12D8]` 确认为
-`_greenland_uvd_init`(0x4851476)，失败点是 `_Cail_MCILWaitFor` 等 UVD 寄存器 0x83AF bit1（详见
-`docs/vcn1-analysis.md` §13）。桩已生效，CAIL 初始化链路走通。
+**内核初始化**（2026-11-07 18:00/21:06 dump）：`[adapter+0x12D8]` 确认为 `_greenland_uvd_init`
+(0x4851476)，失败点是 `_Cail_MCILWaitFor` 等 UVD 寄存器 0x83AF bit1；桩生效时
+`HardwareInitDec=1`（§13）。
 
-**用户态阻塞**：`CapUVD0`/`CapResult` 未出现，`getCapabilities` 从未被调用；QuickTime 日志
-`(AppleGVA) GVA error: AVD_api.Create failed err=5`，`UserApplied`/`DecoderPID` 都没有。
+**用户态已打通**（2026-11-07 21:53 dump）：`VCNUserApplied=16`、`VCNUserD15=1`（Applied）、
+`VCNVPFPath=1`、`VPFPlanState=2`（AllPatched）、`VCNDecoderPID=1027`、`VCNGVASelectionFix=1`；
+GVA 日志不再报 `AVD_api.Create failed err=5`。VA 驱动已经发起 `NewCtxStatus=0`、`UvdCtxInit=1`、
+`ReqCap=1`（mode 6）——只差引擎能力。
 
-已解决的两层阻塞（2026-11-07 21:06 dump）：
+**当前阻塞**：同一 dump 里内核侧 `HardwareInitDec=0`、`StartDec=0`。原因是 `_CailUvdInit` 对同一
+adapter **不幂等**：第一次成功按 mode=0 置 `[adapter+0xE48]` bit8，`initHardwareCail` 的 flag=0
+重试再次进入时被库层门禁直接返回 1（`CailE48=0x100`、`CailInitFirstResult=1`、`CailStubResult=1`）。
+另外桩安装原来用全局 bool，第二个 adapter 会漏装。修复：按 mode 的完成位（bit8/bit20）短路返回 0、
+桩按 adapter 安装，新增 `CailInitCalls`/`CailInitAlready`/`CailAsicStubAdapter`（§16）。
 
-1. `PatchManifestData.hpp` 陈旧，Vcn2Decode 没有 15D8（1276959 加了 `Patches15D8` 却没重跑生成器）→
-   已重新生成，新增 `Sites_Vcn2Decode_Darwin24_15D8` + `FeatureManifest`（§14）。
-2. 新 dump 出现 `NRedVCNVPFPlannerRejected=1`：`VcnDeviceMask` 只有 bit2–5，`deviceBit(0x15D8)=bit0`
-   被 `VPF::plan` 的 `gated()` 拒绝。已把 bit0 加入 `VcnDeviceMask`，0x15DD 仍保持 display-only；
-   `planner_probe` 同步更新，计划基线重新冻结为 31 个（15D8 的 23 个站点与其它 Darwin24 设备逐字节一致）。
-   详见 `docs/vcn1-analysis.md` §15。
-
-`DRMVideoPatchCount=18` 是 `selectFairPlayDecode` 回写的 FairPlay 子集数量（23 选 18），不是旧 build。
+`CapUVD0`/`CapResult=0` 是 init 失败的后果：查询已经到达内核并写入了属性，但引擎没 start，能力为 0。
 
 ## 下一步
 
-1. 安装新 `build/ddr/Build/Products/Release/NootedRed.kext` 重启，播 30 秒 QuickTime 视频，读
-   `NRedVCNUserApplied`、`NRedVCNDecoderPID`、`NRedVCNUserD15`（Applied）以及
-   `NRedVCN1CapUVD0`/`NRedVCN1CapResult`、`NRedVCNVPFPlannerRejected`/`NRedVCNVPFPath`。
-2. 若 `CapResult` 非零 → 用户态已开始查询硬件能力，确认 `UsingHardwareAcceleratedVideoDecoder`，
-   与软解做像素比对。
-3. 若仍无 Applied，按新的阶段位（Region/Protection/Write/Restore）和 `DRMVideoLastStage`、
-   `NRedVCNVPFQuarantined` 继续查 VM 事务。
+1. 安装新 kext 重启、播 30 秒 QuickTime，读 `NRedVCN1HardwareInitDec`、`NRedVCN1StartDec`、
+   `NRedVCN1CapUVD0`/`CapResult`、`CailInitCalls`/`CailInitAlready`。
+2. 若 `CapResult` 非零 → 确认 `UsingHardwareAcceleratedVideoDecoder`，与软解做像素比对。
+3. 若 `StartDec` 仍为 0 → 查 `start()` 在 initHardware 之后还卡在哪；若 `StartDec=1` 但 Cap 仍 0 →
+   查视频上下文/队列的能力填充。
 
 ## 反汇编环境
 

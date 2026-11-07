@@ -502,3 +502,41 @@ constexpr UInt32 VcnDeviceMask = (1U << 2) | (1U << 3) | (1U << 4) | (1U << 5);
 下一轮实机应看到 FairPlay 事务进入 Applied（`UserD15`、`UserApplied`、`DecoderPID`），随后
 `CapUVD0`/`CapResult` 应被 `getCapabilities` 写入。若还停在新阶段（Region/Protection/Write 等），
 按 `DRMVideoLastStage` 与 `NRedVCNVPFQuarantined` 继续。
+
+## 16. 第十三轮：用户态补丁生效，内核 `_CailUvdInit` 重复调用门禁
+
+21:53 dump 是第一次用户态链路真正打通：
+
+- `VCNUserApplied=16`、`VCNUserD15=1`（Applied）、`VCNVPFPath=1`、`VPFPlannerEnabled=448`、
+  `VPFPlanState=2`（AllPatched）、`VCNGVASelectionFix=1`、`VCNDecoderPID=1027`；
+  GVA 日志不再出现 `AVD_api.Create failed err=5`。
+- VA 驱动开始查询内核：`NewCtxType=0`、`NewCtxCodec=3`、`NewCtxStatus=0`、`UvdCtxInit=1`、
+  `ReqCap=1`、`ReqCapMode=6`、`CapResult=0`、`CapUVD0=0`。
+
+但内核解码引擎这次反而没起来：`HardwareInitDec=0`、`StartDec=0`、`InitHardwareCail=0`、`CailDec=0`、
+`CailLastResult=0xE00002C7`。
+
+原因不在桩本身，而是 `_CailUvdInit` **对同一适配器不幂等**：
+
+1. 第一次调用成功（槽被换成返回 0 的桩），末尾按 mode=0 置 `[adapter+0xE48] |= 0x100`。
+2. `uvd7InitHardwareCail` 的 flag=0 重试再次走 `_CAILUvdControl(id=1)` → `_CailUvdInit`。
+3. 库层门禁（0x47F64FF 起）看到 bit8 已置、mode=0，直接在 0x47F650F 返回 1，根本没走到
+   `[adapter+0x12D8]`。dump 里的 `CailE48=0x100`、`CailInitFirstResult=1`、`CailStubResult=1` 正是这条。
+
+这一轮第一次尝试比前几轮走得更远（用户态 VA patch 改变了初始化时序），所以第一次尝试自己就完成了
+CAIL init；以前是 flag=1 尝试在 uvdControl(1) 之前失败，flag=0 重试才做第一次 init，因此没撞上门禁。
+
+同时发现桩安装逻辑的另一个问题：`cailAsicInitStubActive` 是全局 bool，第二个 adapter 失败时不会再装桩
+（dump 里 `CailAsicStubPtr` 是一个 adapter 的 Greenland 指针，而最后一次调用的 `CailInitPtr` 是另一个
+adapter 的槽，`CailInitDelta=0x7EBA6AA1`）。
+
+修复：
+
+- `_CailUvdInit` 钩子在入口检查该 mode 的完成位（mode 0 → bit8，mode 1 → bit20）；已置位就直接返回 0，
+  不再调原函数（等价于「这个 adapter 已经做过这次 init」）。
+- 桩改为按 adapter 安装：只有当前槽不是 `cailAsicInitReturnZero` 时才替换，并记录
+  `CailAsicStubAdapter`。
+- 新增 `CailInitCalls`、`CailInitAlready` 诊断。
+
+下一轮预期：`HardwareInitDec=1`、`StartDec=1`，随后 `CapUVD0`/`CapResult` 应为非零；若 Cap 仍为 0，
+再查引擎 start / capability 填充路径。
