@@ -1314,6 +1314,13 @@ static int cailAsicInitReturnZero(void*, void*) { return 0; }
 
 static int cailUvdInitHook(void* adapter, void* input)
 {
+    static UInt32 initCalls{0};
+    const auto    callIndex = __atomic_fetch_add(&initCalls, 1U, __ATOMIC_RELAXED);
+    NRed::singleton().setProp32("NRedVCN1CailInitCalls", callIndex + 1);
+    // _CailUvdInit 对同一适配器重复调用不是幂等的：成功后 [adapter+0xE48] 会置 bit8（mode 0）或
+    // bit20（mode 1），再次进入时门禁直接返回 1。initHardwareCail 的 flag=0 重试正好会撞上。
+    bool   alreadyInitialised{false};
+    UInt32 doneBit{0}, initMode{0}, initE48{0};
     if (adapter != nullptr) {
         const auto read32 = [](const void* base, const size_t offset) {
             UInt32 value{0};
@@ -1325,7 +1332,8 @@ static int cailUvdInitHook(void* adapter, void* input)
             memcpy(&value, static_cast<const UInt8*>(base) + offset, sizeof(value));
             return value;
         };
-        NRed::singleton().setProp32("NRedVCN1CailE48", read32(adapter, 0xE48));
+        initE48 = read32(adapter, 0xE48);
+        NRed::singleton().setProp32("NRedVCN1CailE48", initE48);
         NRed::singleton().setProp32("NRedVCN1CailUvdW6", read32(adapter, 0x370));
         NRed::singleton().setProp32("NRedVCN1CailUvdW8", read32(adapter, 0x378));
         // _greenland_uvd_init 按 [0x190]/[0x19C]（CAIL family/extRevision）与能力位 0x133/0x134 选 UVD 7.x 路径。
@@ -1357,26 +1365,42 @@ static int cailUvdInitHook(void* adapter, void* input)
         NRed::singleton().setProp32("NRedVCN1CailE15D0", read32(adapter, 0x15D0) & 0xFFU);
         if (input != nullptr) {
             NRed::singleton().setProp32("NRedVCN1CailInitVersion", read32(input, 0x0));
-            NRed::singleton().setProp32("NRedVCN1CailInitMode", read32(input, 0x144));
+            initMode = read32(input, 0x144);
+            NRed::singleton().setProp32("NRedVCN1CailInitMode", initMode);
+            doneBit              = initMode == 1 ? 0x100000U : 0x100U;
+            alreadyInitialised   = (initE48 & doneBit) != 0;
         }
+    }
+    if (alreadyInitialised) {
+        // 同一适配器已经完成过该模式的 UVD init；重复执行只会被库层门禁拒绝。
+        NRed::singleton().setProp32("NRedVCN1CailInitAlready", 1);
+        NRed::singleton().setProp32("NRedVCN1CailInitResult", 0);
+        if (callIndex < 8) {
+            SYSLOG("VCN1", "CAIL UvdInit already initialised mode=%u e48=0x%X", initMode, initE48);
+        }
+        return 0;
     }
     auto result = reinterpret_cast<int (*)(void*, void*)>(cailUvdInitOriginal)(adapter, input);
     NRed::singleton().setProp32("NRedVCN1CailInitFirstResult", static_cast<UInt32>(result));
     // 真实 init 失败后把该槽换成返回 0 的桩再走一遍：既保留原始失败码，也让调用方继续往下走，
     // 用来判断 CapUVD0/CapResult 卡在 ASIC init 还是更后面的链路。
     if (result != 0 && adapter != nullptr) {
-        if (!cailAsicInitStubActive) {
-            auto* const slot = reinterpret_cast<mach_vm_address_t*>(static_cast<UInt8*>(adapter) + 0x12D8);
+        // 每个适配器独立替换：不同引擎/服务实例的 adapter 不是同一个对象，共用全局 bool 会漏装。
+        auto* const      slot = reinterpret_cast<mach_vm_address_t*>(static_cast<UInt8*>(adapter) + 0x12D8);
+        const auto       stub = reinterpret_cast<mach_vm_address_t>(&cailAsicInitReturnZero);
+        if (*slot != stub) {
             if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
                 cailAsicInitStubOriginal = *slot;
-                *slot                    = reinterpret_cast<mach_vm_address_t>(&cailAsicInitReturnZero);
+                *slot                    = stub;
                 MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
                 cailAsicInitStubActive = true;
                 NRed::singleton().setProp32("NRedVCN1CailAsicStub", 1);
                 NRed::singleton().setProp32("NRedVCN1CailAsicStubPtr", static_cast<UInt32>(cailAsicInitStubOriginal));
+                NRed::singleton().setProp32("NRedVCN1CailAsicStubAdapter",
+                                            static_cast<UInt32>(reinterpret_cast<uintptr_t>(adapter)));
             }
         }
-        if (cailAsicInitStubActive) {
+        if (*slot == stub) {
             result = reinterpret_cast<int (*)(void*, void*)>(cailUvdInitOriginal)(adapter, input);
             NRed::singleton().setProp32("NRedVCN1CailStubResult", static_cast<UInt32>(result));
         }
