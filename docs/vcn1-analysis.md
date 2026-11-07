@@ -430,3 +430,44 @@ UVD 寄存器 0x83AF 的 bit1 变为 1，超时 0xBB8。另一个 `r14d=1`（0x4
 - 下一轮实机判读：`CailInitDelta==0x5AFB7`、`CailFamily==0x8E`、`CailStubResult==0`、
   `CailInitResult==0`，再看 `CapUVD0`/`CapResult` 是否非零；若 MCIL 回调为空，则 0x83AF 等待
   本来就无从谈起，桩是正确绕法。
+
+## 14. 第十一轮实机：内核打通，用户态卡在 15D8 的 Vcn2Decode Manifest
+
+新 dump（2026-11-07 18:00）证实上一轮推断：
+
+- `CailInitDelta=372663`（0x5AFB7）→ `_greenland_uvd_init`；`CailFamily=142`（0x8E）、
+  `CailRevision=66`（0x42，PCI revision 1 对应的 extRevision）。
+- `CailInitFirstResult=1`、`CailStubResult=0`、`CailInitResult=0`：真实 Greenland init 仍失败，
+  返回 0 的桩生效。
+- `CailMcilLow`、`CailMcilWaitLow` 都非零，说明不是 MCIL 对象/回调缺失，而是 0x83AF bit1 等不到；
+  桩绕过后 `InitHardwareCail=1`、`CailDec=1`、`HardwareInitDec=1`、`ProbeInitResult=1`，
+  内核 VCN1 初始化链路已打通。`CailRetryFailedDec=0`（flag=0 重试成功）。
+
+用户态仍没有硬解：`NRedVCN1CapUVD0`/`CapResult` 未出现（`getCapabilities` 从未被调用），
+也没有 `NRedVCNUserApplied`/`NRedVCNDecoderPID`。现场证据：
+
+- QuickTime Player(PID 12100) + VTDecoderXPCService(PID 12102) 存在；日志
+  `(AppleGVA) GVA error: AVD_api.Create failed err=5`、`physicalAccelDispose ... == false`。
+- 共享缓存阶段位：D00 Called、D01 OriginalError、D03 CacheRead、D04 CacheMismatch、
+  D06 CodeMismatch、D09 NoMap；`UserLastError=4`（KERN_INVALID_ARGUMENT）；
+  `DynamicMatched=1`、`DynamicReads=3295`，但没有任何 Applied 阶段。
+- 缓存 UUID 四字（0x9028EC42/0x7E3140BC/0x144527BB/0x267FFF2B，按小端读出）就是
+  `42EC2890BC40317EBB2745142BFF7F26`，即 `UserSequoiaVideoData.hpp` 的 CacheUUID。
+
+失败点：`patchSharedRegion` 在 `selectFairPlayDecode` 成功后（`DRMVideoPatchCount` 已发布）调用
+`VPF::ManifestData::find(Vcn2Decode, OsDarwin24, 0x15D8)`，而 `PatchManifestData.hpp` 里
+Vcn2Decode 只有 15E7/1636/1638/164C，没有 15D8 → 返回 null → `stage(CodeMismatch)` +
+`error(KERN_INVALID_ARGUMENT)`，与 dump 的 stage/error 完全一致。生成头本身是陈旧的结果：
+`python3 tools/vpf/generate_manifest.py --check` 报「已陈旧或被手改」，因为 1276959 加了
+`Patches15D8` 但没有重新生成 Manifest。
+
+修复：运行 `python3 tools/vpf/generate_manifest.py --write`，只新增
+
+```
+Sites_Vcn2Decode_Darwin24_15D8 = makeSites(UserSequoiaVideoData::Patches15D8, ...)
+{FeatureId::Vcn2Decode, OsDarwin24, 0x15D8, ..., 23}
+```
+
+共 33 个功能实例、354 个补丁站点；`--check`、`validate_manifest.py`、`test_vpf_manifest.py`、
+`test_display_manifest.py` 全部通过。下一轮装新 kext 后应能看到 FairPlay 事务进入 Applied，
+`UserApplied`/`DecoderPID` 出现，随后 `CapUVD0`/`CapResult` 应被 `getCapabilities` 写入。

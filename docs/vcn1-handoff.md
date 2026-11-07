@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `dea7c38` VCN1: Identify the CAIL ASIC UVD init as Greenland and stub its MCIL wait；docs（本轮） |
+| 最新提交 | `09e1657` VPF: Regenerate the manifest with the missing 15D8 decode entry；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -48,41 +48,40 @@ ioreg -l | grep -o '"NRed[A-Za-z0-9]*" = [0-9a-fA-Fx]*' > ~/Desktop/vcn1-boot.tx
 - CAIL：`[hardware+0x340]` 是 `AmdCailServices`；`earlyInitialize`/`initialize` 都成功（`CailEarly=0`、`CailInit=0` 是成功码），VBIOS 签名 0x55/0xAA 通过。
 - 用户态 VA 驱动补丁表含 0x15D8（family 4），播放时 `NRedVCNUserApplied=16`、`DecoderPID` 出现。
 - 视频上下文：`accel+0x1F10` bit3 本来就置位，`NewCtxResult=1`、`VideoCtxStart=1`、`VcQueueUVD0=1`。
+- 内核 VCN1 初始化：Greenland ASIC init 的 MCIL 等待用返回 0 的桩绕过后，`InitHardwareCail=1`、
+  `HardwareInitDec=1`、`ProbeInitResult=1`（2026-11-07 实机）。
 
 ## 当前阻塞点
 
-`HardwareInitDec=0` / `ProbeInitResult=0`：引擎 `initHardware` 死在 `initHardwareCail`，CAIL 返回被归一化成 `0xE00002C7`。
+**内核侧已通**（2026-11-07 18:00 dump）：`CailInitDelta=0x5AFB7`、`CailFamily=0x8E`、`CailRevision=0x42`、
+`CailInitFirstResult=1`、`CailStubResult=0`、`CailInitResult=0`、`CailMcilLow`/`CailMcilWaitLow` 非零，
+`InitHardwareCail=1`、`CailDec=1`、`HardwareInitDec=1`、`ProbeInitResult=1`。`[adapter+0x12D8]` 确认为
+`_greenland_uvd_init`(0x4851476)，失败点是 `_Cail_MCILWaitFor` 等 UVD 寄存器 0x83AF bit1（详见
+`docs/vcn1-analysis.md` §13）。桩已生效，CAIL 初始化链路走通。
 
-已定位到：
+**用户态阻塞**：`CapUVD0`/`CapResult` 未出现，`getCapabilities` 从未被调用；QuickTime 日志
+`(AppleGVA) GVA error: AVD_api.Create failed err=5`，`UserApplied`/`DecoderPID` 都没有。dump 的
+共享缓存阶段是 D00/01/03/04/06/09，`UserLastError=4`（KERN_INVALID_ARGUMENT），`DynamicMatched=1`
+但没有 Applied。
 
-1. `_CAILUvdControl`(0x47F05E7) 的能力闸门：Picasso 的 DDI 能力表 `_CAIL_DDI_CAPS_PICASSO_A0`(0x60F0440) word6=0x20000000、word10=0x02000120，bit22（0xD6）与 bit27（0x15B）都是 0 → 库层返回 1。
-   现在在 `cailUvdControlHook` 里对位图 `adapter+0x358` 强制置位（`CailCapD6=1`、`CailCap15B=1`）。
-2. 于是进入 `_CailUvdInit`(0x47F64BF)，门禁全过：版本 0x148、`[adapter+0xE48]`=0、mode=0、`[adapter+0x370]&4`=0、`[adapter+0x378]&0x48000`=0，
-   然后 `call qword ptr [adapter+0x12D8]`（ASIC 专用 UVD init）**返回 1** —— 这就是现在的失败点。
+已定位：`patchSharedRegion` 在 `selectFairPlayDecode` 成功后调用
+`VPF::ManifestData::find(Vcn2Decode, OsDarwin24, 0x15D8)`，而提交的 `PatchManifestData.hpp` 是陈旧的
+（1276959 加了 `Patches15D8` 却没重跑生成器），Vcn2Decode 只有 15E7/1636/1638/164C → 返回 null →
+`CodeMismatch` + `KERN_INVALID_ARGUMENT`，与 dump 完全吻合。
 
-`[adapter+0x12D8]` 已确定为 **`_greenland_uvd_init`(0x4851476)**：dump 的 `CailInitFunc=0x296476` 是相对
-HWLibs `__TEXT` 基址 0x45BB000 的偏移，`0x45BB000 + 0x296476 = 0x4851476`；与 `_CailUvdInit` 的差值是
-**0x5AFB7**。上一轮的五项差值表只列了大写 `*UvdInit`，漏掉了小写命名的 Greenland（Vega10 家族；Picasso 的
-CAIL 能力位 0x148 已打开，`_Cail_Raven_InitFunctionPointer` 不覆盖这个槽）。
-
-它返回 1 的路径：`[adapter+0x190]=0x8E`、能力 0x133/0x134=0 → `_uvd_init`(0x48410D8) → `_uvd_init_engine`(…,1)；
-唯一失败点是 0x48416AB 的 `_Cail_MCILWaitFor(adapter, {reg=0x83AF, mask/value=2}, 1, 1, 1, 0xBB8, 4)`：等 UVD
-寄存器 0x83AF 的 bit1。`_Cail_MCILWaitFor` 在 `[adapter+0x18]` 或它 +0x168 的回调为空时立即返回 1，否则
-等待超时也返回 1。详见 `docs/vcn1-analysis.md` §13。
-
-`CailInitDelta` 之前不写是因为 `cailUvdInitOriginal` 是 Lilu 的 trampoline（`routeFunctionInternal` 里
-`*org = trampoline`），不是符号地址；本轮改用 `RouteRequest::from`。同时新增 `CailFamily`、`CailRevision`、
-`CailMcilLow`、`CailMcilWaitLow`，并在真实 init 失败后把该槽换成返回 0 的桩重调 `_CailUvdInit`
-（`CailInitFirstResult` 保留原始失败码，`CailStubResult`/`CailInitResult` 是桩后的结果）。
+修复：`python3 tools/vpf/generate_manifest.py --write`，新增 `Sites_Vcn2Decode_Darwin24_15D8` 与
+15D8 的 `FeatureManifest`（33 个功能、354 个站点）；`--check`、`validate_manifest.py`、
+`test_vpf_manifest.py`、`test_display_manifest.py` 全通过。详见 `docs/vcn1-analysis.md` §14。
 
 ## 下一步
 
-1. 安装 `build/ddr/Build/Products/Release/NootedRed.kext` 重启，读 `CailInitDelta`（应为 0x5AFB7）、
-   `CailFamily`（应 0x8E）、`CailMcilLow`/`CailMcilWaitLow`、`CailInitFirstResult`、`CailStubResult`/`CailInitResult`。
-2. 若 `CailStubResult=0`、`CailInitResult=0` 且 `CapUVD0`/`CapResult` 非零 → CAIL 链路已通，回到用户态验证硬解；
-   若仍失败，按新的 `CapResult`/`NewCtxStatus` 继续。
-3. 若 MCIL 回调为空，说明 CAIL 的等待本来就依赖未构造的宿主服务，桩是正确绕法；后续可把桩收窄到
-   `_uvd_init_engine` 的那一次等待，保留其余寄存器初始化。
+1. 安装新 `build/ddr/Build/Products/Release/NootedRed.kext` 重启，播 30 秒 QuickTime 视频，读
+   `NRedVCNUserApplied`、`NRedVCNDecoderPID`、`NRedVCNUserD15`（Applied）以及
+   `NRedVCN1CapUVD0`/`NRedVCN1CapResult`。
+2. 若 `CapResult` 非零 → 用户态已开始查询硬件能力，确认 `UsingHardwareAcceleratedVideoDecoder`，
+   与软解做像素比对。
+3. 若仍无 Applied，按新的 `NRedVCNUserLastError`/阶段位和 `DRMVideoLastStage` 继续查
+   （下一个可能点：`adaptPatches`/planner 或 VM 事务）。
 
 ## 反汇编环境
 
