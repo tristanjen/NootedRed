@@ -471,3 +471,34 @@ Sites_Vcn2Decode_Darwin24_15D8 = makeSites(UserSequoiaVideoData::Patches15D8, ..
 共 33 个功能实例、354 个补丁站点；`--check`、`validate_manifest.py`、`test_vpf_manifest.py`、
 `test_display_manifest.py` 全部通过。下一轮装新 kext 后应能看到 FairPlay 事务进入 Applied，
 `UserApplied`/`DecoderPID` 出现，随后 `CapUVD0`/`CapResult` 应被 `getCapabilities` 写入。
+
+## 15. 第十二轮：15D8 的 Manifest 补齐后暴露 planner 设备掩码缺位
+
+新 dump（2026-11-07 21:06）里 `NRedVCNVPFPlannerRejected=1`，说明上一轮的 Manifest 修复生效了：
+`ManifestData::find(Vcn2Decode, OsDarwin24, 0x15D8)` 已经能返回条目，失败点后移到
+`adaptPatches`/`planVideoFeatures` 这一块（两者共用同一个诊断位）。`DRMVideoPatchCount=18`
+是 `selectFairPlayDecode` 回写的「FairPlay 子集数量」，不是陈旧 build 的痕迹（23 项里选出 18 项）。
+
+`planVideoFeatures` 调 `VPF::plan`，而 `dependencyPlanner` 的设备门禁是：
+
+```cpp
+constexpr UInt32 deviceBit(UInt32 id) { case 0x15D8: return 1U << 0; ... }
+constexpr UInt32 VcnDeviceMask = (1U << 2) | (1U << 3) | (1U << 4) | (1U << 5);
+```
+
+0x15D8 的 bit0 不在 `VcnDeviceMask` 里，`gated()` 直接拒绝 `Vcn2Decode`，所以 FairPlay 与普通解码
+都进不了安装阶段。`tools/vpf/planner_probe.cpp` 里原本还专门断言 0x15D8 是「video display device」
+（只做显示、不做 VCN 视频），说明这个掩码一直没跟上 1276959 的 15D8 视频补丁表。
+
+修复：
+
+- `VcnDeviceMask` 加入 bit0；0x15DD 仍保持只有显示支持（没有 15DD 的视频补丁表/Manifest）。
+- `planner_probe` 把 0x15D8 放进正向视频设备列表，改用 0x15DD 做「display-only 应拒绝」的用例。
+- 重新冻结基线：`Vcn2Decode/Darwin24/15D8` 出现在计划里（23 个站点、3 张映像、reads=2358），
+  与其它 Darwin24 VCN 设备逐项一致；计划总数 30→31。
+- `test_vpf_video_equivalence.py` 现在把 9 个旧 Resolver 计划与 9 个当前 Manifest 计划逐字节比较，
+  15D8 也通过了——说明补丁字节与旧路径一致。
+
+下一轮实机应看到 FairPlay 事务进入 Applied（`UserD15`、`UserApplied`、`DecoderPID`），随后
+`CapUVD0`/`CapResult` 应被 `getCapabilities` 写入。若还停在新阶段（Region/Protection/Write 等），
+按 `DRMVideoLastStage` 与 `NRedVCNVPFQuarantined` 继续。

@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `09e1657` VPF: Regenerate the manifest with the missing 15D8 decode entry；docs（本轮） |
+| 最新提交 | `931b6d3` VPF: Include 0x15D8 in the VCN device mask；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -60,28 +60,28 @@ ioreg -l | grep -o '"NRed[A-Za-z0-9]*" = [0-9a-fA-Fx]*' > ~/Desktop/vcn1-boot.tx
 `docs/vcn1-analysis.md` §13）。桩已生效，CAIL 初始化链路走通。
 
 **用户态阻塞**：`CapUVD0`/`CapResult` 未出现，`getCapabilities` 从未被调用；QuickTime 日志
-`(AppleGVA) GVA error: AVD_api.Create failed err=5`，`UserApplied`/`DecoderPID` 都没有。dump 的
-共享缓存阶段是 D00/01/03/04/06/09，`UserLastError=4`（KERN_INVALID_ARGUMENT），`DynamicMatched=1`
-但没有 Applied。
+`(AppleGVA) GVA error: AVD_api.Create failed err=5`，`UserApplied`/`DecoderPID` 都没有。
 
-已定位：`patchSharedRegion` 在 `selectFairPlayDecode` 成功后调用
-`VPF::ManifestData::find(Vcn2Decode, OsDarwin24, 0x15D8)`，而提交的 `PatchManifestData.hpp` 是陈旧的
-（1276959 加了 `Patches15D8` 却没重跑生成器），Vcn2Decode 只有 15E7/1636/1638/164C → 返回 null →
-`CodeMismatch` + `KERN_INVALID_ARGUMENT`，与 dump 完全吻合。
+已解决的两层阻塞（2026-11-07 21:06 dump）：
 
-修复：`python3 tools/vpf/generate_manifest.py --write`，新增 `Sites_Vcn2Decode_Darwin24_15D8` 与
-15D8 的 `FeatureManifest`（33 个功能、354 个站点）；`--check`、`validate_manifest.py`、
-`test_vpf_manifest.py`、`test_display_manifest.py` 全通过。详见 `docs/vcn1-analysis.md` §14。
+1. `PatchManifestData.hpp` 陈旧，Vcn2Decode 没有 15D8（1276959 加了 `Patches15D8` 却没重跑生成器）→
+   已重新生成，新增 `Sites_Vcn2Decode_Darwin24_15D8` + `FeatureManifest`（§14）。
+2. 新 dump 出现 `NRedVCNVPFPlannerRejected=1`：`VcnDeviceMask` 只有 bit2–5，`deviceBit(0x15D8)=bit0`
+   被 `VPF::plan` 的 `gated()` 拒绝。已把 bit0 加入 `VcnDeviceMask`，0x15DD 仍保持 display-only；
+   `planner_probe` 同步更新，计划基线重新冻结为 31 个（15D8 的 23 个站点与其它 Darwin24 设备逐字节一致）。
+   详见 `docs/vcn1-analysis.md` §15。
+
+`DRMVideoPatchCount=18` 是 `selectFairPlayDecode` 回写的 FairPlay 子集数量（23 选 18），不是旧 build。
 
 ## 下一步
 
 1. 安装新 `build/ddr/Build/Products/Release/NootedRed.kext` 重启，播 30 秒 QuickTime 视频，读
    `NRedVCNUserApplied`、`NRedVCNDecoderPID`、`NRedVCNUserD15`（Applied）以及
-   `NRedVCN1CapUVD0`/`NRedVCN1CapResult`。
+   `NRedVCN1CapUVD0`/`NRedVCN1CapResult`、`NRedVCNVPFPlannerRejected`/`NRedVCNVPFPath`。
 2. 若 `CapResult` 非零 → 用户态已开始查询硬件能力，确认 `UsingHardwareAcceleratedVideoDecoder`，
    与软解做像素比对。
-3. 若仍无 Applied，按新的 `NRedVCNUserLastError`/阶段位和 `DRMVideoLastStage` 继续查
-   （下一个可能点：`adaptPatches`/planner 或 VM 事务）。
+3. 若仍无 Applied，按新的阶段位（Region/Protection/Write/Restore）和 `DRMVideoLastStage`、
+   `NRedVCNVPFQuarantined` 继续查 VM 事务。
 
 ## 反汇编环境
 
