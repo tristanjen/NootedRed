@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `d69b4b0` VCN1: Locate the CAIL ASIC UVD init by its delta from _CailUvdInit；`7719c72` docs |
+| 最新提交 | `dea7c38` VCN1: Identify the CAIL ASIC UVD init as Greenland and stub its MCIL wait；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -60,14 +60,29 @@ ioreg -l | grep -o '"NRed[A-Za-z0-9]*" = [0-9a-fA-Fx]*' > ~/Desktop/vcn1-boot.tx
 2. 于是进入 `_CailUvdInit`(0x47F64BF)，门禁全过：版本 0x148、`[adapter+0xE48]`=0、mode=0、`[adapter+0x370]&4`=0、`[adapter+0x378]&0x48000`=0，
    然后 `call qword ptr [adapter+0x12D8]`（ASIC 专用 UVD init）**返回 1** —— 这就是现在的失败点。
 
-未解决：`[adapter+0x12D8]` 究竟是哪个函数。用 slide 相减失败（得 0x296476，落在 HWLibs `__TEXT` 0x45BB000–0x68FA000 之外）。
-新增探针 `CailInitDelta = ptr − _CailUvdInit`（提交 `d69b4b0`）：Tahiti 0x11297、Dummy 0x1D28D、Bonaire 0x23710、Tonga 0x30806、Ellesmere 0x39F96。
+`[adapter+0x12D8]` 已确定为 **`_greenland_uvd_init`(0x4851476)**：dump 的 `CailInitFunc=0x296476` 是相对
+HWLibs `__TEXT` 基址 0x45BB000 的偏移，`0x45BB000 + 0x296476 = 0x4851476`；与 `_CailUvdInit` 的差值是
+**0x5AFB7**。上一轮的五项差值表只列了大写 `*UvdInit`，漏掉了小写命名的 Greenland（Vega10 家族；Picasso 的
+CAIL 能力位 0x148 已打开，`_Cail_Raven_InitFunctionPointer` 不覆盖这个槽）。
+
+它返回 1 的路径：`[adapter+0x190]=0x8E`、能力 0x133/0x134=0 → `_uvd_init`(0x48410D8) → `_uvd_init_engine`(…,1)；
+唯一失败点是 0x48416AB 的 `_Cail_MCILWaitFor(adapter, {reg=0x83AF, mask/value=2}, 1, 1, 1, 0xBB8, 4)`：等 UVD
+寄存器 0x83AF 的 bit1。`_Cail_MCILWaitFor` 在 `[adapter+0x18]` 或它 +0x168 的回调为空时立即返回 1，否则
+等待超时也返回 1。详见 `docs/vcn1-analysis.md` §13。
+
+`CailInitDelta` 之前不写是因为 `cailUvdInitOriginal` 是 Lilu 的 trampoline（`routeFunctionInternal` 里
+`*org = trampoline`），不是符号地址；本轮改用 `RouteRequest::from`。同时新增 `CailFamily`、`CailRevision`、
+`CailMcilLow`、`CailMcilWaitLow`，并在真实 init 失败后把该槽换成返回 0 的桩重调 `_CailUvdInit`
+（`CailInitFirstResult` 保留原始失败码，`CailStubResult`/`CailInitResult` 是桩后的结果）。
 
 ## 下一步
 
-1. 拿 `CailInitDelta` 的读数，确定 ASIC init 是哪一个函数，反汇编它，找它返回 1 的那条路径。
-2. 若它依赖我们没构造的寄存器/固件块：考虑直接把该槽替换成「返回 0」的桩，先验证后续链路能否走通（CapUVD0 / CapResult 是否非零）。
-3. 通了之后回到用户态：确认 `UsingHardwareAcceleratedVideoDecoder`，与软解做像素比对。
+1. 安装 `build/ddr/Build/Products/Release/NootedRed.kext` 重启，读 `CailInitDelta`（应为 0x5AFB7）、
+   `CailFamily`（应 0x8E）、`CailMcilLow`/`CailMcilWaitLow`、`CailInitFirstResult`、`CailStubResult`/`CailInitResult`。
+2. 若 `CailStubResult=0`、`CailInitResult=0` 且 `CapUVD0`/`CapResult` 非零 → CAIL 链路已通，回到用户态验证硬解；
+   若仍失败，按新的 `CapResult`/`NewCtxStatus` 继续。
+3. 若 MCIL 回调为空，说明 CAIL 的等待本来就依赖未构造的宿主服务，桩是正确绕法；后续可把桩收窄到
+   `_uvd_init_engine` 的那一次等待，保留其余寄存器初始化。
 
 ## 反汇编环境
 

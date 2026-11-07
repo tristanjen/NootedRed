@@ -369,3 +369,64 @@ AmdCailServices::uvdControl(0x485CC70) 把任何非零 CAIL 返回都归一化�
 诊断字段：CailCapBase6/CailCapBase10（adapter 首次出现的原始能力位）、CailCapD6/CailCap15B（置位后）、CailLibFunc/CailLibResult（库层真实返回）、CailInitVersion/CailInitMode/CailE48/CailUvdW6/CailUvdW8/CailInitResult、CailInitPtr/CailInitPtrHi/CailInitFunc/CailInitDelta/CailE15D0。
 
 当前阻塞：[adapter+0x12D8] 指向的 ASIC init 返回 1。用 CailInitDelta（与 _CailUvdInit 的地址差）比对即可确认是哪一个：Tahiti 0x11297、Dummy 0x1D28D、Bonaire 0x23710、Tonga 0x30806、Ellesmere 0x39F96。
+
+## 13. 第十一轮：定位 ASIC init 为 _greenland_uvd_init
+
+实机 dump 里没有 `CailInitDelta`，但已有的 `CailInitFunc=0x296476` 是相对 HWLibs `__TEXT` 基址
+（0x45BB000）的偏移：`0x45BB000 + 0x296476 = 0x4851476`，符号表里正好是 `_greenland_uvd_init`。
+它与 `_CailUvdInit`(0x47F64BF) 的差值是 **0x5AFB7**。上一轮的五项差值表（Tahiti 0x11297、Dummy 0x1D28D、
+Bonaire 0x23710、Tonga 0x30806、Ellesmere 0x39F96）只枚举了大写 `*UvdInit` 拼写，漏掉了小写的
+`_greenland_uvd_init`；Greenland 正是 Vega10 家族（Picasso 的 VCN1 走这一支）。
+
+`CailInitDelta` 没写入的原因：`KernelPatcher::routeFunctionInternal` 在 wrapper 模式下执行
+`if (org) *org = trampoline;`，所以 `cailUvdInitOriginal` 是 Lilu 的 trampoline，不是 `_CailUvdInit`
+的符号地址；`ptr > cailUvdInitOriginal` 不成立。修正为记录 `RouteRequest::from`（solveSymbol 结果）。
+按该基准，Greenland 的差值应为 0x5AFB7。
+
+### 槽位怎么被装上
+
+- `_Cail_Greenland_InitFunctionPointer`(0x484F9E4) 在 0x484FCA4 用
+  `lea rax, [rip+0x17CB]` 得到 0x4851476，0x484FCAB `mov [adapter+0x12D8], rax`。
+- `_CAILInitFunctionPointer`(0x4813BFF) 在能力位 0x148（word10 bit8）打开时调用它；Picasso 的
+  `_CAIL_DDI_CAPS_PICASSO_A0` word10=0x02000120，bit8 已置位。随后 APU 能力位 0x53 再调
+  `_Cail_Raven_InitFunctionPointer`，但后者不动 +0x12D8，所以该槽保持 Greenland。
+- `_CAILAsicCapsInitTable` 里 Picasso 条目：familyId=0x8E、deviceId=0x15D8、revision=0、
+  extRevision=0x41、ddiCaps=0x60F0440、goldenSettings=0x67348A0。按 `_CAILInitFunctionPointer`
+  的读数约定，adapter+0x190=familyId=0x8E、+0x19C=extRevision=0x41（本轮新增 CailFamily/CailRevision 实机确认）。
+
+### 返回 1 的路径
+
+`_greenland_uvd_init`(0x4851476) 先看 `[adapter+0x190] == 0x8D`：Picasso 是 0x8E，不走 UVD 7.2 分支；
+再看能力 0x133/0x134（word9 bit19/20，Picasso word9=0x09E20E10，均为 0），于是尾跳
+`_uvd_init`(0x48410D8)：
+
+- `test byte [adapter+0xE4A], 2`；置位直接返回 0（dump 里 CailE48=0，不置位）。
+- 否则 `edx=1` 尾跳 `_uvd_init_engine`(0x48410F4)。
+
+`_uvd_init_engine` 在 edx=1 时唯一能返回 1 的路径是 0x48416AB：
+
+```
+0x48416AB  mov r14d, 1
+0x48416CA  call _Cail_MCILWaitFor(adapter, waitObj, 1, 1, 1, 0xBB8, 4)
+0x48416D1  test eax, eax
+0x48416D3  jne  0x4841B00        ; eax=r14d=1
+```
+
+waitObj 由 0x484168C 起填：`[0] = 0x83AF`、`[+8] = 0x200000002`（dword +8=2、+0xC=2），即等待
+UVD 寄存器 0x83AF 的 bit1 变为 1，超时 0xBB8。另一个 `r14d=1`（0x484193B）只在第三个参数为 0 时可达，
+`_uvd_init` 传的是 1，与本路径无关。
+
+`_Cail_MCILWaitFor`(0x47FEB3E) 先看 `[adapter+0x18]` 和 `[[adapter+0x18]+0x168]`：任一为空立即返回 1；
+否则调用该回调做等待，返回码非 0/2 时映射成 1。因此失败要么是 MCIL 对象/回调缺失，要么是 0x83AF bit1
+在超时内没有置位。本轮新增 `CailMcilLow`/`CailMcilWaitLow` 区分这两种情况。
+
+### 本轮改动
+
+- 修正 `CailInitDelta` 基准（`initRoute.from`）。
+- 新增 `CailFamily`、`CailRevision`、`CailMcilLow`、`CailMcilWaitLow`。
+- 真实 init 返回非 0 时，把 `adapter+0x12D8` 换成返回 0 的桩再调一次 `_CailUvdInit`：
+  `CailInitFirstResult` 保留原始失败码，`CailStubResult`/`CailInitResult` 是桩后的结果，
+  `CailAsicStub`/`CailAsicStubPtr` 记录桩状态和原指针。
+- 下一轮实机判读：`CailInitDelta==0x5AFB7`、`CailFamily==0x8E`、`CailStubResult==0`、
+  `CailInitResult==0`，再看 `CapUVD0`/`CapResult` 是否非零；若 MCIL 回调为空，则 0x83AF 等待
+  本来就无从谈起，桩是正确绕法。
