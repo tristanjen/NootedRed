@@ -37,7 +37,8 @@ namespace VPF
     }
 
     constexpr UInt32 DisplayDeviceMask = (1U << 6) - 1;
-    constexpr UInt32 VcnDeviceMask     = (1U << 2) | (1U << 3) | (1U << 4) | (1U << 5);
+    // 0x15D8（Picasso/VCN1）也有独立的 Vcn2Decode 补丁表与 Manifest；0x15DD 仍只有显示支持。
+    constexpr UInt32 VcnDeviceMask     = (1U << 0) | (1U << 2) | (1U << 3) | (1U << 4) | (1U << 5);
 
     struct PlannerFeature
     {

@@ -42,14 +42,14 @@ int main()
     for (const UInt32 os :
          {static_cast<UInt32>(OsDarwin23), static_cast<UInt32>(OsDarwin24), static_cast<UInt32>(OsDarwin25)})
     {
-        for (const UInt32 device : {0x15E7U, 0x1636U, 0x1638U, 0x164CU}) {
+        for (const UInt32 device : {0x15D8U, 0x15E7U, 0x1636U, 0x1638U, 0x164CU}) {
             const auto result = plan(input(os, device, videoRequested, ExternalVcnBridge));
             expect("video", result, videoEnabled);
         }
     }
-    // 缺少内核桥接或非 VCN 设备：拒绝。
+    // 缺少内核桥接或只有显示支持的设备：拒绝。
     expect("video no bridge", plan(input(OsDarwin25, 0x1638, videoRequested, 0)), 0);
-    expect("video display device", plan(input(OsDarwin25, 0x15D8, videoRequested, ExternalVcnBridge)), 0);
+    expect("video display-only device", plan(input(OsDarwin25, 0x15DD, videoRequested, ExternalVcnBridge)), 0);
     // FairPlay：解码子集保留，编码与 AppleGVA 选择被互斥规则拒绝。
     const auto fairPlay = plan(input(OsDarwin25, 0x1638,
                                      bits({FeatureId::Vcn2Decode, FeatureId::Vcn2Encode,

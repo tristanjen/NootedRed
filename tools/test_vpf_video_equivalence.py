@@ -65,9 +65,9 @@ class EquivalenceTests(unittest.TestCase):
 
     def test_plan_set_is_complete(self):
         self.assertEqual(self.old['kind'], 'vpf.video-legacy')
-        self.assertEqual(len(self.old_by_key), 8)
+        self.assertEqual(len(self.old_by_key), 9)
         self.assertEqual(set(self.old_by_key), set(self.current_by_key))
-        self.assertEqual(len(self.current_by_key), 8)
+        self.assertEqual(len(self.current_by_key), 9)
         for plan in self.current_by_key.values():
             self.assertEqual(plan['state'], 'AllOriginal')
             self.assertEqual(len(plan['images']), 3)
