@@ -18,6 +18,7 @@ inline constexpr auto Sites_Vcn2Decode_Darwin23_15E7 = makeSites(UserSonomaVideo
 inline constexpr auto Sites_Vcn2Decode_Darwin23_1636 = makeSites(UserSonomaVideoData::Patches1636, UserSonomaVideoData::ResolverLocations);
 inline constexpr auto Sites_Vcn2Decode_Darwin23_1638 = makeSites(UserSonomaVideoData::Patches, UserSonomaVideoData::ResolverLocations);
 inline constexpr auto Sites_Vcn2Decode_Darwin23_164C = makeSites(UserSonomaVideoData::Patches164C, UserSonomaVideoData::ResolverLocations);
+inline constexpr auto Sites_Vcn2Decode_Darwin24_15D8 = makeSites(UserSequoiaVideoData::Patches15D8, UserSequoiaVideoData::ResolverLocations);
 inline constexpr auto Sites_Vcn2Decode_Darwin24_15E7 = makeSites(UserSequoiaVideoData::Patches15E7, UserSequoiaVideoData::ResolverLocations);
 inline constexpr auto Sites_Vcn2Decode_Darwin24_1636 = makeSites(UserSequoiaVideoData::Patches1636, UserSequoiaVideoData::ResolverLocations);
 inline constexpr auto Sites_Vcn2Decode_Darwin24_1638 = makeSites(UserSequoiaVideoData::Patches, UserSequoiaVideoData::ResolverLocations);
@@ -57,6 +58,9 @@ inline constexpr FeatureManifest Features[] = {
     {FeatureId::Vcn2Decode, OsDarwin23, 0x164C, EvidenceKind::RelocationAwareFullFunction,
      {UserSonomaVideoData::ResolverImages, 3, UserSonomaVideoData::ResolverFunctions, 19, UserSonomaVideoData::ResolverLocations, 23, Sites_Vcn2Decode_Darwin23_164C.sites, 23},
      "UserSonomaVideoData.hpp", "4C1441FD8A543DC2863D49110B946A25"},
+    {FeatureId::Vcn2Decode, OsDarwin24, 0x15D8, EvidenceKind::RelocationAwareFullFunction,
+     {UserSequoiaVideoData::ResolverImages, 3, UserSequoiaVideoData::ResolverFunctions, 19, UserSequoiaVideoData::ResolverLocations, 23, Sites_Vcn2Decode_Darwin24_15D8.sites, 23},
+     "UserSequoiaVideoData.hpp", "42EC2890BC40317EBB2745142BFF7F26"},
     {FeatureId::Vcn2Decode, OsDarwin24, 0x15E7, EvidenceKind::RelocationAwareFullFunction,
      {UserSequoiaVideoData::ResolverImages, 3, UserSequoiaVideoData::ResolverFunctions, 19, UserSequoiaVideoData::ResolverLocations, 23, Sites_Vcn2Decode_Darwin24_15E7.sites, 23},
      "UserSequoiaVideoData.hpp", "42EC2890BC40317EBB2745142BFF7F26"},
