@@ -1303,7 +1303,14 @@ static int cailUvdControlHook(void* adapter, const UInt32 function, void* input,
 
 // _CailUvdInit(adapter, input)：id 1 的尾跳目标，真正的失败码从这里返回。
 static mach_vm_address_t cailUvdInitOriginal{0};
+static mach_vm_address_t cailUvdInitSymbol{0};
 static mach_vm_address_t cailLibrarySlide{0};
+static mach_vm_address_t cailAsicInitStubOriginal{0};
+static bool              cailAsicInitStubActive{false};
+
+// adapter+0x12D8 的替代实现：真实 Greenland init 死在 _Cail_MCILWaitFor（寄存器 0x83AF bit1），
+// 先返回成功验证 _CAILUvdControl 后续链路。
+static int cailAsicInitReturnZero(void*, void*) { return 0; }
 
 static int cailUvdInitHook(void* adapter, void* input)
 {
@@ -1313,9 +1320,25 @@ static int cailUvdInitHook(void* adapter, void* input)
             memcpy(&value, static_cast<const UInt8*>(base) + offset, sizeof(value));
             return value;
         };
+        const auto read64 = [](const void* base, const size_t offset) {
+            UInt64 value{0};
+            memcpy(&value, static_cast<const UInt8*>(base) + offset, sizeof(value));
+            return value;
+        };
         NRed::singleton().setProp32("NRedVCN1CailE48", read32(adapter, 0xE48));
         NRed::singleton().setProp32("NRedVCN1CailUvdW6", read32(adapter, 0x370));
         NRed::singleton().setProp32("NRedVCN1CailUvdW8", read32(adapter, 0x378));
+        // _greenland_uvd_init 按 [0x190]/[0x19C]（CAIL family/extRevision）与能力位 0x133/0x134 选 UVD 7.x 路径。
+        NRed::singleton().setProp32("NRedVCN1CailFamily", read32(adapter, 0x190));
+        NRed::singleton().setProp32("NRedVCN1CailRevision", read32(adapter, 0x19C));
+        // _Cail_MCILWaitFor 先检查 [adapter+0x18] 与它 +0x168 的回调；任一为空会立即返回 1。
+        const auto mcil = read64(adapter, 0x18);
+        NRed::singleton().setProp32("NRedVCN1CailMcilLow", static_cast<UInt32>(mcil));
+        if (mcil != 0) {
+            NRed::singleton().setProp32(
+                "NRedVCN1CailMcilWaitLow",
+                static_cast<UInt32>(read64(reinterpret_cast<const void*>(static_cast<uintptr_t>(mcil)), 0x168)));
+        }
         UInt32 lo{0}, hi{0};
         memcpy(&lo, static_cast<const UInt8*>(adapter) + 0x12D8, sizeof(lo));
         memcpy(&hi, static_cast<const UInt8*>(adapter) + 0x12DC, sizeof(hi));
@@ -1326,9 +1349,10 @@ static int cailUvdInitHook(void* adapter, void* input)
         if (cailLibrarySlide != 0 && ptr > cailLibrarySlide) {
             NRed::singleton().setProp32("NRedVCN1CailInitFunc", static_cast<UInt32>(ptr - cailLibrarySlide));
         }
-        // slide 的基准不明，改用与已钩函数 _CailUvdInit 的差值定位 ASIC 专用 init。
-        if (cailUvdInitOriginal != 0 && ptr > cailUvdInitOriginal) {
-            NRed::singleton().setProp32("NRedVCN1CailInitDelta", static_cast<UInt32>(ptr - cailUvdInitOriginal));
+        // cailUvdInitOriginal 是 KernelPatcher 的 trampoline，不是 _CailUvdInit 的符号地址；
+        // 差值必须相对 initRoute.from（= solveSymbol 结果）才有意义。
+        if (cailUvdInitSymbol != 0 && ptr > cailUvdInitSymbol) {
+            NRed::singleton().setProp32("NRedVCN1CailInitDelta", static_cast<UInt32>(ptr - cailUvdInitSymbol));
         }
         NRed::singleton().setProp32("NRedVCN1CailE15D0", read32(adapter, 0x15D0) & 0xFFU);
         if (input != nullptr) {
@@ -1336,11 +1360,31 @@ static int cailUvdInitHook(void* adapter, void* input)
             NRed::singleton().setProp32("NRedVCN1CailInitMode", read32(input, 0x144));
         }
     }
-    const auto result = reinterpret_cast<int (*)(void*, void*)>(cailUvdInitOriginal)(adapter, input);
+    auto result = reinterpret_cast<int (*)(void*, void*)>(cailUvdInitOriginal)(adapter, input);
+    NRed::singleton().setProp32("NRedVCN1CailInitFirstResult", static_cast<UInt32>(result));
+    // 真实 init 失败后把该槽换成返回 0 的桩再走一遍：既保留原始失败码，也让调用方继续往下走，
+    // 用来判断 CapUVD0/CapResult 卡在 ASIC init 还是更后面的链路。
+    if (result != 0 && adapter != nullptr) {
+        if (!cailAsicInitStubActive) {
+            auto* const slot = reinterpret_cast<mach_vm_address_t*>(static_cast<UInt8*>(adapter) + 0x12D8);
+            if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+                cailAsicInitStubOriginal = *slot;
+                *slot                    = reinterpret_cast<mach_vm_address_t>(&cailAsicInitReturnZero);
+                MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                cailAsicInitStubActive = true;
+                NRed::singleton().setProp32("NRedVCN1CailAsicStub", 1);
+                NRed::singleton().setProp32("NRedVCN1CailAsicStubPtr", static_cast<UInt32>(cailAsicInitStubOriginal));
+            }
+        }
+        if (cailAsicInitStubActive) {
+            result = reinterpret_cast<int (*)(void*, void*)>(cailUvdInitOriginal)(adapter, input);
+            NRed::singleton().setProp32("NRedVCN1CailStubResult", static_cast<UInt32>(result));
+        }
+    }
     NRed::singleton().setProp32("NRedVCN1CailInitResult", static_cast<UInt32>(result));
     static UInt32 count{0};
     if (__atomic_fetch_add(&count, 1U, __ATOMIC_RELAXED) < 8) {
-        SYSLOG("VCN1", "CAIL UvdInit result=%d", result);
+        SYSLOG("VCN1", "CAIL UvdInit result=%d stub=%u", result, cailAsicInitStubActive ? 1U : 0U);
     }
     return result;
 }
@@ -1360,6 +1404,10 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
         patcher.clearError();
         NRed::singleton().setProp32("NRedVCN1CailInitHooked", 0);
     }
-    else { NRed::singleton().setProp32("NRedVCN1CailInitHooked", 1); }
+    else {
+        // RouteRequest::from 是 solveSymbol 的运行时符号地址（cailUvdInitOriginal 是 trampoline）。
+        cailUvdInitSymbol = initRoute.from;
+        NRed::singleton().setProp32("NRedVCN1CailInitHooked", 1);
+    }
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
