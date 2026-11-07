@@ -1307,6 +1307,8 @@ static mach_vm_address_t cailUvdInitSymbol{0};
 static mach_vm_address_t cailLibrarySlide{0};
 static mach_vm_address_t cailAsicInitStubOriginal{0};
 static bool              cailAsicInitStubActive{false};
+// HWLibs 的 MMIO 读：用来在真实 init 前后读 0x83AF（UVD_STATUS），判断空闲位为何等不到。
+static UInt32 (*cailReadMmRegister)(void*, UInt32){nullptr};
 
 // adapter+0x12D8 的替代实现：真实 Greenland init 死在 _Cail_MCILWaitFor（寄存器 0x83AF bit1），
 // 先返回成功验证 _CAILUvdControl 后续链路。
@@ -1380,11 +1382,18 @@ static int cailUvdInitHook(void* adapter, void* input)
         }
         return 0;
     }
+    if (cailReadMmRegister != nullptr && adapter != nullptr) {
+        NRed::singleton().setProp32("NRedVCN1CailUvdStatusBefore", cailReadMmRegister(adapter, 0x83AF));
+    }
     auto result = reinterpret_cast<int (*)(void*, void*)>(cailUvdInitOriginal)(adapter, input);
     NRed::singleton().setProp32("NRedVCN1CailInitFirstResult", static_cast<UInt32>(result));
-    // 真实 init 失败后把该槽换成返回 0 的桩再走一遍：既保留原始失败码，也让调用方继续往下走，
-    // 用来判断 CapUVD0/CapResult 卡在 ASIC init 还是更后面的链路。
-    if (result != 0 && adapter != nullptr) {
+    if (cailReadMmRegister != nullptr && adapter != nullptr) {
+        NRed::singleton().setProp32("NRedVCN1CailUvdStatusAfter", cailReadMmRegister(adapter, 0x83AF));
+    }
+    // 真实 init 失败后把该槽换成返回 0 的桩再走一遍。注意：桩会跳过 UVD 寄存器初始化，
+    // 引擎即使“启动成功”也无法处理解码命令，因此默认关闭，只有显式 boot-arg 才启用。
+    const bool allowAsicStub = checkKernelArgument("-NRedVCNAsicStub");
+    if (allowAsicStub && result != 0 && adapter != nullptr) {
         // 每个适配器独立替换：不同引擎/服务实例的 adapter 不是同一个对象，共用全局 bool 会漏装。
         auto* const      slot = reinterpret_cast<mach_vm_address_t*>(static_cast<UInt8*>(adapter) + 0x12D8);
         const auto       stub = reinterpret_cast<mach_vm_address_t>(&cailAsicInitReturnZero);
@@ -1433,5 +1442,9 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
         cailUvdInitSymbol = initRoute.from;
         NRed::singleton().setProp32("NRedVCN1CailInitHooked", 1);
     }
+    cailReadMmRegister =
+        reinterpret_cast<UInt32 (*)(void*, UInt32)>(patcher.solveSymbol(id, "_ulReadMmRegisterUlong"));
+    patcher.clearError();
+    NRed::singleton().setProp32("NRedVCN1CailMmioReadResolved", cailReadMmRegister != nullptr);
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
