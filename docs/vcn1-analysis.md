@@ -540,3 +540,35 @@ adapter 的槽，`CailInitDelta=0x7EBA6AA1`）。
 
 下一轮预期：`HardwareInitDec=1`、`StartDec=1`，随后 `CapUVD0`/`CapResult` 应为非零；若 Cap 仍为 0，
 再查引擎 start / capability 填充路径。
+
+## 17. 第十四轮：解码通道挂死与安全诊断构建
+
+装上「重复 init 短路」构建后，登录约 55 秒（VTDecoderXPCService 启动）系统冻结。诊断报告
+（`/Library/Logs/DiagnosticReports/Kernel_2026-11-07-22*.gpuRestart`）给出：
+
+- Restart Channel: **12 UVDDec**；`UVD0: Enabled`；`SubmittedTS=2, CompletedTS=0`。
+- FirstPendingCB: PID 550, `VTDecoderXPCServ`, SubmitContext=Video, VMID=3。
+- `AMDRadeonX5000HWLibs` 日志：`HangFlags 0x4: FenceNotRetired=1, FullAsicReset=1`。
+- 三次冻结分别在 22:34/22:36/22:38，都在启动后 ~55 秒。
+
+结论：`adapter+0x12D8` 被换成返回 0 的桩后，`_greenland_uvd_init` 的整套 UVD 寄存器初始化被完全
+跳过。上一轮让 `_CailUvdInit` 的重复调用短路成功后，`initHardwareCail` 返回成功、引擎 `start()`
+继续执行，VA 驱动于是向 UVDDec 环提交真实解码命令；但 UVD 块从未被真正初始化，命令永远不完成，
+GPU 看门狗做 FullAsicReset。冻结不是内存/显示损坏，而是 UVD 通道挂死。
+
+因此桩只能作为诊断，不能作为可用路径。用户已回滚到上一版（UUID `E14758AF`，`HardwareInitDec=0`）
+并稳定运行——没有引擎 start 就没有提交，也就不会挂死。
+
+安全诊断构建（本轮）：
+
+- 桩默认关闭，仅在 boot-arg `-NRedVCNAsicStub` 存在时启用；没有桩就没有成功的 init/start，
+  不会向 UVDDec 提交命令，系统保持稳定。
+- 解析 `_ulReadMmRegisterUlong`，在真实 init 前后读 `0x83AF`（`UVD_STATUS`）：
+  `CailUvdStatusBefore` / `CailUvdStatusAfter`。Linux `vcn_v1_0_wait_for_idle` 等的是
+  `UVD_STATUS == 0x2`（bit1 = idle），与 `_udv_init_engine` 的 waitObj `{0x83AF, mask=2, value=2}`
+  完全一致；这两个读数会告诉我们真实 init 失败时状态是 0x0、0x1 还是别的值。
+- 保留重复 init 短路（真实 init 失败时 E48 不会置位，短路不会触发）。
+- 新增 `CailMmioReadResolved` 确认读函数解析成功。
+
+下一步：用这个安全构建拿到 `CailUvdStatusBefore/After`，判断 UVD 块是否因为未上电/未解复位而没有
+进入 idle；再决定是补时钟/复位序列，还是修正 APU 上 Greenland init 与 VCN1 的差异。

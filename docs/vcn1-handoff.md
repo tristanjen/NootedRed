@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `366eea0` VCN1: Make _CailUvdInit idempotent and stub per adapter；docs（本轮） |
+| 最新提交 | `ff41792` VCN1: Disable the ASIC stub by default and read UVD_STATUS；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -48,8 +48,8 @@ ioreg -l | grep -o '"NRed[A-Za-z0-9]*" = [0-9a-fA-Fx]*' > ~/Desktop/vcn1-boot.tx
 - CAIL：`[hardware+0x340]` 是 `AmdCailServices`；`earlyInitialize`/`initialize` 都成功（`CailEarly=0`、`CailInit=0` 是成功码），VBIOS 签名 0x55/0xAA 通过。
 - 用户态 VA 驱动补丁表含 0x15D8（family 4），播放时 `NRedVCNUserApplied=16`、`DecoderPID` 出现。
 - 视频上下文：`accel+0x1F10` bit3 本来就置位，`NewCtxResult=1`、`VideoCtxStart=1`、`VcQueueUVD0=1`。
-- 内核 VCN1 初始化：Greenland ASIC init 的 MCIL 等待用返回 0 的桩绕过后，`InitHardwareCail=1`、
-  `HardwareInitDec=1`、`ProbeInitResult=1`（2026-11-07 实机）。
+- 内核 VCN1 初始化诊断：返回 0 的桩可让 `InitHardwareCail`/`HardwareInitDec=1`，但它跳过了
+  UVD 寄存器初始化，解码提交会挂死 UVDDec（§17）；真实 init 只卡在 0x83AF idle 等待（§13）。
 - 用户态 VA：共享缓存补丁 Applied（`VCNUserApplied=16`、`VCNUserD15=1`）、`VCNDecoderPID` 出现、
   `NewCtxStatus=0`、`UvdCtxInit=1`、`ReqCap=1`（2026-11-07 21:53 实机）。
 
@@ -64,21 +64,26 @@ ioreg -l | grep -o '"NRed[A-Za-z0-9]*" = [0-9a-fA-Fx]*' > ~/Desktop/vcn1-boot.tx
 GVA 日志不再报 `AVD_api.Create failed err=5`。VA 驱动已经发起 `NewCtxStatus=0`、`UvdCtxInit=1`、
 `ReqCap=1`（mode 6）——只差引擎能力。
 
-**当前阻塞**：同一 dump 里内核侧 `HardwareInitDec=0`、`StartDec=0`。原因是 `_CailUvdInit` 对同一
-adapter **不幂等**：第一次成功按 mode=0 置 `[adapter+0xE48]` bit8，`initHardwareCail` 的 flag=0
-重试再次进入时被库层门禁直接返回 1（`CailE48=0x100`、`CailInitFirstResult=1`、`CailStubResult=1`）。
-另外桩安装原来用全局 bool，第二个 adapter 会漏装。修复：按 mode 的完成位（bit8/bit20）短路返回 0、
-桩按 adapter 安装，新增 `CailInitCalls`/`CailInitAlready`/`CailAsicStubAdapter`（§16）。
+**当前阻塞（2026-11-07 22:34–22:38）**：装上带「重复 init 短路」的构建（UUID `FBEA6D26`）后，
+登录约 55 秒系统冻结。gpuRestart 报告显示 Restart Channel 12 **UVDDec**，VTDecoderXPCService
+PID 550 提交了 2 个命令缓冲、CompletedTS=0，AMD Cail 报 FenceNotRetired=1、FullAsicReset=1。
+原因：返回 0 的 ASIC 桩跳过了 `_greenland_uvd_init` 的 UVD 寄存器初始化；短路让 initHardwareCail
+返回成功，引擎 start 后 VA 驱动提交真实解码命令，UVD 块从未初始化 → 看门狗复位。
+**不要安装 `FBEA6D26` 这个构建**；已回滚到 `E14758AF`（`HardwareInitDec=0`，无提交，稳定）。
+
+安全诊断构建（UUID `8F47944A`，§17）：桩默认关闭（仅 boot-arg `-NRedVCNAsicStub` 启用），真实
+init 失败、引擎不会 start，因此不会挂死；新增 `CailUvdStatusBefore`/`CailUvdStatusAfter`
+（`_ulReadMmRegisterUlong(adapter, 0x83AF)`）和 `CailMmioReadResolved`，用来判断 idle 位为何等不到。
 
 `CapUVD0`/`CapResult=0` 是 init 失败的后果：查询已经到达内核并写入了属性，但引擎没 start，能力为 0。
 
 ## 下一步
 
-1. 安装新 kext 重启、播 30 秒 QuickTime，读 `NRedVCN1HardwareInitDec`、`NRedVCN1StartDec`、
-   `NRedVCN1CapUVD0`/`CapResult`、`CailInitCalls`/`CailInitAlready`。
-2. 若 `CapResult` 非零 → 确认 `UsingHardwareAcceleratedVideoDecoder`，与软解做像素比对。
-3. 若 `StartDec` 仍为 0 → 查 `start()` 在 initHardware 之后还卡在哪；若 `StartDec=1` 但 Cap 仍 0 →
-   查视频上下文/队列的能力填充。
+1. 安装 `8F47944A` 构建重启、播 30 秒 QuickTime，确认系统不再冻结（`HardwareInitDec=0` 是预期），
+   读 `CailUvdStatusBefore`/`CailUvdStatusAfter`、`CailMmioReadResolved`、`CailInitCalls`/`CailInitAlready`。
+2. 若 `After` 为 0x2（idle）而 wait 仍失败 → 查 MCIL 等待路径/回调返回码；若为 0x0/0x1/0x4 等 →
+   说明 UVD 块未上电/未解复位/未启动，需要补时钟/复位序列，或修正 APU 上 Greenland init 与 VCN1 的差异。
+3. 在真实 `_greenland_uvd_init` 能返回 0 之前，不要重新启用 ASIC 桩，也不要在登录时触发解码提交。
 
 ## 反汇编环境
 
