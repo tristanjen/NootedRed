@@ -949,3 +949,33 @@ build42（CDHash `955FE564`，UUID `00A6452E`，commit `eb260d6`）：
   激活媒体 block，下一步在 PSM 上电后的安全时间点一次性重跑引擎 `initHardware`
   （保留 no-start 闸）；若 PSM 计数全 0，则改从视频上下文路径调用
   `PSM_UseAsicBlock`/`PSM_ActivateClient`，不再裸发 `PowerUpVCN`。
+
+## 29. 第二十六轮：build42b 证实 PSM 只关不开，build43 做电源脉冲探针
+
+build42b（CDHash `955FE564`，UUID `00A6452E`）实机 dump：
+
+- 安全默认成立：`InitPowerGate1A0Before/After=1`、`PhmState190AtHardware=1`、
+  `UnsafePoweredAtInit=0`、`PeciVCNPGCalls=1`、`Raw=1`、`Result=1`、`Forced` 不出现。
+  这同时证实 build37 的谜底：驱动 `PECI_ReadRegistry("PP_EnableVCNPG")` 读到的是
+  **默认值 1**，personality 的扁平属性没有被 `getProperty` 命中（或转换失败）。
+- PSM 行为：`PsmReArbitCalls=7`、`PsmReArbitGateDelta=2`，
+  `PhmPowerGateVCNCalls=7`/`LastOn=1`、`PhmPowerGateUVDCalls=7`/`LastOn=1`，
+  `RavenPowerDownCalls=8` 全部空转（190 前后均为 1），`RavenPowerUpCalls` 不出现。
+  `PsmUseAsicBlock*` 不出现（从未调用），`PsmReArbitFlag5F0=0`、`Flag690=0`。
+- 结论：PSM 每轮仲裁都在关 VCN/UVD（on=1），两个“应开”标志
+  `[psm+0x5F0]`/`[psm+0x690]` 始终为 0，视频栈没有向 PSM 申请媒体 block；
+  引擎 init 失败 → 能力为 0 → VA 驱动不会发起真正的视频会话，形成死锁。
+
+build43（CDHash `15BFC5D8`，UUID `028269CA`，commit `5777f9f`）：
+
+- 在 `uvd7InitHardware` 原生 init 失败后做一次短促电源脉冲（只解码引擎、只一次）：
+  临时清 `[0x1A0]` → `PhwRaven_PowerUpVCN`（走 1A0==0 的完整路径：SMU msg 2 + msg 0xC
+  + `PhwRaven_GetSOC15RegisterOffset` 0xC0/0xC1 的 `PECI_WriteRegister/WaitOnRegister`）
+  → 用 `_ulReadMmRegisterUlong(adapter, 0x83AF)` 最多读 3 次（间隔 1ms）→ 恢复 `[0x1A0]`
+  → `PhwRaven_PowerDownVCN` 把 VCN 关回去。窗口几毫秒，**不跑 CAIL init**。
+- 新增 `_PSM_ActivateClient`（client/args/result）与
+  `_PEM_Task_VideoStartMultiUVDStates`（calls/result）观测，`PSM_ReArbit` 里补
+  `PsmHandle`，用于判断视频栈是否真的向 PSM 注册过媒体客户端。
+- 判据：`PowerProbeUpResult` 成功且 `190AfterUp=0`、`PowerProbeStatus` bit1=1
+  → 上电后块是 idle 的，下一版可以在同一窗口里跑 `initHardwareCail`；
+  `Status=0` → 还缺 PSM 的时钟/DPG 序列，需要查 `PhwRaven_SetDPGModeVCN` 与 msg 0xC。
