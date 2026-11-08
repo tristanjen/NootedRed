@@ -747,10 +747,10 @@ namespace
         // 只观察 PHM 状态，不再写 SMU/寄存器：上一版在 PHM 初始化后强制 PowerUpVCN，
         // 约 40 秒后触发 TLB flush 超时 panic（§22）。这里只读驱动的 TF 留下的状态。
         void* phm = __atomic_load_n(&phmHandle, __ATOMIC_ACQUIRE);
+        void* state{nullptr};
+        if (phm != nullptr) { memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state)); }
         NRed::singleton().setProp32("NRedVCN1PhmHandlePresent", phm != nullptr);
         if ((isEncode & 1U) == 0 && phm != nullptr) {
-            void* state{nullptr};
-            memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state));
             const auto poweredNow = readState32(state, 0x190);
             NRed::singleton().setProp32("NRedVCN1PhmState190AtHardware", poweredNow);
             // [0x190]==0 表示 VCN 在引擎 init 时仍上电；build35/build41 都栽在这种状态，
@@ -771,6 +771,27 @@ namespace
                 SYSLOG("VCN1", "forced powerOnOff(true) result=%u", powered ? 1U : 0U);
             }
         }
+        // 自包含的初始化电源窗口（默认关闭，只有 -NRedVCNInitWindow 才启用）：
+        // 在本次 initHardware 内部上电 → loadUVDFW + initHardwareCail → 立即关回。
+        // build45 的 TF 窗口已移除：它存在“TF 打开、init 未执行”时 VCN 长期上电的泄漏路径。
+        bool windowOpen{false};
+        if ((isEncode & 1U) == 0 && vcn1Device() && phm != nullptr && state != nullptr
+            && checkKernelArgument("-NRedVCNInitWindow") && ravenPowerUpOriginal != 0)
+        {
+            static UInt32 windowUses{0};
+            if (__atomic_fetch_add(&windowUses, 1U, __ATOMIC_RELAXED) == 0 && readState32(state, 0x190) != 0) {
+                vcnInitSaved1A0 = readState32(state, 0x1A0);
+                const UInt32 zero{0};
+                memcpy(static_cast<UInt8*>(state) + 0x1A0, &zero, sizeof(zero));
+                vcnInitWindowOpen = true;
+                windowOpen       = true;
+                NRed::singleton().setProp32("NRedVCN1InitWindowOpened", 1);
+                NRed::singleton().setProp32("NRedVCN1InitWindowSaved1A0", vcnInitSaved1A0);
+                const auto up = reinterpret_cast<int (*)(void*)>(ravenPowerUpOriginal)(phm);
+                NRed::singleton().setProp32("NRedVCN1PowerProbeUpResult", static_cast<UInt32>(up));
+                NRed::singleton().setProp32("NRedVCN1PowerProbe190AfterUp", readState32(state, 0x190));
+            }
+        }
         // +0x25D!=0 时原生 initHardware 会跳过 loadUVDFW；但实测 UVD_STATUS(0x83AF) 前后都是 0，
         // 说明固件根本没被这条路径载入。诊断：第一次解码引擎 init 时临时清 0，让原生流程
         // 先 loadUVDFW，再以 flag=0 走 initHardwareCail；调用后恢复原值。
@@ -788,11 +809,13 @@ namespace
         NRed::singleton().setProp32("NRedVCN1CailFirmwareFirst", firmwareFirst ? 1 : 0);
         NRed::singleton().setProp32("NRedVCN1LastHardwareInit", result);
         NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareInitEnc" : "NRedVCN1HardwareInitDec", result);
-        // 初始化电源窗口在解码引擎第一次 initHardware（loadUVDFW + CAIL init）结束后关闭；
-        // 只有显式传 -NRedVCNPowerProbe 时才跑旧的电源脉冲诊断。
-        if ((isEncode & 1U) == 0 && vcn1Device()) {
-            if (vcnInitWindowOpen) { closeInitWindow(phm); }
-            else if (checkKernelArgument("-NRedVCNPowerProbe")) { powerPulseProbe(self); }
+        // 窗口只覆盖本次 initHardware；无论结果如何都立即恢复 VCNPG 并关回。
+        // 旧的电源脉冲诊断只在显式 -NRedVCNPowerProbe 时运行。
+        if (windowOpen) {
+            closeInitWindow(phm);
+        }
+        else if ((isEncode & 1U) == 0 && vcn1Device() && checkKernelArgument("-NRedVCNPowerProbe")) {
+            powerPulseProbe(self);
         }
         auto count = __atomic_fetch_add(&uvd7InitHardwareCount, 1U, __ATOMIC_RELAXED);
         if (count < 16) { SYSLOG("VCN1", "UVD7 initHardware result=%u fwFirst=%u", result, firmwareFirst ? 1U : 0U); }
@@ -954,6 +977,14 @@ namespace
         auto  original    = reinterpret_cast<Function>(accelVideoContextStartOriginal);
         const auto result = original(self);
         NRed::singleton().setProp32("NRedVCN1AccelVideoStart", result);
+        // 兜底：自包含窗口正常不会跨调用存活；若仍打开，强制关回，避免 VCN 长期上电。
+        if (vcnInitWindowOpen) {
+            void* phm = __atomic_load_n(&phmHandle, __ATOMIC_ACQUIRE);
+            if (phm != nullptr) {
+                closeInitWindow(phm);
+                NRed::singleton().setProp32("NRedVCN1InitWindowForcedClosed", 1);
+            }
+        }
         if (result) { probeHardwareInit(); }
         auto count = __atomic_fetch_add(&accelVideoContextStartCount, 1U, __ATOMIC_RELAXED);
         if (count < 8) { SYSLOG("VCN1", "AccelVideoContext::contextStart result=%u", result); }
@@ -1664,24 +1695,9 @@ static int initPowerGateHook(void* phm)
     NRed::singleton().setProp32("NRedVCN1InitPowerGateSeen", 1);
     NRed::singleton().setProp32("NRedVCN1InitPowerGate190Before", readState32(state, 0x190));
     NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Before", readState32(state, 0x1A0));
-    // 打开初始化电源窗口：TF 只有在 [0x1A0]==0 时才会走 PowerUpVCN。这里把 VCNPG 临时清 0
-    // 并保持到解码引擎 initHardware 结束，让固件在 VCN 上电状态下装载、CAIL init 也在
-    // 上电状态下执行；closeInitWindow 随后恢复 [0x1A0] 并立即关回门控。
-    const bool engineAlreadyInitialised = __atomic_load_n(&uvd7InitHardwareCount, __ATOMIC_RELAXED) != 0;
-    if (phm != nullptr && !vcnInitWindowOpen && readState32(state, 0x190) != 0) {
-        if (engineAlreadyInitialised) {
-            // TF 来得太晚（引擎 init 已经跑过）：不开窗，维持默认安全行为。
-            NRed::singleton().setProp32("NRedVCN1InitWindowSkipped", 1);
-        }
-        else {
-            vcnInitSaved1A0 = readState32(state, 0x1A0);
-            const UInt32 zero{0};
-            memcpy(static_cast<UInt8*>(state) + 0x1A0, &zero, sizeof(zero));
-            vcnInitWindowOpen = true;
-            NRed::singleton().setProp32("NRedVCN1InitWindowOpened", 1);
-            NRed::singleton().setProp32("NRedVCN1InitWindowSaved1A0", vcnInitSaved1A0);
-        }
-    }
+    // build45 曾在这里打开初始化电源窗口；它存在“TF 已上电、引擎 init 未执行”时
+    // [0x1A0] 停在 0、VCN 长期上电的泄漏路径（build35/build41 的不稳定状态）。
+    // build46 起窗口移到 uvd7InitHardware 内部（自包含、默认关闭），这里保持只读。
     const auto result = reinterpret_cast<int (*)(void*)>(initPowerGateOriginal)(phm);
     NRed::singleton().setProp32("NRedVCN1InitPowerGateResult", static_cast<UInt32>(result));
     NRed::singleton().setProp32("NRedVCN1InitPowerGate190After", readState32(state, 0x190));
