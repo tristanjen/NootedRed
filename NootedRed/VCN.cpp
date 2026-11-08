@@ -66,6 +66,11 @@ namespace
     // 用来判断驱动自己的 PSM 路径是否真的激活了 UVD/VCN，而不是只有我们在裸发 PowerUpVCN。
     mach_vm_address_t       psmUseAsicBlockOriginal{0}, phmPowerGateUVDOriginal{0};
     UInt32                  psmUseAsicBlockCalls{0}, psmUseAsicBlockMask{0}, phmPowerGateUVDCalls{0};
+    // PSM 仲裁：Raven 上真正调用 PHM_PowerGateVCN 的唯一入口（[psm+0x5f0]/[psm+0x690] 控制）。
+    // PSM_UseAsicBlock 的分发目标 _PhwRaven_SetAsicBlockGating 是 `mov eax,1; ret` 空桩，
+    // 所以只有这条路径能告诉我们媒体 block 是否真的被 PSM 打开了。
+    mach_vm_address_t       psmReArbitOriginal{0};
+    UInt32                  psmReArbitCalls{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -1657,10 +1662,39 @@ static int psmUseAsicBlockHook(void* psm, const UInt32 block)
     if (block < 32) {
         mask = __atomic_fetch_or(&psmUseAsicBlockMask, 1U << block, __ATOMIC_RELAXED) | (1U << block);
     }
-    NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockCalls", calls);
-    NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockLastBlock", block);
-    NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockLastResult", static_cast<UInt32>(result));
-    NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockBlockMask", mask);
+    // 前 8 次或出现新 block 时才写属性，避免在 PSM 热路径上反复分配。
+    static UInt32 publishedMask{0};
+    if (calls <= 8 || (mask & ~publishedMask) != 0) {
+        publishedMask = mask;
+        NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockCalls", calls);
+        NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockLastBlock", block);
+        NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockLastResult", static_cast<UInt32>(result));
+        NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockBlockMask", mask);
+    }
+    return result;
+}
+
+// PSM 仲裁：读 [psm+0x5f0]/[psm+0x690]（VCN 相关开关），并统计本次仲裁是否真的触发了
+// PHM_PowerGateVCN/UVD。只在门控计数变化或前 16 次调用时写属性。
+static int psmReArbitHook(void* psm, const UInt32 reason)
+{
+    const auto flag5f0   = readState32(psm, 0x5F0);
+    const auto flag690   = readState32(psm, 0x690);
+    const auto vcnBefore = __atomic_load_n(&phmPowerGateVCNCalls, __ATOMIC_RELAXED);
+    const auto uvdBefore = __atomic_load_n(&phmPowerGateUVDCalls, __ATOMIC_RELAXED);
+    const auto result    = reinterpret_cast<int (*)(void*, UInt32)>(psmReArbitOriginal)(psm, reason);
+    const auto vcnAfter  = __atomic_load_n(&phmPowerGateVCNCalls, __ATOMIC_RELAXED);
+    const auto uvdAfter  = __atomic_load_n(&phmPowerGateUVDCalls, __ATOMIC_RELAXED);
+    const auto calls     = __atomic_fetch_add(&psmReArbitCalls, 1U, __ATOMIC_RELAXED) + 1;
+    const auto gateDelta = (vcnAfter - vcnBefore) + (uvdAfter - uvdBefore);
+    if (calls <= 16 || gateDelta != 0) {
+        NRed::singleton().setProp32("NRedVCN1PsmReArbitCalls", calls);
+        NRed::singleton().setProp32("NRedVCN1PsmReArbitLastReason", reason);
+        NRed::singleton().setProp32("NRedVCN1PsmReArbitLastResult", static_cast<UInt32>(result));
+        NRed::singleton().setProp32("NRedVCN1PsmReArbitFlag5F0", flag5f0);
+        NRed::singleton().setProp32("NRedVCN1PsmReArbitFlag690", flag690);
+        NRed::singleton().setProp32("NRedVCN1PsmReArbitGateDelta", gateDelta);
+    }
     return result;
 }
 
@@ -1746,6 +1780,14 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
     }
     else {
         NRed::singleton().setProp32("NRedVCN1PsmBlockHooked", 1);
+    }
+    KernelPatcher::RouteRequest psmArbRoute{"_PSM_ReArbit", psmReArbitHook, psmReArbitOriginal};
+    if (!patcher.routeMultiple(id, &psmArbRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1PsmReArbitHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1PsmReArbitHooked", 1);
     }
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }

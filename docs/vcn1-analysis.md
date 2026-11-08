@@ -927,7 +927,7 @@ build41（CDHash `37DF0FD4`，UUID `90A2B51D`，commit `a5a2085`）实机：
 → 之后所有 `PhwRaven_PowerDownVCN` 因 `[0x1A0]==0` 直接返回
 → VCN 在 PSM 之外持续上电，PSM 内部状态与真实电源域不一致。
 
-build42（CDHash `D23DDE55`，UUID `3B0F0DA8`，commit `eb260d6`）：
+build42（CDHash `955FE564`，UUID `00A6452E`，commit `eb260d6`）：
 
 - PECI 强制改为 `-NRedVCNForceVCNPG0` 门控，默认放行原值；只保留
   `PeciVCNPGCalls/Raw/Result` 观测（回答 build37 的属性为何读不到）。
@@ -936,10 +936,16 @@ build42（CDHash `D23DDE55`，UUID `3B0F0DA8`，commit `eb260d6`）：
 - 新增只读观测：
   - `_PSM_UseAsicBlock`（block 2/3/6 是 PEM 视频启动任务使用的媒体 block）
     → `PsmUseAsicBlockCalls/LastBlock/LastResult/BlockMask`；
+  - `_PSM_ReArbit`（Raven 上唯一调用 `PHM_PowerGateVCN` 的入口）
+    → `PsmReArbitCalls/LastReason/LastResult/Flag5F0/Flag690/GateDelta`；
   - `_PHM_PowerGateUVD` → `PhmPowerGateUVDCalls/LastOn/Result/190Before/190After`；
   - `UnsafePoweredAtInit` = `[state+0x190]==0`（引擎 init 时 VCN 仍上电）→ 1。
+- 新增静态事实：`PSM_UseAsicBlock` 的分发目标 `_PhwRaven_SetAsicBlockGating`
+  （0x47bab44）是 `mov eax,1; ret` 空桩，所以仅看 `PSM_UseAsicBlock` 不能判断媒体
+  block 是否被真正上电；必须同时看 `PSM_ReArbit` 与 PHM 门控计数。
 - 判据：默认路径应为 `InitPowerGate1A0Before=1`、`UnsafePoweredAtInit=0`。
-  若播放时 `PsmUseAsicBlockBlockMask` 出现 bit 2/3/6 或 `PhmPowerGateVCN/UVD`
-  的 `LastOn=0`，说明 PSM 自己会激活媒体 block，下一步在 PSM 上电后的安全时间点
-  一次性重跑引擎 `initHardware`（保留 no-start 闸）；若 PSM 计数全 0，则改从
-  视频上下文路径调用 `PSM_UseAsicBlock`/`PSM_ActivateClient`，不再裸发 `PowerUpVCN`。
+  若播放时 `PsmUseAsicBlockBlockMask` 出现 bit 2/3/6、`PsmReArbitCalls>0` 且
+  `PsmReArbitGateDelta>0`，或 `PhmPowerGateVCN/UVD` 的 `LastOn=0`，说明 PSM 自己会
+  激活媒体 block，下一步在 PSM 上电后的安全时间点一次性重跑引擎 `initHardware`
+  （保留 no-start 闸）；若 PSM 计数全 0，则改从视频上下文路径调用
+  `PSM_UseAsicBlock`/`PSM_ActivateClient`，不再裸发 `PowerUpVCN`。

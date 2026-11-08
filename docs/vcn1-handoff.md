@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `eb260d6` VCN1: Make the PECI override opt-in and observe the PSM media path；docs（本轮） |
+| 最新提交 | `6218a05` VCN1: Observe PSM_ReArbit, the real VCN gate caller on Raven；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -169,12 +169,15 @@ panic 为 `spinlock acquisition timeout`（CPU 4 的 fseventsd 线程在 VFS 路
 超时 panic）同类，且 build41 是该次启动唯一增量。**不要再安装 build41。**
 机器已回滚到 build40（UUID `FEB0F272`）运行。
 
-build42（`eb260d6`，CDHash `D23DDE55`，UUID `3B0F0DA8`，默认安全观测版）：把 build41 的 PECI 强制改为 `-NRedVCNForceVCNPG0` 门控
+build42（`eb260d6`，CDHash `955FE564`，UUID `00A6452E`，默认安全观测版）：把 build41 的 PECI 强制改为 `-NRedVCNForceVCNPG0` 门控
 （默认关，放行原值），默认行为回到 build40；保留 PowerUp/PowerDown/PHM 门控的只读计数；
-新增 `_PSM_UseAsicBlock`、`_PHM_PowerGateUVD` 观测与 `UnsafePoweredAtInit` 安全标记
-（`[state+0x190]==0` 时置 1，提示 VCN 被留在上电状态）。目标：确认驱动自己的 PSM
-路径在播放时是否激活媒体 block（`PSM_UseAsicBlock` 的 block 2/3/6、
-`PHM_PowerGateVCN/UVD` 的 on=0），再决定在哪里安全地重跑引擎 init。
+新增 `_PSM_UseAsicBlock`、`_PSM_ReArbit`、`_PHM_PowerGateUVD` 观测与
+`UnsafePoweredAtInit` 安全标记（`[state+0x190]==0` 时置 1，提示 VCN 被留在上电状态）。
+关键静态事实：`PSM_UseAsicBlock` 的分发目标 `_PhwRaven_SetAsicBlockGating`（0x47bab44）
+只是 `mov eax,1; ret` 空桩，Raven 上真正调用 `PHM_PowerGateVCN` 的只有
+`PSM_ReArbit`（[psm+0x5f0]/[psm+0x690] 控制）；所以两条都要看。
+判据：`PsmUseAsicBlockBlockMask` 的 bit 2/3/6、`PsmReArbitGateDelta>0`、
+`PhmPowerGateVCN/UVD` 的 `LastOn=0`，再决定在哪里安全地重跑引擎 init。
 
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
@@ -191,9 +194,10 @@ no-start 闸。
    `RavenPowerDownCalls`、`InitHardwareCailRaw`、`CailInitResult`、`CailUvdStatusBefore/After`。
 2. `InitPowerGate1A0Before=1`、`UnsafePoweredAtInit=0`、`PeciVCNPGForced=0` → 默认安全
    路径成立；若同一 spinlock panic 仍复现，说明与 VCN 改动无关，另查内核/VFS。
-3. 播放时 `PsmUseAsicBlockBlockMask` 出现 bit 2/3/6 或 `PhmPowerGateVCN/UVD` 的
-   `LastOn=0` → PSM 自己会激活媒体 block：下一步（build43）在 PSM 上电后的安全时间点
-   一次性重跑引擎 `initHardware`（保留 no-start 闸），看 `CailInitResult`/`CailUvdStatus`。
+3. 播放时 `PsmUseAsicBlockBlockMask` 出现 bit 2/3/6、`PsmReArbitCalls>0` 且
+   `PsmReArbitGateDelta>0` 或 `PhmPowerGateVCN/UVD` 的 `LastOn=0` → PSM 自己会激活
+   媒体 block：下一步（build43）在 PSM 上电后的安全时间点一次性重跑引擎 `initHardware`
+   （保留 no-start 闸），看 `CailInitResult`/`CailUvdStatus`。
 4. PSM 计数全为 0 → 视频启动任务没有走到 PSM：下一步从视频上下文路径调用
    `PSM_UseAsicBlock`/`PSM_ActivateClient`，而不是直接 `PhwRaven_PowerUpVCN`。
 5. 只有在受控实验里才使用 `-NRedVCNForceVCNPG0`；它等价于 build41 的危险状态。
