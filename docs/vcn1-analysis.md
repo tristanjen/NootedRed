@@ -1007,3 +1007,32 @@ build44（CDHash `A9936CCB`，UUID `D3B887A1`，commit `0e47a32`）：
   的调用者，便于用 `kextstat` 的 slide 反查驱动路径。
 - 判据：`PowerProbeStatus` bit1=1 → 块是活的，看 `PowerProbeWindowInit` 与
   `CailInitResult`；若窗口内 init 成功，下一版去掉 no-start 闸验证 start。
+
+## 31. 第二十八轮：build44 证明只上电不够；build45 把电源窗口覆盖到引擎 init
+
+build44（CDHash `A9936CCB`，UUID `D3B887A1`）实机 dump（14:30）：
+
+- `PowerProbeAdapter=1`（adapter 解析修好了）、`PowerProbeUpResult=1`、
+  `PowerProbe190AfterUp=0`（VCN 上电）、`PowerProbeDownResult=1`、
+  `PowerProbe190AfterDown=1`（关回），系统稳定。
+- **`PowerProbeStatus=0`、`PowerProbeWindowInit` 不出现**：`PowerUpVCN` 能打开电源域，
+  但 UVD 块不会 idle。结合首次 `initHardware` 是在 gated 状态下装载固件的，结论是：
+  固件必须在 VCN 上电状态下装载/启动，0x83AF idle 位才会置起。
+- PSM 侧不变：`PsmActivateClientCalls=6`/`Last=3`/`Result=1`，`PemVideoStartCalls`
+  不出现，PSM 仍只关门不开门。调用者地址落在 KernelPatcher 的 trampoline 区
+  （不在任何已加载 kext 范围内），`__builtin_return_address(0)` 经 route 钩子拿不到
+  真实调用者，后续不再依赖它。
+
+build45（CDHash `217B04E3`，UUID `44B5526C`，commit `16c6574`）：初始化电源窗口。
+
+- `initPowerGateHook` 在第一次 TF 调用前把 `[state+0x1A0]` 清 0 并**保持**：TF 因此走
+  完整 `PhwRaven_PowerUpVCN`（SMU msg 2 + msg 0xC + `PECI_WriteRegister` 0xC0/0xC1）。
+- 窗口一直保持到解码引擎第一次 `initHardware`（`0x25D` 被清 0 → `loadUVDFW` 在 VCN
+  上电状态下执行；随后 `initHardwareCail` 也在上电状态下执行）。
+- `uvd7InitHardware` 返回后立即 `closeInitWindow`：恢复 `[0x1A0]`、调用
+  `PhwRaven_PowerDownVCN` 关回，并发布 `InitWindowClosed/DownResult/190AfterDown`。
+- 安全护栏：若 TF 到达时 `uvd7InitHardwareCount != 0`（引擎 init 已跑过），不开窗
+  （`InitWindowSkipped=1`）；旧的电源脉冲探针改为 `-NRedVCNPowerProbe` 才运行。
+- 判据：`InitWindowOpened=1`、`Closed=1`、`190AfterDown=1` 说明窗口闭合；
+  `CailInitResult=0` + `InitHardwareCailRaw=1` 说明 CAIL init 首次在上电状态下成功，
+  下一版把窗口延长到 `uvdEngineStart` 之后并去掉 no-start 闸。
