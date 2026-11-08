@@ -85,6 +85,10 @@ namespace
     // 不写 [state+0x1A0]/[0x190]，也不直接调用 PhwRaven_PowerUpVCN。
     mach_vm_address_t       psmGetStateByClassification{0}, psmSetUvdState{0}, psmAdjustPowerState{0};
     mach_vm_address_t       psmUnuseAsicBlock{0}, psmGetAsicBlockStatus{0};
+    // build48：分类探测。0x12 在 build47 返回 0xF（状态不存在），这里枚举状态表里实际存在的
+    // 分类位，并依次尝试 UVD 的四个分类（0x12/0x13/0x14/0x11）。
+    mach_vm_address_t       psmListPresentClassifications{0};
+    mach_vm_address_t       psmSetUvdHDState{0}, psmSetUvdSDState{0}, psmSetUvdMVCState{0};
     void*                   psmHandle{nullptr};
     UInt32                  psmWakeStage{0};      // 0=未跑，1=已尝试，2=已放弃
     UInt32                  psmWakeAcquired{0};   // PSM 已接受 block 3 的登记
@@ -1952,20 +1956,71 @@ void psmWakeVcn()
     }
 
     const auto gateBefore = __atomic_load_n(&phmPowerGateVCNCalls, __ATOMIC_RELAXED);
-    UInt32     stateIndex{0};
-    const auto getResult = reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32*)>(
-        psmGetStateByClassification)(psm, 0x12, 0, &stateIndex);
+    UInt32     classesMask{0};
+    if (psmListPresentClassifications != 0) {
+        reinterpret_cast<int (*)(void*, UInt32*)>(psmListPresentClassifications)(psm, &classesMask);
+    }
+    NRed::singleton().setProp32("NRedVCN1PsmWakeClassesMask", classesMask);
+
+    // 按 PEM 视频启动任务的四个 UVD 分类依次探测；取第一个存在的分类和对应 block。
+    struct Candidate {
+        UInt32          classId;
+        UInt32          block;
+        mach_vm_address_t setter;
+    };
+    const Candidate candidates[] = {
+        {0x12, 3, psmSetUvdState},
+        {0x13, 4, psmSetUvdHDState},
+        {0x14, 5, psmSetUvdSDState},
+        {0x11, 2, psmSetUvdMVCState},
+    };
+    UInt32 stateIndex{0}, chosenClass{0}, chosenBlock{0};
+    mach_vm_address_t chosenSetter{0};
+    int    getResult{0};
+    for (const auto& candidate : candidates) {
+        if (candidate.setter == 0) { continue; }
+        UInt32     index{0};
+        const auto probe = reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32*)>(
+            psmGetStateByClassification)(psm, candidate.classId, 0, &index);
+        if (candidate.classId == 0x12) {
+            NRed::singleton().setProp32("NRedVCN1PsmWakeClass12Result", static_cast<UInt32>(probe));
+            NRed::singleton().setProp32("NRedVCN1PsmWakeClass12Index", index);
+        }
+        else if (candidate.classId == 0x13) {
+            NRed::singleton().setProp32("NRedVCN1PsmWakeClass13Result", static_cast<UInt32>(probe));
+            NRed::singleton().setProp32("NRedVCN1PsmWakeClass13Index", index);
+        }
+        else if (candidate.classId == 0x14) {
+            NRed::singleton().setProp32("NRedVCN1PsmWakeClass14Result", static_cast<UInt32>(probe));
+            NRed::singleton().setProp32("NRedVCN1PsmWakeClass14Index", index);
+        }
+        else {
+            NRed::singleton().setProp32("NRedVCN1PsmWakeClass11Result", static_cast<UInt32>(probe));
+            NRed::singleton().setProp32("NRedVCN1PsmWakeClass11Index", index);
+        }
+        if (probe == 1 && getResult == 0) {
+            getResult    = 1;
+            stateIndex   = index;
+            chosenClass  = candidate.classId;
+            chosenBlock  = candidate.block;
+            chosenSetter = candidate.setter;
+        }
+    }
     NRed::singleton().setProp32("NRedVCN1PsmWakeGetStateResult", static_cast<UInt32>(getResult));
     NRed::singleton().setProp32("NRedVCN1PsmWakeStateIndex", stateIndex);
+    NRed::singleton().setProp32("NRedVCN1PsmWakeClass", chosenClass);
+    NRed::singleton().setProp32("NRedVCN1PsmWakeBlock", chosenBlock);
     if (getResult != 1) {
+        NRed::singleton().setProp32("NRedVCN1PsmWakeNoState", 1);
         NRed::singleton().setProp32("NRedVCN1PsmWakeFailed", 1);
+        __atomic_store_n(&psmWakeStage, 2U, __ATOMIC_RELEASE);
         return;
     }
 
-    const auto setResult = reinterpret_cast<int (*)(void*, UInt32)>(psmSetUvdState)(psm, stateIndex);
+    const auto setResult = reinterpret_cast<int (*)(void*, UInt32)>(chosenSetter)(psm, stateIndex);
     const auto adjustResult = reinterpret_cast<int (*)(void*, UInt32)>(psmAdjustPowerState)(psm, 0);
     const auto useResult =
-        reinterpret_cast<int (*)(void*, UInt32)>(psmUseAsicBlockOriginal)(psm, 3);
+        reinterpret_cast<int (*)(void*, UInt32)>(psmUseAsicBlockOriginal)(psm, chosenBlock);
     NRed::singleton().setProp32("NRedVCN1PsmWakeSetUvdResult", static_cast<UInt32>(setResult));
     NRed::singleton().setProp32("NRedVCN1PsmWakeAdjustResult", static_cast<UInt32>(adjustResult));
     NRed::singleton().setProp32("NRedVCN1PsmWakeUseBlockResult", static_cast<UInt32>(useResult));
@@ -1979,7 +2034,7 @@ void psmWakeVcn()
     NRed::singleton().setProp32("NRedVCN1PsmWake190After", state190After);
     NRed::singleton().setProp32("NRedVCN1PsmWakeVcnGateDelta", gateAfter - gateBefore);
     if (flag5f0After == 0 && flag690After == 0) {
-        const auto unuse = reinterpret_cast<int (*)(void*, UInt32)>(psmUnuseAsicBlock)(psm, 3);
+        const auto unuse = reinterpret_cast<int (*)(void*, UInt32)>(psmUnuseAsicBlock)(psm, chosenBlock);
         NRed::singleton().setProp32("NRedVCN1PsmWakeUnuseResult", static_cast<UInt32>(unuse));
         NRed::singleton().setProp32("NRedVCN1PsmWakeFailed", 1);
         __atomic_store_n(&psmWakeStage, 2U, __ATOMIC_RELEASE);
@@ -1989,8 +2044,8 @@ void psmWakeVcn()
     __atomic_store_n(&psmWakeAcquired, 1U, __ATOMIC_RELEASE);
     NRed::singleton().setProp32("NRedVCN1PsmWakeAcquired", 1);
     NRed::singleton().setProp32("NRedVCN1PsmWakePowered", 1);
-    SYSLOG("VCN1", "PSM wake: flags %u/%u 190=%u gateDelta=%u", flag5f0After, flag690After,
-           state190After, gateAfter - gateBefore);
+    SYSLOG("VCN1", "PSM wake: class=%u block=%u flags %u/%u 190=%u gateDelta=%u", chosenClass,
+           chosenBlock, flag5f0After, flag690After, state190After, gateAfter - gateBefore);
 }
 
 void psmWakeRelease()
@@ -2123,9 +2178,16 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
     const bool psmAdjustOk = resolve(patcher, id, "_PSM_AdjustPowerState", psmAdjustPowerState, slide, size);
     const bool psmUnuseOk = resolve(patcher, id, "_PSM_UnuseAsicBlock", psmUnuseAsicBlock, slide, size);
     const bool psmStatusOk = resolve(patcher, id, "_PSM_GetAsicBlockStatus", psmGetAsicBlockStatus, slide, size);
+    const bool psmListOk = resolve(patcher, id, "_PSM_ListPresentClassifications",
+                                   psmListPresentClassifications, slide, size);
+    const bool psmHdOk = resolve(patcher, id, "_PSM_SetUvdHDState", psmSetUvdHDState, slide, size);
+    const bool psmSdOk = resolve(patcher, id, "_PSM_SetUvdSDState", psmSetUvdSDState, slide, size);
+    const bool psmMvcOk = resolve(patcher, id, "_PSM_SetUvdMVCState", psmSetUvdMVCState, slide, size);
     NRed::singleton().setProp32("NRedVCN1PsmWakeSymbols",
                                 (psmStateOk ? 1U : 0U) | (psmSetUvdOk ? 2U : 0U) |
                                     (psmAdjustOk ? 4U : 0U) | (psmUnuseOk ? 8U : 0U) |
-                                    (psmStatusOk ? 16U : 0U));
+                                    (psmStatusOk ? 16U : 0U) | (psmListOk ? 32U : 0U) |
+                                    (psmHdOk ? 64U : 0U) | (psmSdOk ? 128U : 0U) |
+                                    (psmMvcOk ? 256U : 0U));
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
