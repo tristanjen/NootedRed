@@ -103,16 +103,20 @@ message 2 = PowerUpVcn）。`PHM_Initialize(pp,cfg)` 在 `pp+0x960` 分配 0x1AC
 **build35 不安全**（`0E74697C`，commit `428369b`）：它在 `PHM_Initialize` 返回后强制调用
 `PhwRaven_PowerUpVCN`（SMU message 2 + SOC15 寄存器写），实机连续两次 panic：
 11:11:53（启动后 43.1s）与 11:20:15（40.5s），均为 `TLB flush timeout`，CPU 7 卡在
-`AMDRadeonX6000Framebuffer`。**不要再安装 build35。** 当前启动的是 VCN 被拒绝的构建
-（`NRedVCNRejected=5`、`NRedVCNUserRejected=5`），系统稳定。
+`AMDRadeonX6000Framebuffer`。**不要再安装 build35。**
 
-补充：`[state+0x1A0]` 来自注册表键 `PP_EnableVCNPG`（`PhwRaven_Initialize` 读取）。
-`PP_EnableVCNPG==1` 表示启用 VCN 电源门控，驱动自己的 `TF_PhwRaven_InitPowerGateState`
-会跳过 init 时的 `PowerUpVCN`；0 则让驱动自己在 init 任务里上电。这比从 PHM 钩子强行发
-SMU 安全得多。
+build36 只读观测版（`428430a`，CDHash `38DA3C47`）实机稳定，dump 确认：
+`InitPowerGateSeen=1`、`InitPowerGate1A0Before/After=1`、`InitPowerGate190Before/After=1`、
+`InitPowerGateResult=1`——驱动自己的 `TF_PhwRaven_InitPowerGateState` 运行了，但因为
+`[state+0x1A0]==1` **主动跳过** `PowerUpVCN`；VCN 一直处于门控状态。
+`CailUvdStatusBefore/After=0`、`CailInitResult=1`。
 
-安全观测构建（build36，commit `428430a`）：只路由 `_TF_PhwRaven_InitPowerGateState`，
-捕获 `phm` 并记录 `[state+0x190]`/`[state+0x1A0]` 的前后值；**不**路由 `_PHM_Initialize`、
+**修正**：实际读取的注册表键名是 **`CAIL_PP_EnableVCNPG`**（`MCIL_GetRegistrykey` 会拼
+`CAIL_` 前缀），不是 `PP_EnableVCNPG`。它在 iGPU 的 `IOPCIDevice`（ioreg 的 `IGPU@0`）上，
+和现有的 `CAIL_DisableGfxCGPowerGating` 在同一个字典。`getOSObjectData` 支持 OSNumber，
+所以 `<integer>0</integer>` 或 4 字节 data 都可以。
+
+build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
 
@@ -120,18 +124,18 @@ no-start 闸。
 
 ## 下一步
 
-1. 安装 build36（`428430a`，CDHash `38DA3C47`）重启、播 30 秒 QuickTime，读
-   `InitPowerGateSeen`、`InitPowerGateResult`、`InitPowerGate190Before/After`、
-   `InitPowerGate1A0Before/After`、`PhmState190AtHardware`、`CailUvdStatusBefore`、
+1. **不需要新 kext**：在 `config.plist` 的 DeviceProperties 里找到含
+   `CAIL_DisableGfxCGPowerGating` 的 iGPU 字典（ioreg 的 `IGPU@0`），加入
+   `CAIL_PP_EnableVCNPG` = `0`（`<integer>0</integer>` 或 `<data>AAAAAA==</data>`）。
+2. 重启 build36，播 30 秒 QuickTime，读 `InitPowerGate1A0Before/After`、
+   `InitPowerGate190After`、`PhmState190AtHardware`、`CailUvdStatusBefore`、
    `CailInitResult`。
-2. `InitPowerGateSeen=1`、`InitPowerGate1A0Before=1`、`InitPowerGate190After=1`
-   → 驱动因 `PP_EnableVCNPG=1` 跳过上电；下一版只在 TF hook 里临时清 `[0x1A0]`，让驱动
-   自己的 TF 任务调用 `PowerUpVCN`（正确时机/锁上下文），不要从 PHM 钩子强行发 SMU。
-3. `InitPowerGateSeen=1`、`InitPowerGate190After=0` → 驱动自己已经上电；之前 UVD_STATUS=0
-   的原因在别处（时钟/复位或 CAIL 读取路径），查 PSM/时钟。
-4. `InitPowerGateSeen` 缺失 → TF 未被调用；改从 `PhwRaven_Initialize` 或 `PSM_ReArbit` 找入口。
-5. 如果清理 `[0x1A0]` 后仍然 panic，考虑把 `PP_EnableVCNPG` 作为设备属性注入为 0，而不是在
-   kext 里写状态。
+3. `1A0Before=0`、`190After=0`、`CailUvdStatusBefore=0x2` → 驱动自己的 TF 上电成功；
+   下一版放开 no-start 闸（或加 `-NRedVCNAllowStart`）试真正的 start/解码。
+4. `1A0Before` 仍为 1 → 属性没落在 `IGPU@0` 或读取路径不同；改在 TF hook 里临时清
+   `[0x1A0]`（下一版 kext 的 fallback）。
+5. 如果属性生效后仍然 panic，说明驱动自己的 `PowerUpVCN` 完整路径也会卡死；需要 hook
+   `_Raven_SendMsgToSmc`/`_Raven_ReadArgFromSmc` 读真实 SMU 响应，确认是哪条消息失败。
 
 ## 反汇编环境
 

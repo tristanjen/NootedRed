@@ -766,3 +766,33 @@ build36（commit `428430a`，只读观测，不写 SMU/寄存器）：
   UVD_STATUS=0 的原因在别处（时钟/复位或 CAIL 读取路径），查 PSM/时钟。
 - `InitPowerGateSeen` 缺失 → TF 未被调用（PHM 初始化走了别的 ASIC 路径），需要另找
   入口（`PhwRaven_Initialize` 或 `PSM_ReArbit`）。
+
+## 23. 第二十轮：build36 只读观测确认驱动主动跳过 VCN 上电
+
+11-08 11:3x dump（build36，CDHash `38DA3C47`）稳定，关键读数：
+
+- `InitPowerGateSeen=1`、`InitPowerGateResult=1`、`InitPowerGate190Before=1`、
+  `InitPowerGate190After=1`、`InitPowerGate1A0Before=1`、`InitPowerGate1A0After=1`。
+- `PhmHandlePresent=1`、`PhmState190AtHardware=1`。
+- `CailUvdStatusBefore/After=0`、`CailInitResult=1`、`InitHardwareCail=0`。
+- `PowerForced=0`、`PowerDec=2`（engine selector 3 仍然失败）。
+
+结论：`TF_PhwRaven_InitPowerGateState` 确实在启动时运行，但 `[state+0x1A0]==1` 让它
+**主动跳过** `PowerUpVCN`；`[0x190]` 前后都是 1，VCN 一直处于门控状态。这不是失败路径，
+而是驱动的正常策略（`PP_EnableVCNPG` 开启时的初始化行为）。
+
+**修正**：实际读取的注册表键名是 **`CAIL_PP_EnableVCNPG`**，不是 `PP_EnableVCNPG`。
+`AMDHardware::MCIL_GetRegistrykey`（0x43CC702）会在键名前拼 `CAIL_`，再对 `[self+0x10]`
+（`IOPCIDevice`，`AMDHardware::init` 0x43C92C4 写入）调用 `getProperty`。
+`getOSObjectData` 同时支持 OSData/OSNumber，因此 DeviceProperties 里用 `<integer>0</integer>`
+或 4 字节 data 都可以。
+
+下一步（不需要新 kext）：在 `config.plist` 的 DeviceProperties 中，找到已有
+`CAIL_DisableGfxCGPowerGating` 的那个 iGPU 字典（ioreg 显示它在 `IGPU@0`），加入
+`CAIL_PP_EnableVCNPG = 0`，重启 build36。预期：
+
+- `InitPowerGate1A0Before=0`、`InitPowerGate190After=0`；
+- 驱动自己的 TF 调用 `PowerUpVCN`，`CailUvdStatusBefore=0x2`；
+- `CailInitResult=0`（如果 CAIL 初始化随后成功）。
+- 如果 `1A0Before` 仍为 1，说明属性没落在 `IGPU@0` 上或读取路径不同；退回在 TF hook 里
+  临时清 `[0x1A0]`。
