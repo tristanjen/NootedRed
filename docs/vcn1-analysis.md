@@ -603,3 +603,33 @@ GPU 看门狗做 FullAsicReset。冻结不是内存/显示损坏，而是 UVD �
   固件先行顺序正确，去掉/放开 no-start 闸后即可尝试真正的引擎 start 与解码提交。
 - `LoadUVDFW=0` → boot 时的 SML 队列还不能下载固件，需要把加载移到 probe（在 init 之前）。
 - `After` 仍为 0 → 固件载入不足以上电 UVD，需要补 Raven 的 VCN 电源域/时钟（PhwRaven PowerUpVCN 路径）。
+
+## 19. 第十六轮：固件先行未触发/未验证，probe 改为先 load 再 init
+
+10:08 dump（UUID `898C4F45`）仍然稳定，但读数需要小心解释：
+
+- `CailFirmwareFirst=0` 是**最后一次** initHardware 写入的值；第一次是否触发过无法从 ioreg 判断。
+- `CailUvdStatusBefore/After=0`、`CailInitCalls=5`、`CailInitResult=1`，`CailStartBlocked` 缺失
+  （说明 `initHardwareCail` 从未成功过）。
+- `LoadUVDFW=1` 是最后一次写入，无法区分 boot 时固件先行 load 与 probe 事后 load 的结果。
+- 用户态仍正常（`VCNUserApplied=16`、`VCNDecoderPID=1779`）。
+
+关键疑点：如果 boot 时的 `loadUVDFW` 失败，原生 `initHardware` 会在调用 `initHardwareCail` 之前
+直接返回 false；probe 再在**事后** load 成功，但不会重新跑 init。这样「固件先行 → CAIL」的顺序
+从未被真正验证。
+
+本轮诊断（UUID `1BDAD9EC`）：
+
+- `probeHardwareInit` 改为**先** `loadUVDFW`（已知在 probe 时机能成功），再临时清 `+0x25D` 调
+  `initHardware`（内部会再次 load，大概率命中 `+0x3BA` 缓存，然后以 flag=0 走 `initHardwareCail`），
+  调用后恢复；no-start 闸保持不变。
+- 新增 `LoadUVDFWCalls`/`LoadUVDFWFirst`/`LoadUVDFWSecond`、`CailFirmwareFirstEver`、
+  `CailUvdStatusFirstBefore/After`、`ProbeFirmwareFirst`，避免再被「最后一次写入」误导。
+
+判读：
+
+- `ProbeFirmwareFirst=1`、`LoadUVDFWFirst/Second=1`、`UvdStatusAfter=0x2`、`CailInitResult=0` →
+  固件先行顺序正确，下一版放开 no-start 闸尝试真正的 start/解码。
+- `LoadUVDFWFirst=0` → boot 时 SML 队列还不能下载固件；以 probe 的第二次 load 为准。
+- `After` 仍为 0（即使 load 成功）→ 固件载入不足以上电 UVD，转 Raven VCN 电源域
+  （`PhwRaven_PowerUpVCN` / `_PHM_PowerGateVCN`）。

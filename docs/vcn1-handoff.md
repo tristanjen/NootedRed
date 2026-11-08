@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `8e6fb2e` VCN1: Load UVD firmware before CAIL init and block engine start；docs（本轮） |
+| 最新提交 | `ab83a83` VCN1: Load firmware in the probe before initHardware and trace both loads；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -79,21 +79,26 @@ PID 550 提交了 2 个命令缓冲、CompletedTS=0，AMD Cail 报 FenceNotRetir
 `initHardwareCail(+0x25D&1 = 1)`；固件只在 probe 的**事后**单独加载一次，此时 CAIL init 已经失败。
 Linux `vcn_v1_0_wait_for_idle` 等的是 `mmUVD_STATUS == 0x2`；读到 0 表示电源/时钟/复位没打开。
 
-固件先行诊断构建（UUID `898C4F45`，本轮）：第一次解码引擎 `initHardware` 时临时把 `+0x25D` 清 0，
-让原生流程先执行 `loadUVDFW`、再以 flag=0 调 `initHardwareCail`；同时 `initHardwareCail` 即使成功
-也强制返回 false（除非 boot-arg `-NRedVCNAllowStart`），保证本轮不会 start/提交、不会再挂死。
-新增 `CailFirmwareFirst`、`CailStartBlocked`。
+固件先行诊断（UUID `898C4F45`，§18）10:08 实机稳定，但 `CailFirmwareFirst=0` 只是最后一次写入；
+`LoadUVDFW=1` 也可能来自 probe 的事后加载。若 boot 时 load 失败，原生 `initHardware` 会在 CAIL
+之前返回 false，导致「固件先行 → CAIL」从未真正验证。
+
+probe 先行诊断构建（UUID `1BDAD9EC`，本轮）：`probeHardwareInit` 改为**先** `loadUVDFW`
+（该时机已知能成功），再临时清 `+0x25D` 调 `initHardware`（内部再次 load 命中缓存，然后以 flag=0
+走 CAIL），调用后恢复；no-start 闸保持不变。新增 `LoadUVDFWFirst/Second/Calls`、
+`CailFirmwareFirstEver`、`CailUvdStatusFirstBefore/After`、`ProbeFirmwareFirst`。
 
 `CapUVD0`/`CapResult=0` 是 init 失败的后果：查询已经到达内核并写入了属性，但引擎没 start，能力为 0。
 
 ## 下一步
 
-1. 安装 `898C4F45` 重启、播 30 秒 QuickTime，确认不再冻结；读 `CailFirmwareFirst`、`LoadUVDFW`、
-   `CailUvdStatusAfter`、`CailInitResult`、`CailStartBlocked`。
-2. `LoadUVDFW=0` → boot 时 SML 队列还不能下载固件，改到 probe 里先 load 再 init。
-3. `After=0x2` 且 `CailInitResult=0` → 顺序正确；下一版放开 no-start 闸（或加
+1. 安装 `1BDAD9EC` 重启、播 30 秒 QuickTime，读 `ProbeFirmwareFirst`、`LoadUVDFWFirst`/`Second`、
+   `CailUvdStatusFirstAfter`/`After`、`CailInitResult`、`CailStartBlocked`。
+2. `After=0x2` 且 `CailInitResult=0` → 顺序正确；下一版放开 no-start 闸（或加
    `-NRedVCNAllowStart`）再试真正的引擎 start 与解码提交。
-4. `After` 仍为 0 → 固件载入不足以上电 UVD，转去补 Raven 的 VCN 电源域（PhwRaven PowerUpVCN 路径）。
+3. `LoadUVDFWFirst=0` 但 `LoadUVDFWSecond=1` → boot 阶段 load 不可用，以 probe 的第二次为准。
+4. `After` 仍为 0 → 固件载入不足以上电 UVD，转去补 Raven 的 VCN 电源域
+   （`PhwRaven_PowerUpVCN` / `_PHM_PowerGateVCN`）。
 
 ## 反汇编环境
 
