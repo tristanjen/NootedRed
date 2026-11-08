@@ -633,3 +633,43 @@ GPU 看门狗做 FullAsicReset。冻结不是内存/显示损坏，而是 UVD �
 - `LoadUVDFWFirst=0` → boot 时 SML 队列还不能下载固件；以 probe 的第二次 load 为准。
 - `After` 仍为 0（即使 load 成功）→ 固件载入不足以上电 UVD，转 Raven VCN 电源域
   （`PhwRaven_PowerUpVCN` / `_PHM_PowerGateVCN`）。
+
+## 20. 第十七轮：固件加载全部成功，UVD 仍然没上电；补 powerOnOff
+
+10:22 dump（UUID `1BDAD9EC`）给出了决定性结果：
+
+- `CailFirmwareFirstEver=1`、`ProbeFirmwareFirst=1`、`LoadUVDFWCalls=3`，
+  `LoadUVDFWFirst=1`、`LoadUVDFWSecond=1` —— boot 的固件先行与 probe 的先行加载**都成功**。
+- 但 `CailUvdStatusFirstBefore/After=0`、`CailUvdStatusBefore/After=0`，`CailInitResult=1`，
+  `CailStartBlocked` 缺失，`HardwareInitDec=0`、`StartDec=0`。
+- 系统稳定，用户态仍正常（`VCNUserApplied=16`、`VCNDecoderPID=768`）。
+
+结论：固件加载不是瓶颈。**VCN 电源域/时钟从未被打开**，UVD_STATUS 始终是 0；CAIL 的寄存器
+初始化本身不负责上电。
+
+关键线索：dump 里从未出现 `PowerDec`/`PowerEnc`，说明 accelerator 从未调用引擎的 `powerOnOff`。
+反汇编 `AMDUVDHWEngine::powerOnOff`（符号 0x43D1538，实际函数入口 0x43D152A）只有 6 条有效指令：
+
+```
+mov rdi, [self+0x18]        ; SML 接口
+call [rax+0x2b8]            ; 取 CAIL 客户端
+mov esi, 3
+xor edx, edx
+xor ecx, ecx
+call [client_vt+0xc8]       ; 发送 CAIL selector 3
+sete al
+```
+
+它完全忽略 `on` 参数，固定发送 selector 3（很可能是 UVD 电源/时钟消息）。我们的自定义引擎没有
+被 accelerator 纳入电源流程，所以这条消息从未发出。
+
+诊断构建（UUID `B4419BB1`，本轮）：在 `uvd7InitHardware` 里、原始 initHardware 之前，对解码引擎
+手动调用一次 `enginePowerOriginal(self, true)`，发布 `PowerHooked`/`PowerForced`/`PowerDec`。
+no-start 闸保持不变。
+
+判读：
+
+- `PowerForced=1`、`CailUvdStatusAfter=0x2`、`CailInitResult=0` → 就是缺这条电源消息；
+  下一版放开 no-start 闸试真正的 start/解码。
+- `PowerForced=0` 或 status 仍为 0 → selector 3 不是电源消息/不足以上电，转 Raven 电源域
+  （`PhwRaven_PowerUpVCN` / `_PHM_PowerGateVCN` 或 PhwRaven 的 SMU message 2 路径）。
