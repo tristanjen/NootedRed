@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `e870420` VCN1: Clear the PHM VCN power-gate flag inside the driver's TF task；docs（本轮） |
+| 最新提交 | `690a266` VCN1: Keep the VCN power-gate flag cleared after the TF power-up；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -121,6 +121,15 @@ build37 实测（`A73797F8`）：属性确实出现在 `IGPU@0` 的 ioreg 里
 `InitPowerGate1A0Before/After` 仍然是 1——驱动没有走 `PowerUpVCN`。说明注入成功，但
 `PhwRaven_Initialize` 读取的时机/对象与这份属性不一致。
 
+build38 实测（`6BAB212F`）：`InitPowerGate1A0Cleared=1`、`190After=0`，驱动自己的
+`PowerUpVCN` 成功了；但 `PhmState190AtHardware=1`——TF 返回后把 `[0x1A0]` 恢复成 1，
+PSM 的 `PowerGateVCN(phm,1)` 在 engine init 前又把 VCN 关掉。`CailUvdStatusBefore=0`。
+
+build39（`690a266`，CDHash `EB3848FB`）：默认**不恢复** `[0x1A0]`，留在 0，
+`PowerDownVCN` 开头的 `cmp [0x1A0],0` 直接跳过，VCN 保持上电；`-NRedVCNRestorePG`
+恢复 build38 行为。预期 `PhmState190AtHardware=0`、`CailUvdStatusBefore=0x2`、
+`CailInitResult=0`。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -129,16 +138,16 @@ no-start 闸。
 
 ## 下一步
 
-1. 安装 build38（`e870420`，CDHash `6BAB212F`）：`initPowerGateHook` 在调用原始
-   `TF_PhwRaven_InitPowerGateState` 前临时把 `[state+0x1A0]` 清 0，调用后恢复；驱动
-   自己的 TF 会走完整 `PowerUpVCN`。传 `-NRedVCNNoForcePG` 可跳过这次写入。
-2. 重启、播 30 秒 QuickTime，读 `InitPowerGate1A0Cleared/Restored`、
-   `InitPowerGate190After`、`PhmState190AtHardware`、`CailUvdStatusBefore`、
-   `CailInitResult`。
-3. `190After=0`、`CailUvdStatusBefore=0x2` → 驱动自己的 TF 上电成功；下一版放开 no-start
-   闸（或加 `-NRedVCNAllowStart`）试真正的 start/解码。
-4. 如果仍然 panic，说明完整 `PowerUpVCN` 路径（含 SOC15 寄存器写）会卡死 GPU；需要 hook
-   `_Raven_SendMsgToSmc`/`_Raven_ReadArgFromSmc` 读真实 SMU 响应，确认是哪一步失败。
+1. build39（`690a266`，CDHash `EB3848FB`）已安装。重启、播 30 秒 QuickTime，读
+   `InitPowerGate1A0LeftZero`、`InitPowerGate190After`、`PhmState190AtHardware`、
+   `CailUvdStatusBefore`、`CailInitResult`。
+2. `PhmState190AtHardware=0`、`CailUvdStatusBefore=0x2`、`CailInitResult=0` → 电源域和
+   CAIL 初始化都打通；下一版放开 no-start 闸（或加 `-NRedVCNAllowStart`）试真正的
+   start/解码。
+3. `PhmState190AtHardware` 仍为 1 → PSM 还有其他电源-down 路径；hook
+   `_PhwRaven_PowerDownVCN` 观察/拦截。
+4. `CailUvdStatusBefore=0x2` 但 `CailInitResult=1` → CAIL 内部还有别的失败点，看
+   `CailInitCalls`/`CailMcilWait` 等。
 
 ## 反汇编环境
 

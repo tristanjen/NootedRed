@@ -816,3 +816,21 @@ IOPCIDevice 实例）。
 message 0xC + SOC15 寄存器写/等待）；调用后恢复原值。新增
 `InitPowerGate1A0Cleared`/`Restored` 探针。传 `-NRedVCNNoForcePG` 可跳过这次写入
 （安全回退）。
+
+## 24. 第二十一轮：build38 上电成功但被 PSM 重新门控；build39 留在 0
+
+build38（CDHash `6BAB212F`）dump：
+
+- `InitPowerGate1A0Cleared=1`、`Restored=1`、`1A0Before=1`、`1A0After=0`、
+  `190Before=1`、`190After=0`、`Result=1`——驱动自己的 TF 完整 `PowerUpVCN` 成功。
+- 但 `PhmState190AtHardware=1`：到引擎 `initHardware` 时 PSM 已把 VCN 重新门控。
+- `CailUvdStatusBefore/After=0`、`CailInitResult=1`；系统稳定。
+
+原因：build38 在 TF 返回后把 `[0x1A0]` 恢复为 1。`PhwRaven_PowerDownVCN` 在
+`[0x1A0]!=0` 时才会执行消息 0xB 并置 `[0x190]=1`；PSM 的 `PowerGateVCN(phm,1)`
+因此在 engine init 前把 VCN 关掉。
+
+build39（CDHash `EB3848FB`）：默认**不恢复** `[0x1A0]`，留在 0。这样
+`PhwRaven_PowerDownVCN` 开头的 `cmp [0x1A0],0; je return 1` 直接跳过，VCN 保持
+`[0x190]=0`。新增 `InitPowerGate1A0LeftZero` 探针；`-NRedVCNRestorePG` 可恢复 build38
+行为。预期 `PhmState190AtHardware=0`、`CailUvdStatusBefore=0x2`、`CailInitResult=0`。
