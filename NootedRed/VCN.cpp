@@ -62,6 +62,10 @@ namespace
     // PhwRaven 电源域入口与 PHM 门控调度：确认驱动自己的 TF 路径真的上了电，以及之后是否被 PSM 关掉。
     mach_vm_address_t       ravenPowerUpOriginal{0}, ravenPowerDownOriginal{0}, phmPowerGateVCNOriginal{0};
     UInt32                  ravenPowerUpCalls{0}, ravenPowerDownCalls{0}, phmPowerGateVCNCalls{0};
+    // PSM 的媒体 block 使用与 UVD 门控：视频启动任务会调 PSM_UseAsicBlock（block 2/3/6），
+    // 用来判断驱动自己的 PSM 路径是否真的激活了 UVD/VCN，而不是只有我们在裸发 PowerUpVCN。
+    mach_vm_address_t       psmUseAsicBlockOriginal{0}, phmPowerGateUVDOriginal{0};
+    UInt32                  psmUseAsicBlockCalls{0}, psmUseAsicBlockMask{0}, phmPowerGateUVDCalls{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -634,7 +638,11 @@ namespace
         if ((isEncode & 1U) == 0 && phm != nullptr) {
             void* state{nullptr};
             memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state));
-            NRed::singleton().setProp32("NRedVCN1PhmState190AtHardware", readState32(state, 0x190));
+            const auto poweredNow = readState32(state, 0x190);
+            NRed::singleton().setProp32("NRedVCN1PhmState190AtHardware", poweredNow);
+            // [0x190]==0 表示 VCN 在引擎 init 时仍上电；build35/build41 都栽在这种状态，
+            // 默认路径必须是 1（门控）。
+            NRed::singleton().setProp32("NRedVCN1UnsafePoweredAtInit", poweredNow == 0 ? 1 : 0);
         }
         // 默认不再手动调 powerOnOff；让 accelerator 的 powerUpHWEngines 自己调用，
         // 用 PowerOnOffCalls/LastOn/LastResult 观察。只有 -NRedVCNForcePower 才强制调用。
@@ -1547,8 +1555,10 @@ static int initPowerGateHook(void* phm)
 }
 
 // PECI 注册表读取层：PhwRaven_Initialize 用 key="PP_EnableVCNPG"、默认 1 读取该键。
-// personality 里的 CAIL_PP_EnableVCNPG 在 build37 没有被读到（1A0 仍是 1），这里直接在
-// PECI 层兜底，把结果钉成 0，让 TF_PhwRaven_InitPowerGateState 在引擎 init 前上电。
+// personality 里的 CAIL_PP_EnableVCNPG 在 build37 没有被读到（1A0 仍是 1），这里只做观测。
+// 注意：把该键钉成 0 会让 [state+0x1A0]=0，之后 PowerDownVCN 全部直接返回，VCN 在 PSM
+// 管辖之外持续上电——build41 正是这样在 45.6 秒后冻屏/panic（与 build35 同类）。
+// 因此强制路径必须显式传 -NRedVCNForceVCNPG0，默认放行原值。
 static int peciReadRegistryHook(void* handle, const char* key, void* out, const UInt32 defaultValue)
 {
     const auto result = reinterpret_cast<int (*)(void*, const char*, void*, UInt32)>(peciReadRegistryOriginal)(
@@ -1560,11 +1570,13 @@ static int peciReadRegistryHook(void* handle, const char* key, void* out, const 
         NRed::singleton().setProp32("NRedVCN1PeciVCNPGCalls", calls);
         NRed::singleton().setProp32("NRedVCN1PeciVCNPGRaw", raw);
         NRed::singleton().setProp32("NRedVCN1PeciVCNPGResult", static_cast<UInt32>(result));
-        const UInt32 forced{0};
-        memcpy(out, &forced, sizeof(forced));
-        NRed::singleton().setProp32("NRedVCN1PeciVCNPGForced", 1);
-        SYSLOG("VCN1", "PP_EnableVCNPG raw=%u result=%d -> forced 0", raw, result);
-        return 0;
+        if (checkKernelArgument("-NRedVCNForceVCNPG0")) {
+            const UInt32 forced{0};
+            memcpy(out, &forced, sizeof(forced));
+            NRed::singleton().setProp32("NRedVCN1PeciVCNPGForced", 1);
+            SYSLOG("VCN1", "PP_EnableVCNPG raw=%u result=%d -> forced 0 (boot-arg)", raw, result);
+            return 0;
+        }
     }
     return result;
 }
@@ -1616,6 +1628,39 @@ static int phmPowerGateVCNHook(void* phm, const UInt32 on, const UInt32 arg)
     NRed::singleton().setProp32("NRedVCN1PhmPowerGateVCNResult", static_cast<UInt32>(result));
     NRed::singleton().setProp32("NRedVCN1PhmPowerGateVCN190Before", before);
     NRed::singleton().setProp32("NRedVCN1PhmPowerGateVCN190After", readState32(state, 0x190));
+    return result;
+}
+
+// UVD 门控：照旧驱动可能走 PHM_PowerGateUVD 而不是 VCN 版本（block 分发器决定）。
+static int phmPowerGateUVDHook(void* phm, const UInt32 on, const UInt32 arg)
+{
+    void* state{nullptr};
+    if (phm != nullptr) { memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state)); }
+    const auto before = readState32(state, 0x190);
+    const auto result = reinterpret_cast<int (*)(void*, UInt32, UInt32)>(phmPowerGateUVDOriginal)(phm, on, arg);
+    const auto calls  = __atomic_fetch_add(&phmPowerGateUVDCalls, 1U, __ATOMIC_RELAXED) + 1;
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateUVDCalls", calls);
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateUVDLastOn", on);
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateUVDResult", static_cast<UInt32>(result));
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateUVD190Before", before);
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateUVD190After", readState32(state, 0x190));
+    return result;
+}
+
+// PSM 媒体 block 使用：PEM 的视频启动任务按状态调用 PSM_UseAsicBlock(block=2/3/6)。
+// 这是判断「PSM 自己有没有激活 UVD/VCN」最直接的信号。
+static int psmUseAsicBlockHook(void* psm, const UInt32 block)
+{
+    const auto result = reinterpret_cast<int (*)(void*, UInt32)>(psmUseAsicBlockOriginal)(psm, block);
+    const auto calls  = __atomic_fetch_add(&psmUseAsicBlockCalls, 1U, __ATOMIC_RELAXED) + 1;
+    UInt32 mask = __atomic_load_n(&psmUseAsicBlockMask, __ATOMIC_RELAXED);
+    if (block < 32) {
+        mask = __atomic_fetch_or(&psmUseAsicBlockMask, 1U << block, __ATOMIC_RELAXED) | (1U << block);
+    }
+    NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockCalls", calls);
+    NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockLastBlock", block);
+    NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockLastResult", static_cast<UInt32>(result));
+    NRed::singleton().setProp32("NRedVCN1PsmUseAsicBlockBlockMask", mask);
     return result;
 }
 
@@ -1685,6 +1730,22 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
     }
     else {
         NRed::singleton().setProp32("NRedVCN1PhmGateVCNHooked", 1);
+    }
+    KernelPatcher::RouteRequest gateUvdRoute{"_PHM_PowerGateUVD", phmPowerGateUVDHook, phmPowerGateUVDOriginal};
+    if (!patcher.routeMultiple(id, &gateUvdRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1PhmGateUVDHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1PhmGateUVDHooked", 1);
+    }
+    KernelPatcher::RouteRequest psmBlockRoute{"_PSM_UseAsicBlock", psmUseAsicBlockHook, psmUseAsicBlockOriginal};
+    if (!patcher.routeMultiple(id, &psmBlockRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1PsmBlockHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1PsmBlockHooked", 1);
     }
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
