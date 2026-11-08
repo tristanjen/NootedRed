@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `16c6574` VCN1: Observe PSM_ReArbit, the real VCN gate caller on Raven；docs（本轮） |
+| 最新提交 | `240f2c1` VCN1: Observe PSM_ReArbit, the real VCN gate caller on Raven；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -224,6 +224,24 @@ build45（`16c6574`，CDHash `217B04E3`，UUID `44B5526C`）：初始化电源�
 则不开窗（`InitWindowSkipped=1`）。旧的电源脉冲探针改为只在 `-NRedVCNPowerProbe` 时运行。
 新增读数：`InitWindowOpened/Closed/Skipped/Saved1A0/DownResult/190AfterDown/1A0AfterDown`。
 
+**build45 实机冻屏/panic（14:45，`Kernel-2026-11-08-144526.panic`，uptime 155.6s）**：
+`NMIPI for spinlock acquisition timeout`，锁 `0xffffff80171b1d88`（内核数据）；CPU 6 的栈是
+定时器中断（`lapic_interrupt → rtclock_intr → timer_intr → timer_queue_expire_with_options
+→ thread_timer_expire → thread_setrun`），被中断上下文是 **VoodooI2C**（boot args 含
+`-vi2c-force-polling`）；CPU 4（imagent）等同一把锁。**整个 panic 文件没有 NootedRed/AMD 帧**。
+即：不能把这次 panic 直接归因于 VCN，但 build45 的 TF 窗口存在“TF 已上电、引擎 init 未执行”
+时 `[0x1A0]` 停在 0、VCN 长期上电的泄漏路径（build35/build41 的不稳定状态），机制必须移除。
+机器已回滚到 build44 运行。
+
+build46（`240f2c1`，CDHash `D8326E76`，UUID `85F706FB`，默认安全版）：
+`initPowerGateHook` 恢复只读（不写 `[0x1A0]`/`[0x190]`，不再打开 TF 窗口）；初始化电源窗口
+改为**自包含**地放在 `uvd7InitHardware` 内部，只有显式传 `-NRedVCNInitWindow` 才启用：
+保存 `[0x1A0]` → 清 0 → `PhwRaven_PowerUpVCN`（完整路径）→ `loadUVDFW` +
+`initHardwareCail` → 无论结果如何立即恢复 `[0x1A0]` 并 `PhwRaven_PowerDownVCN` 关回。
+窗口只存在于这一次函数调用内，不存在 TF 打开后泄漏的问题。另在 `accelVideoContextStart`
+加兜底：若窗口仍打开则强制关闭并发布 `InitWindowForcedClosed=1`。默认（无 boot-arg）行为
+与 build44 完全一致。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -232,21 +250,22 @@ no-start 闸。
 
 ## 下一步
 
-1. build45 已安装。重启 →（先观察启动是否稳定）→ 播 30 秒 QuickTime → dump。读：
-   `InitWindowOpened/Closed/Skipped/Saved1A0/DownResult/190AfterDown/1A0AfterDown`、
-   `CailUvdStatusBefore/After`、`CailInitResult`、`InitHardwareCailRaw`、
-   `InitPowerGate1A0Before/After`、`InitHardwareDec`/`StartDec`。
-2. `InitWindowOpened=1`、`InitWindowClosed=1`、`190AfterDown=1` → 窗口机制成立；
-   看 `CailInitResult` 是否为 0、`CailUvdStatusBefore/After` 是否出现 0x2。
-3. `CailInitResult=0` 且 `InitHardwareCailRaw=1` → **CAIL init 在上电窗口内成功**：
+1. build46 已安装，**默认行为等同 build44**（窗口实验关闭）。先做默认稳定性验证：
+   重启 → 空闲 60s → 播 30 秒 QuickTime → dump。期望 `InitWindowOpened` 不出现、
+   `InitPowerGate1A0Before/After=1`、`UnsafePoweredAtInit=0`、`PeciVCNPGForced` 不出现，
+   系统稳定。若同款 spinlock/VoodooI2C panic 再次出现，则与 VCN 无关，按独立内核/I2C
+   问题排查（boot args 里的 `-vi2c-force-polling` 是可疑项）。
+2. 可选的窗口实验（用户决定后）：备份 `config.plist`，在 `NVRAM/Add/boot-args` 末尾追加
+   `-NRedVCNInitWindow`，重启后读 `InitWindowOpened/Closed/DownResult/190AfterDown/
+   1A0AfterDown`、`PowerProbeUpResult/190AfterUp`、`CailUvdStatusBefore/After`、
+   `CailInitResult`、`InitHardwareCailRaw`。实验后先恢复 config.plist 备份。
+3. `CailInitResult=0` 且 `InitHardwareCailRaw=1` → CAIL init 首次在上电窗口内成功：
    下一版把窗口延长到引擎 `start` 之后（在 `uvdEngineStart` 钩子里关闭窗口），
    并去掉 no-start 闸，验证 `StartDec=1` 与首帧解码。
-4. `CailInitResult=1` 但 `CailUvdStatusBefore` 仍为 0（固件没有在上电状态下启动）→
-   说明 `loadUVDFW` 的 SML/PSP 路径本身有问题，需要查 `commitUVDFWMsg`/`LoadUVDFW` 的
-   SML 返回值与 PSP 状态；`StatusBefore=2` 但 init 仍失败则是 CAIL 内部问题。
-5. 如果启动就冻屏/panic：立即用 U 盘 build44 备份回滚；窗口在 init 后关闭，
-   理论上不应复现 build41 的长期上电状态，但这是本轮唯一的新窗口。
-6. 仍然禁止默认使用 `-NRedVCNForceVCNPG0`；它等价于 build41 的危险状态。
+4. `CailInitResult=1` 且 `CailUvdStatusBefore=0` → `loadUVDFW` 的 SML/PSP 路径本身有问题，
+   需要查 `commitUVDFWMsg`/`LoadUVDFW` 的返回值与 PSP 状态；`StatusBefore=2` 但 init
+   仍失败则是 CAIL 内部问题。
+5. 仍然禁止默认使用 `-NRedVCNForceVCNPG0`；它等价于 build41 的危险状态。
 
 ## 反汇编环境
 

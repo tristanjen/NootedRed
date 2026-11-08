@@ -1036,3 +1036,29 @@ build45（CDHash `217B04E3`，UUID `44B5526C`，commit `16c6574`）：初始化�
 - 判据：`InitWindowOpened=1`、`Closed=1`、`190AfterDown=1` 说明窗口闭合；
   `CailInitResult=0` + `InitHardwareCailRaw=1` 说明 CAIL init 首次在上电状态下成功，
   下一版把窗口延长到 `uvdEngineStart` 之后并去掉 no-start 闸。
+
+## 32. 第二十九轮：build45 的 TF 窗口冻屏/panic；build46 改为自包含、默认关闭
+
+build45（CDHash `217B04E3`，UUID `44B5526C`）实机：约 155.6 秒后冻屏并 panic
+（`Kernel-2026-11-08-144526.panic`）：
+
+- `NMIPI for spinlock acquisition timeout`，锁 `0xffffff80171b1d88`（内核数据）。
+- CPU 6（锁持有者）的栈是定时器中断：`lapic_interrupt → rtclock_intr → timer_intr →
+  timer_queue_expire_with_options → thread_timer_expire → thread_setrun`；被中断上下文是
+  **VoodooI2C**（boot args 含 `-vi2c-force-polling`）。CPU 4（imagent）等同一把锁。
+- panic 文件里 **没有 NootedRed / AMD 帧**（grep ChefKiss = 0）。
+- 结论：不能把这次 panic 直接归因于 VCN；但 build45 的窗口在 TF 打开、只由解码引擎
+  `uvd7InitHardware` 关闭，若 `uvd7Init` 失败或 `initHardware` 未执行就泄漏，[0x1A0]
+  停在 0、VCN 在 PSM 外长期上电（build35/build41 的状态）。机制必须移除。
+
+build46（CDHash `D8326E76`，UUID `85F706FB`，commit `240f2c1`）：
+
+- `initPowerGateHook` 恢复只读；TF 窗口删除。
+- 初始化电源窗口移到 `uvd7InitHardware` 内部，默认关闭，只有
+  `-NRedVCNInitWindow` 才启用：保存 [0x1A0] → 清 0 → `PhwRaven_PowerUpVCN`（完整路径）→
+  `loadUVDFW` + `initHardwareCail` → 无论结果如何立即恢复 [0x1A0] 并
+  `PhwRaven_PowerDownVCN`。窗口只存在于这一次函数调用内。
+- `accelVideoContextStart` 增加兜底：若窗口仍打开则强制 `closeInitWindow` 并发布
+  `InitWindowForcedClosed=1`。
+- 默认（无 boot-arg）与 build44 完全一致，保证稳定性；实验通过 OpenCore
+  `NVRAM/Add/boot-args` 追加 `-NRedVCNInitWindow` 显式开启。
