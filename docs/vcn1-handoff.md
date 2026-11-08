@@ -124,15 +124,14 @@ no-start 闸。
 
 ## 下一步
 
-1. **不需要新 kext**：在 `config.plist` 的 DeviceProperties 里找到含
-   `CAIL_DisableGfxCGPowerGating` 的 iGPU 字典（ioreg 的 `IGPU@0`），加入
-   `CAIL_PP_EnableVCNPG` = `0`（`<integer>0</integer>` 或 `<data>AAAAAA==</data>`）。
-2. 重启 build36，播 30 秒 QuickTime，读 `InitPowerGate1A0Before/After`、
-   `InitPowerGate190After`、`PhmState190AtHardware`、`CailUvdStatusBefore`、
-   `CailInitResult`。
+1. 安装 build37（CDHash `A73797F8`）：`Personalities/com.apple.kext.AMDRadeonX5000.xml` 的
+   0x15D8 personality 已加入 `CAIL_PP_EnableVCNPG = 0`，由 `DriverInjector` 注入 AMD 驱动
+   （和现有的 `CAIL_DisableGfxCGPowerGating = 1` 同一份 `cail_properties`）。
+2. 重启、播 30 秒 QuickTime，读 `InitPowerGate1A0Before/After`、`InitPowerGate190After`、
+   `PhmState190AtHardware`、`CailUvdStatusBefore`、`CailInitResult`。
 3. `1A0Before=0`、`190After=0`、`CailUvdStatusBefore=0x2` → 驱动自己的 TF 上电成功；
    下一版放开 no-start 闸（或加 `-NRedVCNAllowStart`）试真正的 start/解码。
-4. `1A0Before` 仍为 1 → 属性没落在 `IGPU@0` 或读取路径不同；改在 TF hook 里临时清
+4. `1A0Before` 仍为 1 → personality 的 0 值没被应用或读取路径不同；改在 TF hook 里临时清
    `[0x1A0]`（下一版 kext 的 fallback）。
 5. 如果属性生效后仍然 panic，说明驱动自己的 `PowerUpVCN` 完整路径也会卡死；需要 hook
    `_Raven_SendMsgToSmc`/`_Raven_ReadArgFromSmc` 读真实 SMU 响应，确认是哪条消息失败。

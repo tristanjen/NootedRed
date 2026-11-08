@@ -235,6 +235,9 @@
 			<integer>177</integer>
 			<key>CAIL_DisableGfxCGPowerGating</key>
 			<integer>1</integer>
+			<!-- Picasso: let TF_PhwRaven_InitPowerGateState power up VCN at init. -->
+			<key>CAIL_PP_EnableVCNPG</key>
+			<integer>0</integer>
 		</dict>
 	</dict>
 	<dict>

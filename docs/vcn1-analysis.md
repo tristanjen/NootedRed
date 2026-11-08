@@ -787,9 +787,11 @@ build36（commit `428430a`，只读观测，不写 SMU/寄存器）：
 `getOSObjectData` 同时支持 OSData/OSNumber，因此 DeviceProperties 里用 `<integer>0</integer>`
 或 4 字节 data 都可以。
 
-下一步（不需要新 kext）：在 `config.plist` 的 DeviceProperties 中，找到已有
-`CAIL_DisableGfxCGPowerGating` 的那个 iGPU 字典（ioreg 显示它在 `IGPU@0`），加入
-`CAIL_PP_EnableVCNPG = 0`，重启 build36。预期：
+下一步（build37）：属性不是来自 OpenCore DeviceProperties，而是 NootedRed 的
+`Personalities/com.apple.kext.AMDRadeonX5000.xml` 经 `DriverInjector`（`IOCatalogue::addDrivers`
+包装）合并进 AMD 驱动的 personality。已在该文件 **0x15D8** personality 的 `cail_properties`
+里加入 `CAIL_PP_EnableVCNPG = 0`（和已有的 `CAIL_DisableGfxCGPowerGating = 1` 同一字典）；
+build37（CDHash `A73797F8`）已把新 XML 嵌入二进制。安装后预期：
 
 - `InitPowerGate1A0Before=0`、`InitPowerGate190After=0`；
 - 驱动自己的 TF 调用 `PowerUpVCN`，`CailUvdStatusBefore=0x2`；
