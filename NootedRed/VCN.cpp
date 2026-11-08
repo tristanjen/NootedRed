@@ -13,6 +13,9 @@
 #include <libkern/OSKextLib.h>
 #include <libkern/c++/OSMetaClass.h>
 
+// 文件作用域（匿名 namespace 之外）：电源脉冲探针要读 UVD_STATUS（0x83AF）。
+static UInt32 (*cailReadMmRegister)(void*, UInt32){nullptr};
+
 namespace
 {
 
@@ -71,6 +74,9 @@ namespace
     // 所以只有这条路径能告诉我们媒体 block 是否真的被 PSM 打开了。
     mach_vm_address_t       psmReArbitOriginal{0};
     UInt32                  psmReArbitCalls{0};
+    // PSM 客户端激活与 PEM 视频启动任务：判断视频栈到底有没有向 PSM 申请媒体 block。
+    mach_vm_address_t       psmActivateClientOriginal{0}, pemVideoStartOriginal{0};
+    UInt32                  psmActivateClientCalls{0}, pemVideoStartCalls{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -625,6 +631,57 @@ namespace
         return result;
     }
 
+    // 电源脉冲探针（只在解码引擎第一次 initHardware 失败后跑一次）：
+    // 临时清 [0x1A0] 让 PhwRaven_PowerUpVCN 走完整路径（msg 0xC + 0xC0/0xC1 寄存器写），
+    // 读一次 UVD_STATUS(0x83AF)，随后立刻恢复 [0x1A0] 并 PowerDownVCN 关回去。
+    // 窗口只有几毫秒，不在这里跑 CAIL init：先回答“上电后块到底活不活”。
+    void powerPulseProbe(void* engine)
+    {
+        static UInt32 pulses{0};
+        if (__atomic_fetch_add(&pulses, 1U, __ATOMIC_RELAXED) != 0) { return; }
+        void* phm = __atomic_load_n(&phmHandle, __ATOMIC_ACQUIRE);
+        if (phm == nullptr || ravenPowerUpOriginal == 0 || ravenPowerDownOriginal == 0) {
+            NRed::singleton().setProp32("NRedVCN1PowerProbeRun", 0);
+            return;
+        }
+        void* state{nullptr};
+        memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state));
+        if (state == nullptr || readState32(state, 0x190) == 0) {
+            // 已经处于上电状态：不要在我们不理解的窗口里继续动电源。
+            NRed::singleton().setProp32("NRedVCN1PowerProbeRun", 0);
+            return;
+        }
+        void* client{nullptr};
+        memcpy(&client, static_cast<UInt8*>(engine) + 0x18, sizeof(client));
+        void* adapter{nullptr};
+        if (client != nullptr) { memcpy(&adapter, static_cast<UInt8*>(client) + 0x20038, sizeof(adapter)); }
+        NRed::singleton().setProp32("NRedVCN1PowerProbeRun", 1);
+        NRed::singleton().setProp32("NRedVCN1PowerProbeAdapter", adapter != nullptr);
+        NRed::singleton().setProp32("NRedVCN1PowerProbeDPG", readState32(state, 0x194));
+        const auto saved1A0 = readState32(state, 0x1A0);
+        const UInt32 zero{0};
+        memcpy(static_cast<UInt8*>(state) + 0x1A0, &zero, sizeof(zero));
+        const auto up = reinterpret_cast<int (*)(void*)>(ravenPowerUpOriginal)(phm);
+        NRed::singleton().setProp32("NRedVCN1PowerProbeUpResult", static_cast<UInt32>(up));
+        NRed::singleton().setProp32("NRedVCN1PowerProbe190AfterUp", readState32(state, 0x190));
+        UInt32 status{0};
+        if (cailReadMmRegister != nullptr && adapter != nullptr) {
+            // 最多三次、间隔 1ms：SMU ack 之后块可能还要一点时间才报 idle。
+            for (UInt32 i = 0; i < 3; ++i) {
+                status = cailReadMmRegister(adapter, 0x83AF);
+                if ((status & 2U) != 0) { break; }
+                IODelay(1000);
+            }
+        }
+        NRed::singleton().setProp32("NRedVCN1PowerProbeStatus", status);
+        memcpy(static_cast<UInt8*>(state) + 0x1A0, &saved1A0, sizeof(saved1A0));
+        const auto down = reinterpret_cast<int (*)(void*)>(ravenPowerDownOriginal)(phm);
+        NRed::singleton().setProp32("NRedVCN1PowerProbeDownResult", static_cast<UInt32>(down));
+        NRed::singleton().setProp32("NRedVCN1PowerProbe190AfterDown", readState32(state, 0x190));
+        SYSLOG("VCN1", "power pulse up=%d status=0x%X down=%d 190=%u", up, status, down,
+               readState32(state, 0x190));
+    }
+
     bool uvd7InitHardware(void* self)
     {
         UInt8  early{0}, skipFirmware{0};
@@ -680,6 +737,8 @@ namespace
         NRed::singleton().setProp32("NRedVCN1CailFirmwareFirst", firmwareFirst ? 1 : 0);
         NRed::singleton().setProp32("NRedVCN1LastHardwareInit", result);
         NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareInitEnc" : "NRedVCN1HardwareInitDec", result);
+        // 原生 init 失败后做一次短促电源脉冲，读完 UVD_STATUS 立即关回去（只解码引擎、只一次）。
+        if ((isEncode & 1U) == 0 && vcn1Device()) { powerPulseProbe(self); }
         auto count = __atomic_fetch_add(&uvd7InitHardwareCount, 1U, __ATOMIC_RELAXED);
         if (count < 16) { SYSLOG("VCN1", "UVD7 initHardware result=%u fwFirst=%u", result, firmwareFirst ? 1U : 0U); }
         return result;
@@ -1415,8 +1474,7 @@ static mach_vm_address_t cailUvdInitSymbol{0};
 static mach_vm_address_t cailLibrarySlide{0};
 static mach_vm_address_t cailAsicInitStubOriginal{0};
 static bool              cailAsicInitStubActive{false};
-// HWLibs 的 MMIO 读：用来在真实 init 前后读 0x83AF（UVD_STATUS），判断空闲位为何等不到。
-static UInt32 (*cailReadMmRegister)(void*, UInt32){nullptr};
+// HWLibs 的 MMIO 读（定义在文件顶部）：用来在真实 init 前后读 0x83AF（UVD_STATUS）。
 
 // adapter+0x12D8 的替代实现：真实 Greenland init 死在 _Cail_MCILWaitFor（寄存器 0x83AF bit1），
 // 先返回成功验证 _CAILUvdControl 后续链路。
@@ -1688,12 +1746,44 @@ static int psmReArbitHook(void* psm, const UInt32 reason)
     const auto calls     = __atomic_fetch_add(&psmReArbitCalls, 1U, __ATOMIC_RELAXED) + 1;
     const auto gateDelta = (vcnAfter - vcnBefore) + (uvdAfter - uvdBefore);
     if (calls <= 16 || gateDelta != 0) {
+        const auto psmValue = reinterpret_cast<mach_vm_address_t>(psm);
+        NRed::singleton().setProp32("NRedVCN1PsmHandle", static_cast<UInt32>(psmValue & 0xFFFFFFFFULL));
+        NRed::singleton().setProp32("NRedVCN1PsmHandleHi", static_cast<UInt32>(psmValue >> 32));
         NRed::singleton().setProp32("NRedVCN1PsmReArbitCalls", calls);
         NRed::singleton().setProp32("NRedVCN1PsmReArbitLastReason", reason);
         NRed::singleton().setProp32("NRedVCN1PsmReArbitLastResult", static_cast<UInt32>(result));
         NRed::singleton().setProp32("NRedVCN1PsmReArbitFlag5F0", flag5f0);
         NRed::singleton().setProp32("NRedVCN1PsmReArbitFlag690", flag690);
         NRed::singleton().setProp32("NRedVCN1PsmReArbitGateDelta", gateDelta);
+    }
+    return result;
+}
+
+// PSM 客户端激活：视频栈如果向 PSM 注册了媒体客户端，这里会看到对应的 client id。
+static int psmActivateClientHook(void* psm, const UInt32 client, const UInt32 arg2, const UInt32 arg3,
+                                 const UInt32 arg4)
+{
+    const auto result = reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32, UInt32)>(psmActivateClientOriginal)(
+        psm, client, arg2, arg3, arg4);
+    const auto calls = __atomic_fetch_add(&psmActivateClientCalls, 1U, __ATOMIC_RELAXED) + 1;
+    if (calls <= 16) {
+        NRed::singleton().setProp32("NRedVCN1PsmActivateClientCalls", calls);
+        NRed::singleton().setProp32("NRedVCN1PsmActivateClientLast", client);
+        NRed::singleton().setProp32("NRedVCN1PsmActivateClientArg2", arg2);
+        NRed::singleton().setProp32("NRedVCN1PsmActivateClientArg3", arg3);
+        NRed::singleton().setProp32("NRedVCN1PsmActivateClientResult", static_cast<UInt32>(result));
+    }
+    return result;
+}
+
+// PEM 的视频启动任务：确认视频栈是否真的把 UVD 多状态启动任务跑起来。
+static int pemVideoStartHook(void* task, void* event)
+{
+    const auto result = reinterpret_cast<int (*)(void*, void*)>(pemVideoStartOriginal)(task, event);
+    const auto calls  = __atomic_fetch_add(&pemVideoStartCalls, 1U, __ATOMIC_RELAXED) + 1;
+    if (calls <= 16) {
+        NRed::singleton().setProp32("NRedVCN1PemVideoStartCalls", calls);
+        NRed::singleton().setProp32("NRedVCN1PemVideoStartResult", static_cast<UInt32>(result));
     }
     return result;
 }
@@ -1788,6 +1878,24 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
     }
     else {
         NRed::singleton().setProp32("NRedVCN1PsmReArbitHooked", 1);
+    }
+    KernelPatcher::RouteRequest psmClientRoute{"_PSM_ActivateClient", psmActivateClientHook,
+                                               psmActivateClientOriginal};
+    if (!patcher.routeMultiple(id, &psmClientRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1PsmClientHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1PsmClientHooked", 1);
+    }
+    KernelPatcher::RouteRequest pemVideoRoute{"_PEM_Task_VideoStartMultiUVDStates", pemVideoStartHook,
+                                              pemVideoStartOriginal};
+    if (!patcher.routeMultiple(id, &pemVideoRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1PemVideoHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1PemVideoHooked", 1);
     }
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
