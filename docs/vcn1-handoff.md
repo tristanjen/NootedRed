@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `5777f9f` VCN1: Observe PSM_ReArbit, the real VCN gate caller on Raven；docs（本轮） |
+| 最新提交 | `0e47a32` VCN1: Observe PSM_ReArbit, the real VCN gate caller on Raven；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -195,6 +195,20 @@ msg 0xC + 0xC0/0xC1 寄存器写）→ 读 `UVD_STATUS(0x83AF)` 最多 3 次（�
 同时新增 `_PSM_ActivateClient`、`_PEM_Task_VideoStartMultiUVDStates` 观测与 `PsmHandle`。
 探针读数：`PowerProbeRun/UpResult/DPG/190AfterUp/Status/DownResult/190AfterDown`。
 
+build43 实测（2026-11-08 dump）：脉冲机制成立且系统稳定——`PowerProbeRun=1`、
+`PowerProbeUpResult=1`、`PowerProbe190AfterUp=0`、`PowerProbeDownResult=1`、
+`PowerProbe190AfterDown=1`、`PowerProbeDPG=0`；但 `PowerProbeAdapter=0`，
+状态读没有执行（adapter 取错：CAIL client 在 `[engine+0x18]` 虚表 +0x2B8 的 getter 后面）。
+PSM：`PsmActivateClientCalls=6`、`Last=3`、`Arg2=1`、`Arg3=0`、`Result=1`，
+`PemVideoStartCalls` 不出现——有客户端激活，但 PEM 的视频启动任务从未执行，
+PSM 的 VCN 开窗标志仍是 0。
+
+build44（`0e47a32`，CDHash `A9936CCB`，UUID `D3B887A1`）：修正探针的 adapter 解析
+（`cailClient`，或 `[engine+0x18]` 虚表 +0x2B8 的 getter）后在同一个电源窗口里条件初始化：
+只有当 `UVD_STATUS` bit1（0x2，idle）置位时才调用原生 `initHardware`（`0x25D=1`
+跳过固件，只走 CAIL init），随后立刻关回。新增 `PowerProbeAdapter/WindowInit/StatusAfterInit`，
+并记录 `PSM_ActivateClient` 的调用者地址（client 3 单独记录）与第一次 `PSM_ReArbit` 调用者。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -203,19 +217,21 @@ no-start 闸。
 
 ## 下一步
 
-1. build43 已安装。重启（先观察首次启动是否稳定）→ 播 30 秒 QuickTime → dump。
-   读：`PowerProbeRun/UpResult/DPG/190AfterUp/Status/DownResult/190AfterDown`、
-   `PsmActivateClientCalls/Last/Result`、`PemVideoStartCalls/Result`、
-   `PsmReArbit*`、`PhmPowerGateVCN/UVD*`、`RavenPowerUp/Down*`、`InitHardwareCailRaw`。
-2. `PowerProbeUpResult` 成功、`190AfterUp=0`，且 `PowerProbeStatus` 的 bit1（0x2）置位
-   → 上电后 UVD 块是活的：下一版在同一个电源窗口里跑 `initHardwareCail`（保留 no-start
-   闸），成功就立刻关回去，看 `CailInitResult=0`、`CailUvdStatusAfter=0x2`。
-3. `PowerProbeStatus=0`（块上电但不 idle）→ 还缺 PSM 的时钟/DPG 序列：先看
-   `PowerProbeDPG`、msg 0xC 参数与 `PhwRaven_SetDPGModeVCN` 的调用者。
-4. `PsmActivateClientCalls=0` 且 `PemVideoStartCalls=0` → 视频栈根本没走到 PEM/PSM，
-   确认必须走“自建电源窗口”的路线；若 `PemVideoStartCalls>0` 但 PSM 标志仍为 0，
-   查 PEM 任务在 `PsmUseAsicBlock` 之前的返回码。
-5. 仍然禁止默认使用 `-NRedVCNForceVCNPG0`；它等价于 build41 的危险状态。
+1. build44 已安装。重启 → 播 30 秒 QuickTime → dump。读：
+   `PowerProbeRun/Adapter/UpResult/190AfterUp/Status/DPG/WindowInit/StatusAfterInit/DownResult`、
+   `CailInitResult`/`InitHardwareCailRaw`/`CailUvdStatusBefore/After`、
+   `PsmActivateClientCalls/Last/Arg2/Arg3/Arg4/Result/Caller`、`PsmReArbitCaller`。
+2. `Adapter=1` 且 `Status` bit1（0x2）置位 → 上电后块 idle，窗口内 `initHardware` 已执行：
+   若 `CailInitResult=0`、`StatusAfterInit=0x2`、`InitHardwareCailRaw=1` →
+   CAIL init 在窗口内成功；下一版去掉 no-start 闸（或默认放行）验证引擎 start。
+3. `Adapter=1` 但 `Status` bit1=0 → 上电后块仍不 idle：需要补 PSM 的时钟/DPG 序列
+   （`PhwRaven_SetDPGModeVCN` 的调用者、msg 0xC 参数），或确认固件是否真正载入。
+4. `WindowInit=0` 或 `CailInitResult` 仍为 1 → 窗口内 init 失败，看 `CailE48`/`CailInitMode`
+   与 `_CailUvdInit` 的返回路径。
+5. 用 `PsmActivateClientCaller`/`PsmReArbitCaller`（配合 `kextstat` 的 slide）反查是
+   哪条驱动路径在激活 client 3、以及谁在触发仲裁；若视频客户端从未真正激活，
+   再考虑从视频上下文路径驱动 PSM。
+6. 仍然禁止默认使用 `-NRedVCNForceVCNPG0`；它等价于 build41 的危险状态。
 
 ## 反汇编环境
 

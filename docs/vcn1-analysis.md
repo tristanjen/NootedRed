@@ -979,3 +979,31 @@ build43（CDHash `15BFC5D8`，UUID `028269CA`，commit `5777f9f`）：
 - 判据：`PowerProbeUpResult` 成功且 `190AfterUp=0`、`PowerProbeStatus` bit1=1
   → 上电后块是 idle 的，下一版可以在同一窗口里跑 `initHardwareCail`；
   `Status=0` → 还缺 PSM 的时钟/DPG 序列，需要查 `PhwRaven_SetDPGModeVCN` 与 msg 0xC。
+
+## 30. 第二十七轮：build43 电源脉冲成立但 adapter 取错；build44 修正并在窗口内条件初始化
+
+build43（CDHash `15BFC5D8`，UUID `028269CA`）实机 dump：
+
+- 脉冲机制成立且系统稳定：`PowerProbeRun=1`、`PowerProbeUpResult=1`、
+  `PowerProbe190AfterUp=0`（上电）、`PowerProbeDownResult=1`、
+  `PowerProbe190AfterDown=1`（关回）、`PowerProbeDPG=0`。
+- `PowerProbeAdapter=0`：adapter 取错了。CAIL client 不是 `[engine+0x18]`，而是它
+  虚表 +0x2B8 的 getter 返回值；adapter 在 `client+0x20038`。因此 `PowerProbeStatus=0`
+  只是没读，不代表块不 idle。
+- PSM：`PsmActivateClientCalls=6`、`Last=3`、`Arg2=1`、`Arg3=0`、`Result=1`；
+  `PemVideoStartCalls` 不出现 → 视频栈有客户端激活，但 PEM 的视频启动任务
+  （`PEM_Task_VideoStartMultiUVDStates`）从未执行，PSM 的 VCN 开窗标志仍是 0。
+  两个直接调用者是 `PEM_UpdateExclusiveWorkload`（client 0x1E）与
+  `PEM_CWDDEPM_ActivateClient`（client 来自事件字段 +4，即这里的 3）。
+
+build44（CDHash `A9936CCB`，UUID `D3B887A1`，commit `0e47a32`）：
+
+- 探针改用 `cailClient`（或走 `[engine+0x18]` 虚表 +0x2B8 的 getter），从
+  `client+0x20038` 取 adapter。
+- 读 `UVD_STATUS(0x83AF)`（最多 3 次、间隔 1ms）；只有 bit1（0x2）置位时才在同一个
+  电源窗口里调用原生 `initHardware`（`0x25D=1` → 跳过固件，只走 CAIL init），
+  随后立刻恢复 `[0x1A0]` 并 `PowerDownVCN` 关回。
+- 记录 `PSM_ActivateClient` 的调用者地址（client 3 单独记录）与第一次 `PSM_ReArbit`
+  的调用者，便于用 `kextstat` 的 slide 反查驱动路径。
+- 判据：`PowerProbeStatus` bit1=1 → 块是活的，看 `PowerProbeWindowInit` 与
+  `CailInitResult`；若窗口内 init 成功，下一版去掉 no-start 闸验证 start。
