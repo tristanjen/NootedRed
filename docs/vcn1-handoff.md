@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `14c078b` VCN1: Disable the CAIL probe and observe the native power path；docs（本轮） |
+| 最新提交 | `a5a2085` VCN1: Force PP_EnableVCNPG off at the PECI layer and trace the power path；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -141,6 +141,28 @@ engine `powerOnOff`（`-NRedVCNForcePower` 才启用）。新增 `PowerOnOffCall
 `LastResult` 和 `CailFunc1..5Calls/Result`，用来观察 accelerator 是否调用 powerOnOff、
 CAIL func 3 是否成功。系统应稳定。
 
+build40 实测（2026-11-08 12:56 dump）：`PowerOnOffCalls` **不出现**——反汇编 UVD7 虚表
+槽 +0x138（`__ZTV30AMDRadeonX5000_AMDUVD7HWEngine`）指向 0x43d2b24，只是一个
+`mov al,1; ret` 的桩；UVD 基类的 `powerOnOff`（0x43d1538）在 UVD7 上被覆盖，所以钩子
+永远不会被调用。`CailFunc1Calls=4` 全部 `Result=1`，`CailFunc2..5` 从未调用；
+`CailLastSelector=1`、`CailLastResult=0xFFFFFFFFE00002C7`，`CailSubmit8=0`、
+`CailSubmit9=0xFFFFFFFFE00002C7`。`InitPowerGate1A0Before/After=1`、
+`PhmState190AtHardware=1`、`InitHardwareCail=0`、`HardwareInitDec=0`、`StartDec=0`。
+即：CAIL init 仍因 UVD 块未上电而失败，且 accelerator 的 powerUpHWEngines 即使调
+UVD7 的 powerOnOff 也只是空桩。
+
+根因确认：`CAIL_PP_EnableVCNPG=0` 虽然以**扁平属性**出现在 IGPU（IOPCIDevice）上，
+驱动读到的仍是默认值 1。`PECI_ReadRegistry(handle,"PP_EnableVCNPG",&out,1)` 的返回值
+决定 `[state+0x1A0]`，而 build37 里它走了「未找到→写默认值」分支。
+
+build41（`a5a2085`，CDHash `37DF0FD4`，已安装）：路由 `_PECI_ReadRegistry`，对
+key=`PP_EnableVCNPG` 的读取强制写回 0，让 `PhwRaven_Initialize` 把 `[0x1A0]` 置 0；
+`TF_PhwRaven_InitPowerGateState` 随之在引擎 init 前走 `PowerUpVCN`，且 `[0x1A0]=0`
+会让之后的 `PowerDownVCN` 直接返回。新增探针：`PeciVCNPGCalls/Raw/Result/Forced`、
+`RavenPowerUpCalls/Result/190Before/190After/1A0`、`RavenPowerDownCalls/...`、
+`PhmPowerGateVCNCalls/LastOn/Result/190Before/190After`、`InitPowerGateCalls`、
+`InitHardwareCailRaw`（门控前真实结果）。probe 仍默认关闭，不强制 powerOnOff。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -149,15 +171,19 @@ no-start 闸。
 
 ## 下一步
 
-1. build40 已安装。重启、播 30 秒 QuickTime，读 `PowerOnOffCalls`、`PowerOnOffLastOn`、
-   `PowerOnOffLastResult`、`CailFunc1Calls/Result`、`CailFunc2...`、`CailFunc3...`、
-   `CailInitResult`、`CailUvdStatusBefore`、`HardwareInitDec`/`StartDec`。
-2. `PowerOnOffCalls=0` → accelerator 没调用引擎 powerOnOff；检查引擎数组/时序，或显式在
-   `powerUpHWEngines` 后调用。
-3. `LastResult=0` → CAIL func 3 失败；看 `CailFunc3Result`/`CailLibResult`，再决定是否
-   需要先满足 func 3 的前置条件（client ready/caps）。
-4. `LastResult=1` 且 VCN 上电 → 看 `CailUvdStatusBefore` 是否 0x2；若 CAIL init 失败，
-   查 `CailFunc1Result`/`CailInitCalls`。
+1. build41 已安装。重启、播 30 秒 QuickTime，读 `PeciVCNPGCalls/Raw/Forced`、
+   `InitPowerGate1A0Before/After`、`RavenPowerUpCalls/Result/190After/1A0`、
+   `RavenPowerDownCalls`、`PhmPowerGateVCNCalls/LastOn/190After`、`InitPowerGateCalls`、
+   `InitHardwareCailRaw`、`InitHardwareCail`、`CailInitResult`、`CailUvdStatusBefore/After`、
+   `HardwareInitDec`/`StartDec`。
+2. `InitPowerGate1A0Before=0` 且 `RavenPowerUpCalls>=1`、`190After=0` → 电源路径按设计
+   走通；看 `CailInitResult` 是否为 0、`CailUvdStatusBefore/After` 是否 0x2。
+3. `CailInitResult=0`（成功）且 `InitHardwareCailRaw=1` → 下一步去掉 no-start 闸
+   （`-NRedVCNAllowStart` 或默认放行），验证引擎 start 与首帧解码。
+4. `CailInitResult=1` 但 `CailUvdStatusBefore=2` → init 失败与电源无关，查 CAIL 的
+   ASIC init（`_greenland_uvd_init`）或固件装载顺序。
+5. `PeciVCNPGCalls=0` → PECI 钩子没生效（符号/时机），改钩 `MCIL_GetRegistrykey` 或
+   直接在 TF 里清 `[0x1A0]`（build39 的路径，但必须保持 probe 关闭）。
 
 ## 反汇编环境
 
