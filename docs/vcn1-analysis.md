@@ -834,3 +834,23 @@ build39（CDHash `EB3848FB`）：默认**不恢复** `[0x1A0]`，留在 0。这�
 `PhwRaven_PowerDownVCN` 开头的 `cmp [0x1A0],0; je return 1` 直接跳过，VCN 保持
 `[0x190]=0`。新增 `InitPowerGate1A0LeftZero` 探针；`-NRedVCNRestorePG` 可恢复 build38
 行为。预期 `PhmState190AtHardware=0`、`CailUvdStatusBefore=0x2`、`CailInitResult=0`。
+
+## 25. 第二十二轮：build39 在 probe 的 CAIL idle 等待中 panic
+
+build39（UUID `9CFD1B1F`）实机 panic（`Kernel-2026-11-08-203225.panic`）：
+
+- CPU 1 卡在 `_ulReadMmRegisterUlong+0x30`（读 0x83AF），上一层
+  `_uvd_init_engine+0x60f`（`_Cail_MCILWaitFor` 等 bit1），再上 `_CailUvdInit+0x90`
+  → `AmdCailServices::uvdControl+0x3c9`。
+- NootedRed 栈（atos）：`cailSubmit` → `uvd7InitHardwareCail` → `uvd7InitHardware` →
+  **`probeHardwareInit`** → `accelVideoContextStart` → `videoContextStart`。
+- 触发进程：`avconferenced`（视频会议守护进程启动视频上下文，触发 probe）。
+- 结论：build39 让 VCN 保持上电后，probe 里的 `_CailUvdInit` 真正进入 `_udv_init_engine`
+  的 0x83AF idle 等待；但块虽然上电，PSM/时钟没有把它带到 idle（UVD_STATUS 仍为 0），
+  等待变成自旋，最终 TLB flush 超时 panic。
+- **build39 不安全**；EFI 已回滚到 stock 构建（UUID `30579C7E`），系统稳定。
+
+方向调整：不要再从 PHM 强行上电。正确路径是让 PSM 把 VCN 当作活动 block 激活
+（`PSM_UseAsicBlock` / `PSM_ActivateClient` / `PSM_ReArbit` → `PHM_PowerGateVCN(phm,0)`），
+由 PSM 同时设置 VCN 时钟/DPG；否则 CAIL 的 0x83AF idle 等待永远不会满足。probe 也必须
+默认关闭（`-NRedVCNProbe` 才启用），避免视频上下文启动时提前跑 CAIL init。

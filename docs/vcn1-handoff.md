@@ -130,6 +130,11 @@ build39（`690a266`，CDHash `EB3848FB`）：默认**不恢复** `[0x1A0]`，留
 恢复 build38 行为。预期 `PhmState190AtHardware=0`、`CailUvdStatusBefore=0x2`、
 `CailInitResult=0`。
 
+**build39 不安全**（UUID `9CFD1B1F`）：实机 panic，栈为 `_ulReadMmRegisterUlong`
+→ `_uvd_init_engine`（等 0x83AF）→ `_CailUvdInit` → NootedRed `probeHardwareInit`
+→ `accelVideoContextStart`；触发进程 `avconferenced`。VCN 被强行保持上电，但 PSM/时钟
+没有把它带到 idle，CAIL 等待变成自旋。EFI 已回滚到 stock 构建（`30579C7E`），系统稳定。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -138,16 +143,14 @@ no-start 闸。
 
 ## 下一步
 
-1. build39（`690a266`，CDHash `EB3848FB`）已安装。重启、播 30 秒 QuickTime，读
-   `InitPowerGate1A0LeftZero`、`InitPowerGate190After`、`PhmState190AtHardware`、
-   `CailUvdStatusBefore`、`CailInitResult`。
-2. `PhmState190AtHardware=0`、`CailUvdStatusBefore=0x2`、`CailInitResult=0` → 电源域和
-   CAIL 初始化都打通；下一版放开 no-start 闸（或加 `-NRedVCNAllowStart`）试真正的
-   start/解码。
-3. `PhmState190AtHardware` 仍为 1 → PSM 还有其他电源-down 路径；hook
-   `_PhwRaven_PowerDownVCN` 观察/拦截。
-4. `CailUvdStatusBefore=0x2` 但 `CailInitResult=1` → CAIL 内部还有别的失败点，看
-   `CailInitCalls`/`CailMcilWait` 等。
+1. **不要再装 build39**；EFI 现在是 stock 构建（UUID `30579C7E`），系统稳定。
+2. 方向调整：不再从 PHM 强行上电。先做无写入的 PSM 观测：
+   - `PSM_UseAsicBlock` / `PSM_UnuseAsicBlock`（UVD block 注册）
+   - `PSM_ActivateClient` / `PSM_UpdateClockRequest`（视频客户端激活/时钟请求）
+   - `PHM_PowerGateVCN` / `PhwRaven_PowerUpVCN`（PSM 何时调用）
+   - `PhwRaven_SetDPGModeVCN` 与 VCN 时钟路径
+3. probe 默认关闭（`-NRedVCNProbe` 才启用），避免视频上下文启动时提前跑 CAIL init。
+4. 找到 PSM 激活 UVD block 的入口后，让自定义引擎走同一路径，而不是直接发 SMU。
 
 ## 反汇编环境
 
