@@ -628,10 +628,11 @@ namespace
             memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state));
             NRed::singleton().setProp32("NRedVCN1PhmState190AtHardware", readState32(state, 0x190));
         }
-        // accelerator 从未调用引擎的 powerOnOff（PowerDec 缺失）；UVD 电源域因此没打开。
-        // 诊断：解码引擎第一次 initHardware 前手动上电一次，观察 UVD_STATUS 是否变化。
+        // 默认不再手动调 powerOnOff；让 accelerator 的 powerUpHWEngines 自己调用，
+        // 用 PowerOnOffCalls/LastOn/LastResult 观察。只有 -NRedVCNForcePower 才强制调用。
         NRed::singleton().setProp32("NRedVCN1PowerHooked", enginePowerOriginal != 0);
-        if ((isEncode & 1U) == 0 && enginePowerOriginal != 0) {
+        if ((isEncode & 1U) == 0 && enginePowerOriginal != 0
+            && checkKernelArgument("-NRedVCNForcePower")) {
             static UInt32 forcedPowerCount{0};
             if (__atomic_fetch_add(&forcedPowerCount, 1U, __ATOMIC_RELAXED) == 0) {
                 const auto powered = reinterpret_cast<bool (*)(void*, bool)>(enginePowerOriginal)(self, true);
@@ -677,6 +678,9 @@ namespace
     bool probeHardwareInit()
     {
         if (!probeEngine || !vcn1Device()) { return false; }
+        // probe 会在视频上下文启动时提前跑 CAIL init；build39 的 panic 正是这条路径
+        // 在 0x83AF idle 等待里自旋。默认关闭，只有显式传 -NRedVCNProbe 才启用。
+        if (!checkKernelArgument("-NRedVCNProbe")) { return false; }
         if (__atomic_load_n(&probeInitCount, __ATOMIC_RELAXED) != 0) { return false; }
         __atomic_add_fetch(&probeInitCount, 1U, __ATOMIC_RELAXED);
         UInt8 skipFirmware{0};
@@ -723,8 +727,13 @@ namespace
     bool uvdPowerOnOff(void* self, const bool on)
     {
         const auto result = reinterpret_cast<bool (*)(void*, bool)>(enginePowerOriginal)(self, on);
+        static UInt32 calls{0};
+        const auto    count = __atomic_fetch_add(&calls, 1U, __ATOMIC_RELAXED) + 1;
+        NRed::singleton().setProp32("NRedVCN1PowerOnOffCalls", count);
+        NRed::singleton().setProp32("NRedVCN1PowerOnOffLastOn", on ? 1 : 0);
+        NRed::singleton().setProp32("NRedVCN1PowerOnOffLastResult", result ? 1 : 0);
         setEngineProp(self, "NRedVCN1PowerDec", "NRedVCN1PowerEnc", (on ? 2U : 0U) | (result ? 1U : 0U));
-        SYSLOG("VCN1", "UVDHWEngine::powerOnOff on=%u result=%u", on, result);
+        SYSLOG("VCN1", "UVDHWEngine::powerOnOff on=%u result=%u call=%u", on, result, count);
         return result;
     }
 
@@ -1346,6 +1355,21 @@ static int cailUvdControlHook(void* adapter, const UInt32 function, void* input,
                                                                                                       input, output);
     NRed::singleton().setProp32("NRedVCN1CailLibFunc", function);
     NRed::singleton().setProp32("NRedVCN1CailLibResult", static_cast<UInt32>(result));
+    // 按 CAIL 函数号记录调用次数和最后一次返回值，用来区分 init(1)/start(2)/power(3)。
+    static UInt32 funcCalls[6]{};
+    static UInt32 funcResults[6]{};
+    static const char* const funcCallKeys[6] = {
+        nullptr, "NRedVCN1CailFunc1Calls", "NRedVCN1CailFunc2Calls", "NRedVCN1CailFunc3Calls",
+        "NRedVCN1CailFunc4Calls", "NRedVCN1CailFunc5Calls"};
+    static const char* const funcResultKeys[6] = {
+        nullptr, "NRedVCN1CailFunc1Result", "NRedVCN1CailFunc2Result", "NRedVCN1CailFunc3Result",
+        "NRedVCN1CailFunc4Result", "NRedVCN1CailFunc5Result"};
+    if (function >= 1 && function <= 5) {
+        const auto calls = __atomic_fetch_add(&funcCalls[function], 1U, __ATOMIC_RELAXED) + 1;
+        funcResults[function] = static_cast<UInt32>(result);
+        NRed::singleton().setProp32(funcCallKeys[function], calls);
+        NRed::singleton().setProp32(funcResultKeys[function], funcResults[function]);
+    }
     if (adapter != nullptr) {
         // 能力位图在适配器 +0x358（_CailCapsEnabled 取基址 +0x1E0）：0xD6 = word6 bit22、0x15B = word10 bit27。
         UInt32 words[16]{};
@@ -1487,10 +1511,8 @@ static int cailUvdInitHook(void* adapter, void* input)
     return result;
 }
 
-// 驱动的 TF_PhwRaven_InitPowerGateState 会根据 [state+0x1A0] 决定是否调 PowerUpVCN。
-// build37 的 CAIL_PP_EnableVCNPG=0 已经出现在 IGPU@0 的属性里，但驱动读到的 [0x1A0]
-// 仍是 1（§23），所以这里在 TF 入口临时把 [0x1A0] 清 0，让驱动自己的 TF 走完整的
-// PowerUpVCN 分支；调用后恢复原值。传 -NRedVCNNoForcePG 可跳过这次写入（安全回退）。
+// 只观察驱动的 TF_PhwRaven_InitPowerGateState：不写 [0x1A0]，不提前上电。
+// build39 的强制/留在 0 让 CAIL 在 probe 里进入 0x83AF idle 等待并 panic（§25）。
 static int initPowerGateHook(void* phm)
 {
     if (phm != nullptr) { __atomic_store_n(&phmHandle, phm, __ATOMIC_RELEASE); }
@@ -1501,34 +1523,14 @@ static int initPowerGateHook(void* phm)
         NRed::singleton().setProp32("NRedVCN1PhmHandle", static_cast<UInt32>(value & 0xFFFFFFFFULL));
         NRed::singleton().setProp32("NRedVCN1PhmHandleHi", static_cast<UInt32>(value >> 32));
     }
-    const auto original1A0 = readState32(state, 0x1A0);
     NRed::singleton().setProp32("NRedVCN1InitPowerGateSeen", 1);
     NRed::singleton().setProp32("NRedVCN1InitPowerGate190Before", readState32(state, 0x190));
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Before", original1A0);
-    const bool clearGate =
-        state != nullptr && original1A0 != 0 && !checkKernelArgument("-NRedVCNNoForcePG");
-    if (clearGate) {
-        const UInt32 zero{0};
-        memcpy(static_cast<UInt8*>(state) + 0x1A0, &zero, sizeof(zero));
-        NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Cleared", 1);
-    }
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Before", readState32(state, 0x1A0));
     const auto result = reinterpret_cast<int (*)(void*)>(initPowerGateOriginal)(phm);
-    const auto after190 = readState32(state, 0x190);
-    const auto after1A0 = readState32(state, 0x1A0);
-    // 默认把 [0x1A0] 留在 0：PowerDownVCN 看到 0 会直接返回，不会把 VCN 重新门控。
-    // build38 恢复成 1 后，PSM 在 engine init 前把 [0x190] 又置回了 1（§24）。
-    const bool restoreGate = clearGate && checkKernelArgument("-NRedVCNRestorePG");
-    if (restoreGate) {
-        memcpy(static_cast<UInt8*>(state) + 0x1A0, &original1A0, sizeof(original1A0));
-    }
     NRed::singleton().setProp32("NRedVCN1InitPowerGateResult", static_cast<UInt32>(result));
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate190After", after190);
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0After", after1A0);
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Restored", restoreGate ? 1 : 0);
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0LeftZero",
-                                clearGate && !restoreGate ? 1 : 0);
-    SYSLOG("VCN1", "TF_PhwRaven_InitPowerGateState result=%d clear=%u restore=%u 190=%u", result,
-           clearGate ? 1U : 0U, restoreGate ? 1U : 0U, after190);
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate190After", readState32(state, 0x190));
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0After", readState32(state, 0x1A0));
+    SYSLOG("VCN1", "TF_PhwRaven_InitPowerGateState result=%d", result);
     return result;
 }
 
