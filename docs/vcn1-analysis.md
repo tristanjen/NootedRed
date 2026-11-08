@@ -1212,7 +1212,7 @@ build49 `-NRedVCNPsmWake` 实测（2026-11-08 21:48，dump 共 391 项）：
   `CailLastSelector=1`；`CailUvdStatusBefore/After=0`（两项即 `cailReadMmRegister(0x83AF)`
   的读回值，idle 位 bit1 始终未置位）。
 - `InitHardwareCailRaw=0`、`InitHardwareCail=0`、`HardwareInitDec=0`、
-  `LastHardwareInit=0`、`StartDec=0`；`CapResult=0`、`CapUVD0=0`。
+  `LastHardwareInit=0`、`StartDec=0`；`CapResult=0`（IOKit 成功码）、`CapUVD0=0`（能力字为零）。
 - 稳定性：`UnsafePoweredAtInit=0`、`PhmState190AtHardware=1`、`InitPowerGateResult=1`
   （`[0x190]`/`[0x1A0]` 前后均为 1）；未重演 build35/41 的“上电态进入 init”panic。
 
