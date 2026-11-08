@@ -608,11 +608,24 @@ namespace
         NRed::singleton().setProp32("NRedVCN1HardwareEarlyFlag", early);
         NRed::singleton().setProp32("NRedVCN1HardwareSkipFirmware", skipFirmware);
         NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareBaseEnc" : "NRedVCN1HardwareBaseDec", base);
+        // +0x25D!=0 时原生 initHardware 会跳过 loadUVDFW；但实测 UVD_STATUS(0x83AF) 前后都是 0，
+        // 说明固件根本没被这条路径载入。诊断：第一次解码引擎 init 时临时清 0，让原生流程
+        // 先 loadUVDFW，再以 flag=0 走 initHardwareCail；调用后恢复原值。
+        bool firmwareFirst{false};
+        if ((isEncode & 1U) == 0 && skipFirmware != 0) {
+            static UInt32 firmwareFirstCount{0};
+            if (__atomic_fetch_add(&firmwareFirstCount, 1U, __ATOMIC_RELAXED) == 0) {
+                firmwareFirst                        = true;
+                static_cast<UInt8*>(self)[0x25D] = 0;
+            }
+        }
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7InitHardwareOriginal)(self);
+        if (firmwareFirst) { static_cast<UInt8*>(self)[0x25D] = skipFirmware; }
+        NRed::singleton().setProp32("NRedVCN1CailFirmwareFirst", firmwareFirst ? 1 : 0);
         NRed::singleton().setProp32("NRedVCN1LastHardwareInit", result);
         NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareInitEnc" : "NRedVCN1HardwareInitDec", result);
         auto count = __atomic_fetch_add(&uvd7InitHardwareCount, 1U, __ATOMIC_RELAXED);
-        if (count < 16) { SYSLOG("VCN1", "UVD7 initHardware result=%u", result); }
+        if (count < 16) { SYSLOG("VCN1", "UVD7 initHardware result=%u fwFirst=%u", result, firmwareFirst ? 1U : 0U); }
         return result;
     }
 
@@ -729,6 +742,13 @@ namespace
             NRed::singleton().setProp32("NRedVCN1CailRetryResult", result);
             NRed::singleton().setProp32(isEncode & 1 ? "NRedVCN1CailRetryFailedEnc" : "NRedVCN1CailRetryFailedDec",
                                         cailRetryFailed[isEncode & 1]);
+        }
+        // 在固件先行诊断确认 UVD 块真正进入 idle 之前，不让 initHardware 成功、引擎不 start，
+        // 避免再次向未初始化的 UVDDec 环提交命令导致 GPU FullAsicReset。确认后再用 boot-arg 打开。
+        const bool allowEngineStart = checkKernelArgument("-NRedVCNAllowStart");
+        if (!allowEngineStart && result) {
+            NRed::singleton().setProp32("NRedVCN1CailStartBlocked", 1);
+            result = false;
         }
         NRed::singleton().setProp32("NRedVCN1InitHardwareCail", result);
         (isEncode ? cailEncResult : cailDecResult) = result;
