@@ -54,6 +54,14 @@ namespace
     // （+0x88 = SMC 接口，+0xA0 = ASIC 电源状态）。这里只观测，不主动写硬件。
     mach_vm_address_t       initPowerGateOriginal{0};
     void*                   phmHandle{nullptr};
+    // PhwRaven_Initialize 通过 PECI 读取 PP_EnableVCNPG（默认 1）。Picasso 的 personality 属性
+    // 虽然出现在 IGPU 上，但驱动读到的仍是默认值（build37），所以直接在 PECI 层把该键钉成 0：
+    // TF_PhwRaven_InitPowerGateState 便会在引擎 init 之前走 PowerUpVCN。
+    mach_vm_address_t       peciReadRegistryOriginal{0};
+    UInt32                  peciVcnPGCalls{0}, initPowerGateCalls{0};
+    // PhwRaven 电源域入口与 PHM 门控调度：确认驱动自己的 TF 路径真的上了电，以及之后是否被 PSM 关掉。
+    mach_vm_address_t       ravenPowerUpOriginal{0}, ravenPowerDownOriginal{0}, phmPowerGateVCNOriginal{0};
+    UInt32                  ravenPowerUpCalls{0}, ravenPowerDownCalls{0}, phmPowerGateVCNCalls{0};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -793,6 +801,8 @@ namespace
             NRed::singleton().setProp32(isEncode & 1 ? "NRedVCN1CailRetryFailedEnc" : "NRedVCN1CailRetryFailedDec",
                                         cailRetryFailed[isEncode & 1]);
         }
+        // 门控之前的真实结果：即使下面把 start 挡掉，也能判断 CAIL init 本身是否成功。
+        NRed::singleton().setProp32("NRedVCN1InitHardwareCailRaw", result);
         // 在固件先行诊断确认 UVD 块真正进入 idle 之前，不让 initHardware 成功、引擎不 start，
         // 避免再次向未初始化的 UVDDec 环提交命令导致 GPU FullAsicReset。确认后再用 boot-arg 打开。
         const bool allowEngineStart = checkKernelArgument("-NRedVCNAllowStart");
@@ -1515,6 +1525,8 @@ static int cailUvdInitHook(void* adapter, void* input)
 // build39 的强制/留在 0 让 CAIL 在 probe 里进入 0x83AF idle 等待并 panic（§25）。
 static int initPowerGateHook(void* phm)
 {
+    const auto callIndex = __atomic_fetch_add(&initPowerGateCalls, 1U, __ATOMIC_RELAXED) + 1;
+    NRed::singleton().setProp32("NRedVCN1InitPowerGateCalls", callIndex);
     if (phm != nullptr) { __atomic_store_n(&phmHandle, phm, __ATOMIC_RELEASE); }
     void* state{nullptr};
     if (phm != nullptr) { memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state)); }
@@ -1531,6 +1543,79 @@ static int initPowerGateHook(void* phm)
     NRed::singleton().setProp32("NRedVCN1InitPowerGate190After", readState32(state, 0x190));
     NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0After", readState32(state, 0x1A0));
     SYSLOG("VCN1", "TF_PhwRaven_InitPowerGateState result=%d", result);
+    return result;
+}
+
+// PECI 注册表读取层：PhwRaven_Initialize 用 key="PP_EnableVCNPG"、默认 1 读取该键。
+// personality 里的 CAIL_PP_EnableVCNPG 在 build37 没有被读到（1A0 仍是 1），这里直接在
+// PECI 层兜底，把结果钉成 0，让 TF_PhwRaven_InitPowerGateState 在引擎 init 前上电。
+static int peciReadRegistryHook(void* handle, const char* key, void* out, const UInt32 defaultValue)
+{
+    const auto result = reinterpret_cast<int (*)(void*, const char*, void*, UInt32)>(peciReadRegistryOriginal)(
+        handle, key, out, defaultValue);
+    if (key != nullptr && out != nullptr && strcmp(key, "PP_EnableVCNPG") == 0) {
+        UInt32 raw{defaultValue};
+        memcpy(&raw, out, sizeof(raw));
+        const auto calls = __atomic_fetch_add(&peciVcnPGCalls, 1U, __ATOMIC_RELAXED) + 1;
+        NRed::singleton().setProp32("NRedVCN1PeciVCNPGCalls", calls);
+        NRed::singleton().setProp32("NRedVCN1PeciVCNPGRaw", raw);
+        NRed::singleton().setProp32("NRedVCN1PeciVCNPGResult", static_cast<UInt32>(result));
+        const UInt32 forced{0};
+        memcpy(out, &forced, sizeof(forced));
+        NRed::singleton().setProp32("NRedVCN1PeciVCNPGForced", 1);
+        SYSLOG("VCN1", "PP_EnableVCNPG raw=%u result=%d -> forced 0", raw, result);
+        return 0;
+    }
+    return result;
+}
+
+// 驱动自己的 VCN 电源入口：确认 TF 路径真的调到 PowerUpVCN，以及之后有没有被关掉。
+static int ravenPowerUpHook(void* phm)
+{
+    void* state{nullptr};
+    if (phm != nullptr) { memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state)); }
+    const auto before = readState32(state, 0x190);
+    const auto result = reinterpret_cast<int (*)(void*)>(ravenPowerUpOriginal)(phm);
+    const auto calls  = __atomic_fetch_add(&ravenPowerUpCalls, 1U, __ATOMIC_RELAXED) + 1;
+    NRed::singleton().setProp32("NRedVCN1RavenPowerUpCalls", calls);
+    NRed::singleton().setProp32("NRedVCN1RavenPowerUpResult", static_cast<UInt32>(result));
+    NRed::singleton().setProp32("NRedVCN1RavenPowerUp190Before", before);
+    NRed::singleton().setProp32("NRedVCN1RavenPowerUp190After", readState32(state, 0x190));
+    NRed::singleton().setProp32("NRedVCN1RavenPowerUp1A0", readState32(state, 0x1A0));
+    SYSLOG("VCN1", "PhwRaven_PowerUpVCN result=%d 190=%u->%u call=%u", result, before,
+           readState32(state, 0x190), calls);
+    return result;
+}
+
+static int ravenPowerDownHook(void* phm)
+{
+    void* state{nullptr};
+    if (phm != nullptr) { memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state)); }
+    const auto before = readState32(state, 0x190);
+    const auto result = reinterpret_cast<int (*)(void*)>(ravenPowerDownOriginal)(phm);
+    const auto calls  = __atomic_fetch_add(&ravenPowerDownCalls, 1U, __ATOMIC_RELAXED) + 1;
+    NRed::singleton().setProp32("NRedVCN1RavenPowerDownCalls", calls);
+    NRed::singleton().setProp32("NRedVCN1RavenPowerDownResult", static_cast<UInt32>(result));
+    NRed::singleton().setProp32("NRedVCN1RavenPowerDown190Before", before);
+    NRed::singleton().setProp32("NRedVCN1RavenPowerDown190After", readState32(state, 0x190));
+    SYSLOG("VCN1", "PhwRaven_PowerDownVCN result=%d 190=%u->%u call=%u", result, before,
+           readState32(state, 0x190), calls);
+    return result;
+}
+
+// PSM/PEM 的门控调度入口：看 PSM 是否在引擎 init 前后请求开/关 VCN。
+static int phmPowerGateVCNHook(void* phm, const UInt32 on, const UInt32 arg)
+{
+    void* state{nullptr};
+    if (phm != nullptr) { memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state)); }
+    const auto before = readState32(state, 0x190);
+    const auto result = reinterpret_cast<int (*)(void*, UInt32, UInt32)>(phmPowerGateVCNOriginal)(phm, on, arg);
+    const auto calls  = __atomic_fetch_add(&phmPowerGateVCNCalls, 1U, __ATOMIC_RELAXED) + 1;
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateVCNCalls", calls);
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateVCNLastOn", on);
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateVCNResult", static_cast<UInt32>(result));
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateVCN190Before", before);
+    NRed::singleton().setProp32("NRedVCN1PhmPowerGateVCN190After", readState32(state, 0x190));
     return result;
 }
 
@@ -1567,6 +1652,39 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
     }
     else {
         NRed::singleton().setProp32("NRedVCN1InitPowerGateHooked", 1);
+    }
+    // PECI 层钉住 PP_EnableVCNPG，并观测驱动自己的 VCN 电源入口与 PHM 门控调度。
+    KernelPatcher::RouteRequest peciRoute{"_PECI_ReadRegistry", peciReadRegistryHook, peciReadRegistryOriginal};
+    if (!patcher.routeMultiple(id, &peciRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1PeciHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1PeciHooked", 1);
+    }
+    KernelPatcher::RouteRequest powerUpRoute{"_PhwRaven_PowerUpVCN", ravenPowerUpHook, ravenPowerUpOriginal};
+    if (!patcher.routeMultiple(id, &powerUpRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1RavenPowerUpHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1RavenPowerUpHooked", 1);
+    }
+    KernelPatcher::RouteRequest powerDownRoute{"_PhwRaven_PowerDownVCN", ravenPowerDownHook, ravenPowerDownOriginal};
+    if (!patcher.routeMultiple(id, &powerDownRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1RavenPowerDownHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1RavenPowerDownHooked", 1);
+    }
+    KernelPatcher::RouteRequest gateVcnRoute{"_PHM_PowerGateVCN", phmPowerGateVCNHook, phmPowerGateVCNOriginal};
+    if (!patcher.routeMultiple(id, &gateVcnRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1PhmGateVCNHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1PhmGateVCNHooked", 1);
     }
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
