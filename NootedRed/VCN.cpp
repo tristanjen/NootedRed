@@ -617,6 +617,7 @@ namespace
             if (__atomic_fetch_add(&firmwareFirstCount, 1U, __ATOMIC_RELAXED) == 0) {
                 firmwareFirst                        = true;
                 static_cast<UInt8*>(self)[0x25D] = 0;
+                NRed::singleton().setProp32("NRedVCN1CailFirmwareFirstEver", 1);
             }
         }
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7InitHardwareOriginal)(self);
@@ -650,10 +651,8 @@ namespace
         NRed::singleton().setProp32("NRedVCN1ProbeSkipFirmware", skipFirmware);
         const auto init = engineSlot(probeEngine, 0x368);
         NRed::singleton().setProp32("NRedVCN1ProbeSlotValid", init != 0);
-        auto result = init ? reinterpret_cast<bool (*)(void*)>(init)(probeEngine) : false;
-        NRed::singleton().setProp32("NRedVCN1ProbeInitResult", result);
-        // 固件下载原本被 +0x25D 跳过；单独跑一次，区分「固件没下载」与「CAIL 初始化失败」。
-        if (!result || skipFirmware != 0) {
+        // 原生顺序是 loadUVDFW → initHardwareCail；先加载固件，再初始化，避免在死块上等 idle。
+        if (skipFirmware != 0) {
             const auto load = engineSlot(probeEngine, 0x338);
             if (load && __atomic_load_n(&probeFwCount, __ATOMIC_RELAXED) == 0) {
                 __atomic_add_fetch(&probeFwCount, 1U, __ATOMIC_RELAXED);
@@ -662,6 +661,12 @@ namespace
                 SYSLOG("VCN1", "probe loadUVDFW result=%u", fw);
             }
         }
+        const bool firmwareFirst = skipFirmware != 0;
+        if (firmwareFirst) { static_cast<UInt8*>(probeEngine)[0x25D] = 0; }
+        auto result = init ? reinterpret_cast<bool (*)(void*)>(init)(probeEngine) : false;
+        if (firmwareFirst) { static_cast<UInt8*>(probeEngine)[0x25D] = skipFirmware; }
+        NRed::singleton().setProp32("NRedVCN1ProbeFirmwareFirst", firmwareFirst ? 1 : 0);
+        NRed::singleton().setProp32("NRedVCN1ProbeInitResult", result);
         SYSLOG("VCN1", "probe initHardware result=%u", result);
         return result;
     }
@@ -710,6 +715,9 @@ namespace
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7LoadUVDFWOriginal)(self);
         NRed::singleton().setProp32("NRedVCN1LoadUVDFW", result);
         auto count = __atomic_fetch_add(&uvd7LoadUVDFWCount, 1U, __ATOMIC_RELAXED);
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWCalls", count + 1);
+        if (count == 0) { NRed::singleton().setProp32("NRedVCN1LoadUVDFWFirst", result); }
+        if (count == 1) { NRed::singleton().setProp32("NRedVCN1LoadUVDFWSecond", result); }
         if (count < 16) { SYSLOG("VCN1", "loadUVDFW result=%u", result); }
         return result;
     }
@@ -1403,12 +1411,16 @@ static int cailUvdInitHook(void* adapter, void* input)
         return 0;
     }
     if (cailReadMmRegister != nullptr && adapter != nullptr) {
-        NRed::singleton().setProp32("NRedVCN1CailUvdStatusBefore", cailReadMmRegister(adapter, 0x83AF));
+        const auto status = cailReadMmRegister(adapter, 0x83AF);
+        NRed::singleton().setProp32("NRedVCN1CailUvdStatusBefore", status);
+        if (callIndex == 0) { NRed::singleton().setProp32("NRedVCN1CailUvdStatusFirstBefore", status); }
     }
     auto result = reinterpret_cast<int (*)(void*, void*)>(cailUvdInitOriginal)(adapter, input);
     NRed::singleton().setProp32("NRedVCN1CailInitFirstResult", static_cast<UInt32>(result));
     if (cailReadMmRegister != nullptr && adapter != nullptr) {
-        NRed::singleton().setProp32("NRedVCN1CailUvdStatusAfter", cailReadMmRegister(adapter, 0x83AF));
+        const auto status = cailReadMmRegister(adapter, 0x83AF);
+        NRed::singleton().setProp32("NRedVCN1CailUvdStatusAfter", status);
+        if (callIndex == 0) { NRed::singleton().setProp32("NRedVCN1CailUvdStatusFirstAfter", status); }
     }
     // 真实 init 失败后把该槽换成返回 0 的桩再走一遍。注意：桩会跳过 UVD 寄存器初始化，
     // 引擎即使“启动成功”也无法处理解码命令，因此默认关闭，只有显式 boot-arg 才启用。
