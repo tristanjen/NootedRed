@@ -873,3 +873,39 @@ build39 panic 后回滚 stock；build40（CDHash `C29F2533`）：
 - `PowerOnOffCalls>0`、`LastResult=1` → 原生上电成功；VCN 可能已上电，CAIL init 能否
   通过看 `CailInitResult`/`CailUvdStatusBefore`。
 - 系统应稳定（probe 关闭、无强制写）。
+
+## 27. 第二十四轮：build40 dump 与 build41 的 PECI 兜底
+
+build40（CDHash `C29F2533`）实机 dump（2026-11-08 12:56）：
+
+- `PowerOnOffCalls` **不出现**：反汇编 `__ZTV30AMDRadeonX5000_AMDUVD7HWEngine` 槽
+  +0x138 指向 0x43d2b24，是 `mov al,1; ret` 的空桩。UVD7 覆盖了基类的
+  `AMDUVDHWEngine::powerOnOff`（0x43d1538），所以钩子永远不会触发；accelerator 的
+  `powerUpHWEngines` 调到的就是「直接返回 true」，不产生任何 CAIL 消息。
+- `CailFunc1Calls=4`、`CailFunc1Result=1`；`CailFunc2..5` 从未调用。
+  `CailLastSelector=1`、`CailLastResult=0xFFFFFFFFE00002C7`（即 `0xE00002C7`
+  符号扩展），`CailSubmit8=0`、`CailSubmit9=0xFFFFFFFFE00002C7`。
+- `InitPowerGate1A0Before/After=1`、`InitPowerGate190Before/After=1`、
+  `PhmState190AtHardware=1`、`InitHardwareCail=0`、`HardwareInitDec=0`、`StartDec=0`、
+  `CailUvdStatusBefore/After=0`。
+- 结论：engine init 期间 UVD 块完全没上电，CAIL init 以返回 1 收场；accelerator 侧
+  不会（也不需要）通过 UVD7 的 powerOnOff 上电。
+
+属性链路核实：`CAIL_PP_EnableVCNPG=0` 确实以**扁平属性**出现在 IGPU（IOPCIDevice）
+节点上（`ioreg -a` 结构确认），但 `PhwRaven_Initialize` 里的
+`PECI_ReadRegistry(handle, "PP_EnableVCNPG", &out, 1)` 仍然走了「未找到 → 写默认值 1」
+分支，于是 `[state+0x1A0]=1`。`MCIL_GetRegistrykey` 会拼 `CAIL_` 前缀后调用
+`[hardware+0x10]`（IOPCIDevice）的虚表 +0x2B8；失败原因可能是转换/时机，但不必再猜。
+
+build41（CDHash `37DF0FD4`，commit `a5a2085`）：
+
+- 路由 `_PECI_ReadRegistry`，key 为 `PP_EnableVCNPG` 时把输出强制写 0 并返回 0。
+  这样 `PhwRaven_Initialize` 得到 `[state+0x1A0]=0`，`TF_PhwRaven_InitPowerGateState`
+  在引擎 init 前走 `PhwRaven_PowerUpVCN`；之后 `PhwRaven_PowerDownVCN` 因
+  `[0x1A0]==0` 直接返回，VCN 保持上电。
+- 观测：`PeciVCNPGCalls/Raw/Result/Forced`、`InitPowerGateCalls`、
+  `RavenPowerUpCalls/Result/190Before/190After/1A0`、
+  `RavenPowerDownCalls/Result/190Before/190After`、
+  `PhmPowerGateVCNCalls/LastOn/Result/190Before/190After`、
+  `InitHardwareCailRaw`（no-start 闸之前的真实结果）。
+- probe 仍默认关闭，不强制 powerOnOff；预期系统稳定。
