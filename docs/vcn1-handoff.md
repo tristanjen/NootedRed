@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `690a266` VCN1: Keep the VCN power-gate flag cleared after the TF power-up；docs（本轮） |
+| 最新提交 | `14c078b` VCN1: Disable the CAIL probe and observe the native power path；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -133,7 +133,13 @@ build39（`690a266`，CDHash `EB3848FB`）：默认**不恢复** `[0x1A0]`，留
 **build39 不安全**（UUID `9CFD1B1F`）：实机 panic，栈为 `_ulReadMmRegisterUlong`
 → `_uvd_init_engine`（等 0x83AF）→ `_CailUvdInit` → NootedRed `probeHardwareInit`
 → `accelVideoContextStart`；触发进程 `avconferenced`。VCN 被强行保持上电，但 PSM/时钟
-没有把它带到 idle，CAIL 等待变成自旋。EFI 已回滚到 stock 构建（`30579C7E`），系统稳定。
+没有把它带到 idle，CAIL 等待变成自旋。
+
+build40（`14c078b`，CDHash `C29F2533`，已安装）：`probeHardwareInit` 默认关闭
+（`-NRedVCNProbe` 才启用）；TF hook 只读（不写 `[0x1A0]`、不提前上电）；不再默认强制
+engine `powerOnOff`（`-NRedVCNForcePower` 才启用）。新增 `PowerOnOffCalls`/`LastOn`/
+`LastResult` 和 `CailFunc1..5Calls/Result`，用来观察 accelerator 是否调用 powerOnOff、
+CAIL func 3 是否成功。系统应稳定。
 
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
@@ -143,14 +149,15 @@ no-start 闸。
 
 ## 下一步
 
-1. **不要再装 build39**；EFI 现在是 stock 构建（UUID `30579C7E`），系统稳定。
-2. 方向调整：不再从 PHM 强行上电。先做无写入的 PSM 观测：
-   - `PSM_UseAsicBlock` / `PSM_UnuseAsicBlock`（UVD block 注册）
-   - `PSM_ActivateClient` / `PSM_UpdateClockRequest`（视频客户端激活/时钟请求）
-   - `PHM_PowerGateVCN` / `PhwRaven_PowerUpVCN`（PSM 何时调用）
-   - `PhwRaven_SetDPGModeVCN` 与 VCN 时钟路径
-3. probe 默认关闭（`-NRedVCNProbe` 才启用），避免视频上下文启动时提前跑 CAIL init。
-4. 找到 PSM 激活 UVD block 的入口后，让自定义引擎走同一路径，而不是直接发 SMU。
+1. build40 已安装。重启、播 30 秒 QuickTime，读 `PowerOnOffCalls`、`PowerOnOffLastOn`、
+   `PowerOnOffLastResult`、`CailFunc1Calls/Result`、`CailFunc2...`、`CailFunc3...`、
+   `CailInitResult`、`CailUvdStatusBefore`、`HardwareInitDec`/`StartDec`。
+2. `PowerOnOffCalls=0` → accelerator 没调用引擎 powerOnOff；检查引擎数组/时序，或显式在
+   `powerUpHWEngines` 后调用。
+3. `LastResult=0` → CAIL func 3 失败；看 `CailFunc3Result`/`CailLibResult`，再决定是否
+   需要先满足 func 3 的前置条件（client ready/caps）。
+4. `LastResult=1` 且 VCN 上电 → 看 `CailUvdStatusBefore` 是否 0x2；若 CAIL init 失败，
+   查 `CailFunc1Result`/`CailInitCalls`。
 
 ## 反汇编环境
 

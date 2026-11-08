@@ -854,3 +854,22 @@ build39（UUID `9CFD1B1F`）实机 panic（`Kernel-2026-11-08-203225.panic`）�
 （`PSM_UseAsicBlock` / `PSM_ActivateClient` / `PSM_ReArbit` → `PHM_PowerGateVCN(phm,0)`），
 由 PSM 同时设置 VCN 时钟/DPG；否则 CAIL 的 0x83AF idle 等待永远不会满足。probe 也必须
 默认关闭（`-NRedVCNProbe` 才启用），避免视频上下文启动时提前跑 CAIL init。
+
+## 26. 第二十三轮：关闭 probe，观察 accelerator 的原生 powerOnOff/CAIL 函数
+
+build39 panic 后回滚 stock；build40（CDHash `C29F2533`）：
+
+- `probeHardwareInit` 默认关闭（`-NRedVCNProbe` 才启用），避免视频上下文启动时提前跑
+  CAIL init；build39 的 panic 栈正是这条路径。
+- `initPowerGateHook` 恢复只读：不写 `[0x1A0]`、不提前上电。
+- `uvd7InitHardware` 不再默认强制 `enginePowerOriginal(self,true)`，只有
+  `-NRedVCNForcePower` 才调用；新增 `PowerOnOffCalls`/`LastOn`/`LastResult`。
+- `cailUvdControlHook` 新增 `CailFunc1..5Calls/Result`，用来区分 init/start/power。
+
+判读：
+
+- `PowerOnOffCalls=0` → accelerator 没调用引擎 `powerOnOff`（引擎数组/时序问题）。
+- `PowerOnOffCalls>0`、`LastOn=1`、`LastResult=0` → 调用了但 CAIL func 3 失败。
+- `PowerOnOffCalls>0`、`LastResult=1` → 原生上电成功；VCN 可能已上电，CAIL init 能否
+  通过看 `CailInitResult`/`CailUvdStatusBefore`。
+- 系统应稳定（probe 关闭、无强制写）。
