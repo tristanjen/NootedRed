@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `240f2c1` VCN1: Observe PSM_ReArbit, the real VCN gate caller on Raven；docs（本轮） |
+| 最新提交 | 代码 `240f2c1`；本轮 docs 见 `git log -1`（build46 窗口实验失败记录） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -242,6 +242,18 @@ build46（`240f2c1`，CDHash `D8326E76`，UUID `85F706FB`，默认安全版）�
 加兜底：若窗口仍打开则强制关闭并发布 `InitWindowForcedClosed=1`。默认（无 boot-arg）行为
 与 build44 完全一致。
 
+**build46 窗口实验（2026-11-08 15:03，`-NRedVCNInitWindow`）不安全**：
+启动后约 47.3 秒、登录进桌面几秒后冻屏并 panic（panic 文件
+`Kernel-2026-11-08-150645.panic`，写在下次启动时）。`NMIPI for unresponsive processor:
+TLB flush timeout`；RIP `0xffffff7fa14d1abf` = `AMDRadeonX6000Framebuffer` +
+`0x1cabf` = `AMDRadeonX6000_AmdRegisterAccess::readValidateReg32(unsigned int)+0x8b`。
+这与 build35 的 11:11:53 panic（RIP `0xffffff7f9d2d1abf`，同样 +`0x1cabf`，43.1 秒）
+是**同一条指令、同一类失败**；panic 前一条指令是 `mov edx, [rcx+rax]`（MMIO 寄存器读）。
+实验没有拿到 ioreg：窗口很可能卡在寄存器读里，`initHardware` 没返回、
+`closeInitWindow` 没执行。**不要重试这个窗口，也不要默认打开。**
+panic 后 EFI 已恢复为 stock NootedRed（`30579C7E`），`config.plist` 已从
+`config.plist.bak-20261108-150146` 恢复（`-NRedVCNInitWindow` 已移除）。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -250,22 +262,20 @@ no-start 闸。
 
 ## 下一步
 
-1. build46 已安装，**默认行为等同 build44**（窗口实验关闭）。先做默认稳定性验证：
-   重启 → 空闲 60s → 播 30 秒 QuickTime → dump。期望 `InitWindowOpened` 不出现、
-   `InitPowerGate1A0Before/After=1`、`UnsafePoweredAtInit=0`、`PeciVCNPGForced` 不出现，
-   系统稳定。若同款 spinlock/VoodooI2C panic 再次出现，则与 VCN 无关，按独立内核/I2C
-   问题排查（boot args 里的 `-vi2c-force-polling` 是可疑项）。
-2. 可选的窗口实验（用户决定后）：备份 `config.plist`，在 `NVRAM/Add/boot-args` 末尾追加
-   `-NRedVCNInitWindow`，重启后读 `InitWindowOpened/Closed/DownResult/190AfterDown/
-   1A0AfterDown`、`PowerProbeUpResult/190AfterUp`、`CailUvdStatusBefore/After`、
-   `CailInitResult`、`InitHardwareCailRaw`。实验后先恢复 config.plist 备份。
-3. `CailInitResult=0` 且 `InitHardwareCailRaw=1` → CAIL init 首次在上电窗口内成功：
-   下一版把窗口延长到引擎 `start` 之后（在 `uvdEngineStart` 钩子里关闭窗口），
-   并去掉 no-start 闸，验证 `StartDec=1` 与首帧解码。
-4. `CailInitResult=1` 且 `CailUvdStatusBefore=0` → `loadUVDFW` 的 SML/PSP 路径本身有问题，
-   需要查 `commitUVDFWMsg`/`LoadUVDFW` 的返回值与 PSP 状态；`StatusBefore=2` 但 init
-   仍失败则是 CAIL 内部问题。
-5. 仍然禁止默认使用 `-NRedVCNForceVCNPG0`；它等价于 build41 的危险状态。
+1. **当前系统是 stock NootedRed（`30579C7E`）**：窗口实验 panic 后 EFI 已恢复为 stock，
+   `config.plist` 已恢复（`-NRedVCNInitWindow` 移除）。继续实验前先确认这台机器要装回
+   哪个构建；默认安全版是 build46（`D8326E76`，无 boot-arg）。
+2. **禁止**重试 `-NRedVCNInitWindow`：它复现了 build35 的 `readValidateReg32+0x8b`
+   TLB flush panic（47.3 秒）。同样禁止 build35/39/41/45 和 `-NRedVCNForceVCNPG0`。
+3. 如果继续，先装 build46 默认版做稳定性/观测验证（无窗口），再转向 **PSM 驱动的媒体
+   block 激活**：`PSM_UseAsicBlock`/`PSM_ActivateClient`/PEM 视频启动任务，或让
+   `PSM_ReArbit` 在 `[psm+0x5F0]`/`[0x690]` 置位后走 `PHM_PowerGateVCN(phm,0)`，
+   而不是从 NootedRed 裸调 `PhwRaven_PowerUpVCN`。
+4. 另一条线：查 `readValidateReg32` 卡住的寄存器访问（RIP +`0x1cabf` 前一条是
+   `mov edx,[rcx+rax]`），确认窗口里到底是 `loadUVDFW` 还是 `initHardwareCail` 的读
+   挂住了 GPU；这决定下一步是改固件装载路径还是改电源时序。
+5. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
+   先恢复 EFI/配置再重启。
 
 ## 反汇编环境
 

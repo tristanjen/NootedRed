@@ -1062,3 +1062,45 @@ build46（CDHash `D8326E76`，UUID `85F706FB`，commit `240f2c1`）：
   `InitWindowForcedClosed=1`。
 - 默认（无 boot-arg）与 build44 完全一致，保证稳定性；实验通过 OpenCore
   `NVRAM/Add/boot-args` 追加 `-NRedVCNInitWindow` 显式开启。
+
+## 33. 第三十轮：build46 的窗口实验复现 build35 的 TLB flush panic
+
+2026-11-08 15:01 把 `-NRedVCNInitWindow` 追加到 OpenCore `NVRAM/Add/boot-args`
+（备份 `config.plist.bak-20261108-150146`），15:03 启动含 build46 的系统。启动后约
+47.3 秒、登录进桌面几秒后冻屏并 panic（panic 文件在下次启动时写出：
+`Kernel-2026-11-08-150645.panic`）：
+
+- `Panic(CPU 0, time 47259910154): NMIPI for unresponsive processor: TLB flush timeout`；
+  uptime `47260046800` ns ≈ 47.26 s。第二次 panic 是 `IPI timeout, unresponsive CPU
+  bitmap: 0x1`，panicked task 为 `avconferenced`（登录时探测视频能力的进程）。
+- RIP `0xffffff7fa14d1abf`；`AMDRadeonX6000Framebuffer` 载入范围
+  `0xffffff7fa14b5000`–`0xffffff7fa173efff`，所以 kext 内偏移 = **`0x1cabf`**。
+- 用当前系统的 `SystemKernelExtensions.kc` 导出
+  `com.apple.kext.AMDRadeonX6000Framebuffer.kc.bin`（`__TEXT` 文件偏移
+  `0xbfcc000`）后解析：`0x1cabf` = `__ZN32AMDRadeonX6000_AmdRegisterAccess17
+  readValidateReg32Ej + 0x8b`（`readValidateReg32(unsigned int)+0x8b`）。
+- 反汇编：`+0x1cabc` 是 `mov edx, dword ptr [rcx + rax]`（从
+  `[object+0x38] + reg*4` 读寄存器），`+0x1cabf` 是随后的
+  `mov rax, qword ptr [r14]`；即 CPU 卡在 **MMIO 寄存器读** 之后。
+- **与 build35 的 panic 完全相同**：11:11:53 的 panic RIP 为
+  `0xffffff7f9d2d1abf`，基址 `0xffffff7f9d2b5000`，kext 内偏移同样是 `0x1cabf`，
+  uptime 43.1 s。两份 panic 都停在 `readValidateReg32+0x8b` 这一条指令上，
+  说明窗口实验复现了 build35 的“VCN 上电/门控状态不正确 → GPU 寄存器读挂死”
+  这一类失败，而不是 VoodooI2C/定时器问题。
+
+实验没有拿到 ioreg dump：窗口很可能在 `uvd7InitHardwareOriginal(self)` 内的寄存器读
+处挂住，函数没有返回，`closeInitWindow` 也就没有执行；这与“关窗后 VCN 仍上电”的
+build35 状态在外部表现上一致。无论是“init 挂住导致窗口未关”还是“关窗失败”，
+结论相同：**这个窗口不安全，不能重试，也不能默认打开**。
+
+panic 后 EFI 已被恢复为 stock NootedRed（UUID `30579C7E`，二进制与
+`NootedRed-stock-30579C7E-EFI-backup.kext` 相同，mtime 2026-11-01 11:13:54）；
+`config.plist` 已从 `config.plist.bak-20261108-150146` 恢复，boot-args 中不再有
+`-NRedVCNInitWindow`。当前系统以 stock kext 运行。
+
+下一步不再从 NootedRed 裸调 `PhwRaven_PowerUpVCN`。优先方向是让 PSM 自己激活媒体
+block（`PSM_UseAsicBlock`/`PSM_ActivateClient`/PEM 视频启动，或让 `PSM_ReArbit` 在
+`[psm+0x5F0]`/`[0x690]` 置位后调用 `PHM_PowerGateVCN(phm,0)`），这样电源域、时钟与
+DPG 由驱动自己的电源管理序列协调；另一条线是查清 `readValidateReg32` 卡住的具体
+寄存器（`loadUVDFW` 的 SML/PSP 读还是 `initHardwareCail` 的 `UVD_STATUS(0x83AF)` 读），
+再决定是改固件装载路径还是改电源时序。
