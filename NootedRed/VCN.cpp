@@ -608,6 +608,19 @@ namespace
         NRed::singleton().setProp32("NRedVCN1HardwareEarlyFlag", early);
         NRed::singleton().setProp32("NRedVCN1HardwareSkipFirmware", skipFirmware);
         NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareBaseEnc" : "NRedVCN1HardwareBaseDec", base);
+        // accelerator 从未调用引擎的 powerOnOff（PowerDec 缺失）；UVD 电源域因此没打开。
+        // 诊断：解码引擎第一次 initHardware 前手动上电一次，观察 UVD_STATUS 是否变化。
+        NRed::singleton().setProp32("NRedVCN1PowerHooked", enginePowerOriginal != 0);
+        if ((isEncode & 1U) == 0 && enginePowerOriginal != 0) {
+            static UInt32 forcedPowerCount{0};
+            if (__atomic_fetch_add(&forcedPowerCount, 1U, __ATOMIC_RELAXED) == 0) {
+                const auto powered = reinterpret_cast<bool (*)(void*, bool)>(enginePowerOriginal)(self, true);
+                NRed::singleton().setProp32("NRedVCN1PowerForced", powered ? 1 : 0);
+                NRed::singleton().setProp32(isEncode ? "NRedVCN1PowerEnc" : "NRedVCN1PowerDec",
+                                            2U | (powered ? 1U : 0U));
+                SYSLOG("VCN1", "forced powerOnOff(true) result=%u", powered ? 1U : 0U);
+            }
+        }
         // +0x25D!=0 时原生 initHardware 会跳过 loadUVDFW；但实测 UVD_STATUS(0x83AF) 前后都是 0，
         // 说明固件根本没被这条路径载入。诊断：第一次解码引擎 init 时临时清 0，让原生流程
         // 先 loadUVDFW，再以 flag=0 走 initHardwareCail；调用后恢复原值。
