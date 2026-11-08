@@ -1184,3 +1184,57 @@ build49（CDHash `4370048A`，UUID `9BA1FB25`）：在四个 UVD 分类都不存
 - 发布 `PsmWakeClass4Result/Index`、`PsmWakeFallbackClass4`、`PsmWakeClass=4`、
   `PsmWakeBlock=3`；
 - 仍不写 `[0x1A0]`/`[0x190]`、不直接调用 `PhwRaven_PowerUpVCN`。
+
+## 37. 第三十四轮：build49 分类 4 兜底实测（调用成功，硬件未上电）
+
+build49 `-NRedVCNPsmWake` 实测（2026-11-08 21:48，dump 共 391 项）：
+
+- 前置守卫全部通过：`PsmWakeRun=1`、`PsmWake190Before=1`、`PsmWakeFlag5F0/690Before=0`，
+  `PsmWakeSkipped` 未出现；`PsmWakeSymbols=511`（9 个符号全部解析）。
+- `PsmWakeClassesMask=49`（0x31，仍只有分类 0/4/5 存在）；0x12/0x13/0x14/0x11 四个
+  UVD 分类全部 `Result=15`、`Index=0`，与 §36 记录的 build48 结果（均为 15）一致。
+- 分类 4 兜底按设计执行：`PsmWakeClass4Result=1`、`PsmWakeClass4Index=1`、
+  `PsmWakeFallbackClass4=1`、`PsmWakeGetStateResult=1`、`PsmWakeStateIndex=1`、
+  `PsmWakeClass=4`、`PsmWakeBlock=3`。
+- 四个调用全部被接受：`PsmWakeSetUvdResult=1`、`PsmWakeAdjustResult=1`、
+  `PsmWakeUseBlockResult=1`。
+- 但硬件侧没有任何变化：**`PsmWakeFlag5F0After=0`、`PsmWakeFlag690After=0`、
+  `PsmWakeVcnGateDelta=0`（唤醒窗口内 `PHM_PowerGateVCN` 一次都没被调用）、
+  `PsmWake190After=1`（仍是门控态）**。于是按设计走失败分支：
+  `PsmWakeUnuseResult=1`、`PsmWakeFailed=1`；`PsmWakeAcquired/Consumed` 均未出现。
+- 结论：**分类 4 的 state 不带 VCN 时钟/门控属性**。`PSM_SetUvdState` 只是把 UVD
+  precedence 9 指向该 state，`AdjustPowerState` 接受请求但不会为 VCN 打开门控。
+  分类 4 兜底不可行，PSM 分类路线到此为止。
+
+下游状态（同一 dump，与“未上电”一致）：
+
+- `CailInitResult=1`（失败）、`CailRetryResult=0`、`CailSubmit1/9=0xFFFFFFFFE00002C7`、
+  `CailLastSelector=1`；`CailUvdStatusBefore/After=0`（两项即 `cailReadMmRegister(0x83AF)`
+  的读回值，idle 位 bit1 始终未置位）。
+- `InitHardwareCailRaw=0`、`InitHardwareCail=0`、`HardwareInitDec=0`、
+  `LastHardwareInit=0`、`StartDec=0`；`CapResult=0`、`CapUVD0=0`。
+- 稳定性：`UnsafePoweredAtInit=0`、`PhmState190AtHardware=1`、`InitPowerGateResult=1`
+  （`[0x190]`/`[0x1A0]` 前后均为 1）；未重演 build35/41 的“上电态进入 init”panic。
+
+同一 dump 中用户态与上下文链的新进展：
+
+- `NRedVCNUserRejected` 消失；`UserEnabled=1`、`UserApplied=16`、`DecoderPID=783`、
+  `UserDynamicMatched/Applied=1`（`DynamicReads=3322`）。第六轮的补丁表问题已闭环。
+- `SelSeen=0x85F`（0x100/101/102/103/104/106/10B）、`SelCount=165`、`SelLast=0x10B`：
+  用户态在完整驱动 video context，不再只有 bit0。
+- `NewCtxResult=1`、`NewCtxStatus=0`、`NewCtxType=0`（解码分支）、`NewCtxCodec=3`、
+  `UvdCtxInit=1`、`ReqCap=1`、`ReqCapMode=3`：上下文对象与能力申请链已走通，
+  只差真实硬件能力。
+
+固件路径的新疑点：
+
+- `LoadUVDFW=1`、`LoadUVDFWCalls=1`、`LoadUVDFWFirst=1`、`FirmwareAddress=0x7B52F000`
+  非零，且 `CailFirmwareFirstEver=1`（固件先行分支确实触发过一次），但
+  **`FwMsg*` 三个键一个都没出现**，即 `commitUVDFWMsg` 从未被观测到。
+- 两种可能：(a) `loadUVDFW` 因缓存标志（`+0x3BA`）提前返回，并未真正下发消息；
+  (b) `commitUVDFWMsg` 符号未解析，钩子没安装（`prepareVCN1` 中该路由是条件安装，
+  当前没有发布“是否安装”的属性）。
+- 在排除这两点之前，不能把 `LoadUVDFW=1` 当作“固件已下载”的证据。
+
+下一步方向：放弃 PSM 分类路线；转向 CWDDEPM 的 UVD 状态创建 /`PSM_AddState`，
+或直接驱动 `PEM_Task_VideoStartMultiUVDStates`；禁止退回裸调 `PowerUpVCN`。

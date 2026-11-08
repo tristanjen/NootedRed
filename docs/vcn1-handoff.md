@@ -1,6 +1,7 @@
 # VCN1 / Picasso handoff
 
-Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 上打通**硬件视频解码**。
+Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 上补**硬件视频解码**。
+当前状态：用户态补丁与视频上下文链已打通，硬件侧仍卡在 VCN 上电（见 `vcn1-analysis.md` §37）。
 硬编尽力而为（HEVC 可期，AVC 无专用命令类）。
 
 ## 仓库与分支
@@ -11,7 +12,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | 代码与 docs 见 `git log -1`（build47 PSM 唤醒） |
+| 最新提交 | 代码与 docs 见 `git log -1`（build48/build49 PSM 分类探测与分类 4 兜底） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -298,19 +299,23 @@ no-start 闸。
 
 ## 下一步
 
-1. 当前 EFI 装的是 build49（`4370048A`/`9BA1FB25`），`config.plist` 已备份并追加
-   `-NRedVCNPsmWake`；重启后做**分类 4 兜底**实验。
-2. 读 `PsmWakeClassesMask`、`PsmWakeClass12/13/14/11Result`（应仍为 15）、
-   `PsmWakeClass4Result/Index`、`PsmWakeFallbackClass4`、`PsmWakeClass=4`、
-   `PsmWakeBlock=3`、`PsmWakeSetUvdResult/AdjustResult/UseBlockResult`、
-   `PsmWakeFlag5F0/690After`、`PsmWakeVcnGateDelta`、`PsmWake190After`、
-   `CailInitResult`、`InitHardwareCailRaw`。
-3. 成功判据：flag 出现 1、`VcnGateDelta>0`、`190After=0`，随后 `CailInitResult=0` 且
-   `InitHardwareCailRaw=1`。若 flag 仍为 0，说明分类 4 没有 VCN 时钟属性；下一步查
-   `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建/`PSM_AddState`，或直接驱动
-   PEM 视频启动事件；不要退回裸调 `PowerUpVCN`。
-4. **禁止** build35/39/41/45、`-NRedVCNInitWindow`、`-NRedVCNForceVCNPG0`。
-5. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
+1. **build49 分类 4 兜底实测失败**（2026-11-08 21:48）：`PsmWakeClass4Result/Index=1/1`、
+   `PsmWakeFallbackClass4=1`，SetUvd/Adjust/UseBlock 全部返回 1，但
+   `PsmWakeFlag5F0/690After=0`、`PsmWakeVcnGateDelta=0`、`PsmWake190After=1`，
+   随后 `PsmWakeUnuseResult=1`、`PsmWakeFailed=1`。**分类 4 的 state 没有 VCN 时钟属性，
+   PSM 分类路线到此为止**，不要再试 0x11–0x14 或分类 4。
+2. **先恢复 config.plist**：本机启动仍带 `-NRedVCNPsmWake`（`PsmWakeRun=1` 可证）。
+   挂载 ESP 后用 `~/Desktop/config.plist.bak-20261108-214330` 覆盖
+   `EFI/OC/config.plist`，确认 boot-args 不再含该开关。
+3. **补固件路径诊断**：`LoadUVDFW=1`、`FirmwareAddress=0x7B52F000` 非零，但 `FwMsg*`
+   全缺。下一版在 `prepareVCN1` 发布 `FwMsgRouteInstalled`，并在 `loadUVDFW` 入口读
+   `+0x3BA` 缓存标志、发布提前返回位，先区分“没下发”和“没钩上”。
+4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
+   /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
+   `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。
+   不要退回裸调 `PowerUpVCN`。
+5. **禁止** build35/39/41/45、`-NRedVCNInitWindow`、`-NRedVCNForceVCNPG0`。
+6. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
    先恢复 EFI/配置再重启。
 
 ## 反汇编环境
@@ -322,7 +327,7 @@ no-start 闸。
 
 ## 代码地图
 
-`NootedRed/VCN.cpp`（VCN1 主体：`prepareVCN1`、`hookCailLibrary`、`cailUvdControlHook`、`cailUvdInitHook`、`probeHardwareInit`）、`VCN.hpp`、`X5000.cpp`/`.hpp`（`allocateHWEngines` VCN1 分支、能力位）、`HWLibs.cpp`（钩 HWLibs 前调用 `VCN::hookCailLibrary`）、`UserVideoDecode.cpp`、`UserSequoiaVideoData.hpp`（生成物）、`VCNCapabilities.hpp`、`docs/vcn.md`、`docs/vcn1-analysis.md`（§1–§12 全过程记录）。
+`NootedRed/VCN.cpp`（VCN1 主体：`prepareVCN1`、`hookCailLibrary`、`cailUvdControlHook`、`cailUvdInitHook`、`probeHardwareInit`）、`VCN.hpp`、`X5000.cpp`/`.hpp`（`allocateHWEngines` VCN1 分支、能力位）、`HWLibs.cpp`（钩 HWLibs 前调用 `VCN::hookCailLibrary`）、`UserVideoDecode.cpp`、`UserSequoiaVideoData.hpp`（生成物）、`VCNCapabilities.hpp`、`docs/vcn.md`、`docs/vcn1-analysis.md`（§1–§37 全过程记录）。
 
 ## 完整对话导出
 

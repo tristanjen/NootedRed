@@ -3,7 +3,7 @@
 本仓库是 NootedRed 的 fork（https://github.com/tristanjen/NootedRed），当前分支 `vcn1-upstream`：
 为 Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 上补硬件视频解码。
 
-**先读 `docs/vcn1-handoff.md`**（进度、当前阻塞、下一步），再读 `docs/vcn1-analysis.md`（§1–§12 逆向全过程）。
+**先读 `docs/vcn1-handoff.md`**（进度、当前阻塞、下一步），再读 `docs/vcn1-analysis.md`（§1–§37 逆向全过程）。
 
 ## 工作约定
 
