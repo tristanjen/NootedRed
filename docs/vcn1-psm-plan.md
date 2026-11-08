@@ -229,3 +229,15 @@ else:
   登录时发生；因此必须保留 `[state+0x190] != 0` 与 flag 前置检查，并在客户端 stop
   时释放。
 - 任何一次实验后先恢复 config.plist，再重启；不要在默认启动里保留 `-NRedVCNPsmWake`。
+
+## 5. 实测更新（build48 / build49）
+
+- build48 分类探测：`PsmWakeClassesMask=49`（只有分类 0/4/5），0x11-0x14 全部返回
+  0xF；PSM 状态表没有 UVD 分类。继续换 UVD 分类没有意义。
+- `PEM_CWDDEPM_PredictUVDStateSettings` 默认把分类 4 作为 UVD 预测的基状态；
+  `PSM_SetUvdState` 只是把 UVD precedence 9 指向给定 state ID。
+- build49（CDHash `4370048A`，UUID `9BA1FB25`）在四个 UVD 分类都不存在时改用分类 4：
+  `GetStateByClassification(4)` → `SetUvdState(idx4)` → `AdjustPowerState` →
+  `UseAsicBlock(3)`，并发布 `PsmWakeClass4Result/Index`、`PsmWakeFallbackClass4`。
+  如果 flag 仍为 0，说明分类 4 没有 VCN 时钟属性，下一步应查 CWDDEPM 的 UVD 状态
+  创建/`PSM_AddState`，或直接驱动 PEM 视频启动事件。

@@ -279,6 +279,17 @@ build48（CDHash `A5E04CEB`，UUID `A0F67623`）：在唤醒前先调用
 SetUvdX/AdjustPowerState/UseAsicBlock。仍不写 `[0x1A0]`/`[0x190]`、不直接调
 `PhwRaven_PowerUpVCN`。
 
+**build48 分类探测实测（2026-11-08 21:33，`-NRedVCNPsmWake`）**：
+`PsmWakeClassesMask=49`（0x31，只有分类 **0/4/5** 存在）；0x12/0x13/0x14/0x11 四个
+UVD 分类全部返回 **15**，`PsmWakeNoState=1`、`PsmWakeFailed=1`，未上电，系统稳定。
+即 **当前 PPT/PSM 状态表没有任何 UVD 分类**，不是换分类就能解决的。
+
+build49（CDHash `4370048A`，UUID `9BA1FB25`）：四个 UVD 分类都不存在时，按
+`PEM_CWDDEPM_PredictUVDStateSettings` 的默认基状态改用分类 4（性能状态）：
+`GetStateByClassification(4)` → `SetUvdState(idx4)` → `AdjustPowerState` →
+`UseAsicBlock(3)`。发布 `PsmWakeClass4Result/Index`、`PsmWakeFallbackClass4`。
+仍不写 `[0x1A0]`/`[0x190]`、不直接调 `PhwRaven_PowerUpVCN`。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -287,24 +298,19 @@ no-start 闸。
 
 ## 下一步
 
-1. **config.plist 恢复待完成**：build47 唤醒实验后，`-NRedVCNPsmWake` 仍留在 ESP 的
-   boot-args 里（管理员授权挂载卡住）。需要用管理员权限把
-   `~/Desktop/config.plist.bak-20261108-154732` 放回
-   `/Volumes/ESP_EFI/EFI/OC/config.plist`，并确认 boot-args 不再包含该开关。
-2. 恢复后安装 build48（`A5E04CEB`/`A0F67623`）默认版：重启 → 空闲 60s → 播 30s →
-   dump；期望 `PsmWake*` 不出现、`PsmWakeSymbols=511`、`InitPowerGate1A0/190=1`、
-   `UnsafePoweredAtInit=0`，系统稳定。
-3. 然后做分类探测实验：备份 config → 追加 `-NRedVCNPsmWake` → 重启 → 播 30s → dump。
-   重点读 `PsmWakeClassesMask`、`PsmWakeClass12/13/14/11Result`、`PsmWakeNoState`、
-   `PsmWakeClass`/`PsmWakeBlock`、`PsmWakeFlag5F0/690After`、`PsmWakeVcnGateDelta`、
-   `PsmWake190After`、`CailInitResult`、`InitHardwareCailRaw`。成功判据：某个分类存在、
-   flag 出现 1、`VcnGateDelta>0`、`190After=0`；随后 `CailInitResult=0` 且
-   `InitHardwareCailRaw=1`。实验后立即恢复 config.plist。
-4. 若四个分类都不存在（`PsmWakeNoState=1` 且 mask 的 0x11-0x14 位为 0）：说明当前
-   PPT/PSM 状态表没有 UVD 状态，需要转向 PSM 动态建状态或直接驱动 PEM 视频启动事件，
-   不要退回裸调 `PowerUpVCN`。
-5. **禁止** build35/39/41/45、`-NRedVCNInitWindow`、`-NRedVCNForceVCNPG0`。
-6. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
+1. 当前 EFI 装的是 build49（`4370048A`/`9BA1FB25`），`config.plist` 已备份并追加
+   `-NRedVCNPsmWake`；重启后做**分类 4 兜底**实验。
+2. 读 `PsmWakeClassesMask`、`PsmWakeClass12/13/14/11Result`（应仍为 15）、
+   `PsmWakeClass4Result/Index`、`PsmWakeFallbackClass4`、`PsmWakeClass=4`、
+   `PsmWakeBlock=3`、`PsmWakeSetUvdResult/AdjustResult/UseBlockResult`、
+   `PsmWakeFlag5F0/690After`、`PsmWakeVcnGateDelta`、`PsmWake190After`、
+   `CailInitResult`、`InitHardwareCailRaw`。
+3. 成功判据：flag 出现 1、`VcnGateDelta>0`、`190After=0`，随后 `CailInitResult=0` 且
+   `InitHardwareCailRaw=1`。若 flag 仍为 0，说明分类 4 没有 VCN 时钟属性；下一步查
+   `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建/`PSM_AddState`，或直接驱动
+   PEM 视频启动事件；不要退回裸调 `PowerUpVCN`。
+4. **禁止** build35/39/41/45、`-NRedVCNInitWindow`、`-NRedVCNForceVCNPG0`。
+5. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
    先恢复 EFI/配置再重启。
 
 ## 反汇编环境

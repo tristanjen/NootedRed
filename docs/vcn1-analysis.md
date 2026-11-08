@@ -1156,3 +1156,31 @@ build48（CDHash `A5E04CEB`，UUID `A0F67623`）据此改为分类探测版：
 - 取第一个存在的分类，调用对应 `PSM_SetUvd*State` → `PSM_AdjustPowerState` →
   `PSM_UseAsicBlock(block)`；
 - 四个都不存在则 `PsmWakeNoState=1`，释放并停止，不写任何电源状态。
+
+## 36. 第三十三轮：build48 分类探测（无 UVD 分类）与 build49 分类 4 兜底
+
+build48 `-NRedVCNPsmWake` 实测（2026-11-08 21:33）：
+
+- `PsmWakeClassesMask = 49 = 0x31`：状态表里只有分类 **0/4/5** 存在。
+- 0x12/0x13/0x14/0x11 四个 UVD 分类全部返回 **15（0xF）**；
+  `PsmWakeNoState=1`、`PsmWakeFailed=1`；没有执行 SetUvd/Adjust/UseBlock，未上电，
+  系统稳定（21:33:32 启动，dump 时约 4 分钟）。
+- 结论：**当前 PPT/PSM 状态表没有任何 UVD 分类**。继续探测 0x11-0x14 没有意义。
+
+静态补充：
+
+- `PEM_CWDDEPM_PredictUVDStateSettings`（`0x46AA345`）在 event flags 默认时把
+  `r12d = 4`，然后按 `0x13/0x12/0x11/0x14` 依次回退探测；即把**分类 4（性能状态）**
+  作为 UVD 预测的基状态。
+- `PSM_SetUvdState(psm, idx)` → `PSM_SetState_Legacy(psm, idx, 9)` →
+  `PSM_RSV_SetStateForPrecedenceLevel(psm+0xB8, 9, state)`：它只是把 **UVD precedence 9**
+  指向给定的 state ID，并不要求该 state 本身带 UVD 分类位。
+- 因此可以尝试把分类 4 的 state 作为 UVD precedence 的候选。
+
+build49（CDHash `4370048A`，UUID `9BA1FB25`）：在四个 UVD 分类都不存在时：
+
+- `GetStateByClassification(psm, 4, 0, &idx4)`（分类 4 存在）；
+- `SetUvdState(psm, idx4)` → `AdjustPowerState(psm, 0)` → `UseAsicBlock(psm, 3)`；
+- 发布 `PsmWakeClass4Result/Index`、`PsmWakeFallbackClass4`、`PsmWakeClass=4`、
+  `PsmWakeBlock=3`；
+- 仍不写 `[0x1A0]`/`[0x190]`、不直接调用 `PhwRaven_PowerUpVCN`。
