@@ -572,3 +572,34 @@ GPU 看门狗做 FullAsicReset。冻结不是内存/显示损坏，而是 UVD �
 
 下一步：用这个安全构建拿到 `CailUvdStatusBefore/After`，判断 UVD 块是否因为未上电/未解复位而没有
 进入 idle；再决定是补时钟/复位序列，还是修正 APU 上 Greenland init 与 VCN1 的差异。
+
+## 18. 第十五轮：UVD_STATUS 全 0，固件先行诊断
+
+安全诊断构建（UUID `8F47944A`）实机稳定（uptime 7 分钟，无冻结），读数：
+
+- `CailMmioReadResolved=1`；`CailUvdStatusBefore=0`、`CailUvdStatusAfter=0`；
+  `CailInitCalls=6`，全部在 `_Cail_MCILWaitFor` 的 0x83AF bit1 等待上失败。
+- `HardwareInitDec=0`、`StartDec=0`（预期，安全）；`HardwareSkipFirmware=1`、`ProbeSkipFirmware=1`、
+  `LoadUVDFW=1`、`ProbeFirmware=1`。
+- 用户态仍然是好的：`VCNUserApplied=16`、`VCNDecoderPID=1534`、`NewCtxStatus=0`、`UvdCtxInit=1`。
+
+`UVD_STATUS` 前后都是 0（不是「忙」，是整个块没起来）。结合原生流程：
+
+- `AMDUVD7HWEngine::init` 在 Raven 上把 `+0x25D` 设为 1（`HardwareSkipFirmware=1`），
+  原生 `initHardware` 因此**跳过** `loadUVDFW`，只调 `initHardwareCail(+0x25D&1 = 1)`。
+- 固件只在 `probeHardwareInit` 的**事后**诊断里单独 load 一次（`ProbeFirmware=1`），此时 CAIL
+  init 已经跑完，UVD 块仍未启动。
+- Linux `vcn_v1_0_wait_for_idle` 等的是 `mmUVD_STATUS == 0x2`；读到 0 说明 VCN 电源域/时钟/
+  复位没被打开。CAIL 的寄存器初始化本身不负责上电。
+
+诊断构建（UUID `898C4F45`，本轮）：第一次解码引擎 `initHardware` 时临时把 `+0x25D` 清 0，
+让原生流程先执行 `loadUVDFW`，再以 `flag=0` 调 `initHardwareCail`；调用后恢复原值。
+同时加安全闸：`initHardwareCail` 即使成功也强制返回 false（除非 boot-arg `-NRedVCNAllowStart`），
+保证本轮不会 start 引擎、不会再向 UVDDec 提交。新增 `CailFirmwareFirst`、`CailStartBlocked`。
+
+判读下一轮：
+
+- `CailFirmwareFirst=1`、`LoadUVDFW=1`、`CailUvdStatusAfter=0x2`、`CailInitResult=0` →
+  固件先行顺序正确，去掉/放开 no-start 闸后即可尝试真正的引擎 start 与解码提交。
+- `LoadUVDFW=0` → boot 时的 SML 队列还不能下载固件，需要把加载移到 probe（在 init 之前）。
+- `After` 仍为 0 → 固件载入不足以上电 UVD，需要补 Raven 的 VCN 电源域/时钟（PhwRaven PowerUpVCN 路径）。

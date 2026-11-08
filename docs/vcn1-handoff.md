@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `ff41792` VCN1: Disable the ASIC stub by default and read UVD_STATUS；docs（本轮） |
+| 最新提交 | `8e6fb2e` VCN1: Load UVD firmware before CAIL init and block engine start；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -71,19 +71,29 @@ PID 550 提交了 2 个命令缓冲、CompletedTS=0，AMD Cail 报 FenceNotRetir
 返回成功，引擎 start 后 VA 驱动提交真实解码命令，UVD 块从未初始化 → 看门狗复位。
 **不要安装 `FBEA6D26` 这个构建**；已回滚到 `E14758AF`（`HardwareInitDec=0`，无提交，稳定）。
 
-安全诊断构建（UUID `8F47944A`，§17）：桩默认关闭（仅 boot-arg `-NRedVCNAsicStub` 启用），真实
-init 失败、引擎不会 start，因此不会挂死；新增 `CailUvdStatusBefore`/`CailUvdStatusAfter`
-（`_ulReadMmRegisterUlong(adapter, 0x83AF)`）和 `CailMmioReadResolved`，用来判断 idle 位为何等不到。
+安全诊断构建（UUID `8F47944A`，§17）实机稳定；读数 `CailMmioReadResolved=1`、
+`CailUvdStatusBefore=0`、`CailUvdStatusAfter=0`、`CailInitCalls=6`——UVD 块**完全没上电**，
+不是 MCIL 等待路径的问题。
+
+根因（§18）：`HardwareSkipFirmware=1`，原生 `initHardware` 跳过 `loadUVDFW`，只跑
+`initHardwareCail(+0x25D&1 = 1)`；固件只在 probe 的**事后**单独加载一次，此时 CAIL init 已经失败。
+Linux `vcn_v1_0_wait_for_idle` 等的是 `mmUVD_STATUS == 0x2`；读到 0 表示电源/时钟/复位没打开。
+
+固件先行诊断构建（UUID `898C4F45`，本轮）：第一次解码引擎 `initHardware` 时临时把 `+0x25D` 清 0，
+让原生流程先执行 `loadUVDFW`、再以 flag=0 调 `initHardwareCail`；同时 `initHardwareCail` 即使成功
+也强制返回 false（除非 boot-arg `-NRedVCNAllowStart`），保证本轮不会 start/提交、不会再挂死。
+新增 `CailFirmwareFirst`、`CailStartBlocked`。
 
 `CapUVD0`/`CapResult=0` 是 init 失败的后果：查询已经到达内核并写入了属性，但引擎没 start，能力为 0。
 
 ## 下一步
 
-1. 安装 `8F47944A` 构建重启、播 30 秒 QuickTime，确认系统不再冻结（`HardwareInitDec=0` 是预期），
-   读 `CailUvdStatusBefore`/`CailUvdStatusAfter`、`CailMmioReadResolved`、`CailInitCalls`/`CailInitAlready`。
-2. 若 `After` 为 0x2（idle）而 wait 仍失败 → 查 MCIL 等待路径/回调返回码；若为 0x0/0x1/0x4 等 →
-   说明 UVD 块未上电/未解复位/未启动，需要补时钟/复位序列，或修正 APU 上 Greenland init 与 VCN1 的差异。
-3. 在真实 `_greenland_uvd_init` 能返回 0 之前，不要重新启用 ASIC 桩，也不要在登录时触发解码提交。
+1. 安装 `898C4F45` 重启、播 30 秒 QuickTime，确认不再冻结；读 `CailFirmwareFirst`、`LoadUVDFW`、
+   `CailUvdStatusAfter`、`CailInitResult`、`CailStartBlocked`。
+2. `LoadUVDFW=0` → boot 时 SML 队列还不能下载固件，改到 probe 里先 load 再 init。
+3. `After=0x2` 且 `CailInitResult=0` → 顺序正确；下一版放开 no-start 闸（或加
+   `-NRedVCNAllowStart`）再试真正的引擎 start 与解码提交。
+4. `After` 仍为 0 → 固件载入不足以上电 UVD，转去补 Raven 的 VCN 电源域（PhwRaven PowerUpVCN 路径）。
 
 ## 反汇编环境
 
