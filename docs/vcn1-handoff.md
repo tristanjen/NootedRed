@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | 代码 `240f2c1`；本轮 docs 见 `git log -1`（build46 窗口实验失败记录） |
+| 最新提交 | 代码与 docs 见 `git log -1`（build47 PSM 唤醒） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -254,6 +254,16 @@ TLB flush timeout`；RIP `0xffffff7fa14d1abf` = `AMDRadeonX6000Framebuffer` +
 panic 后 EFI 已恢复为 stock NootedRed（`30579C7E`），`config.plist` 已从
 `config.plist.bak-20261108-150146` 恢复（`-NRedVCNInitWindow` 已移除）。
 
+build47（在 stock 期间准备，CDHash `DBBC2952`，UUID `E5F48284`）：
+默认路径只解析 PSM 状态机入口（`_PSM_GetStateByClassification`、`_PSM_SetUvdState`、
+`_PSM_AdjustPowerState`、`_PSM_UnuseAsicBlock`、`_PSM_GetAsicBlockStatus`），并在
+`PSM_ReArbit`/`PSM_ActivateClient` 钩子里捕获 `psm` 句柄；不改变任何电源行为。
+可选唤醒 `-NRedVCNPsmWake`（默认关）在 `Vega10VideoContext::contextStart` 返回成功且
+UVD0 队列非空后执行一次 PSM 序列：`GetStateByClassification(0x12)` → `SetUvdState` →
+`AdjustPowerState` → `UseAsicBlock(3)`；失败立即 `UnuseAsicBlock(3)`，客户端 stop 时释放。
+不写 `[0x1A0]`/`[0x190]`，不调用 `PhwRaven_PowerUpVCN/PowerDownVCN`。完整设计与判读见
+`docs/vcn1-psm-plan.md`。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -262,18 +272,20 @@ no-start 闸。
 
 ## 下一步
 
-1. **当前系统是 stock NootedRed（`30579C7E`）**：窗口实验 panic 后 EFI 已恢复为 stock，
-   `config.plist` 已恢复（`-NRedVCNInitWindow` 移除）。继续实验前先确认这台机器要装回
-   哪个构建；默认安全版是 build46（`D8326E76`，无 boot-arg）。
-2. **禁止**重试 `-NRedVCNInitWindow`：它复现了 build35 的 `readValidateReg32+0x8b`
-   TLB flush panic（47.3 秒）。同样禁止 build35/39/41/45 和 `-NRedVCNForceVCNPG0`。
-3. 如果继续，先装 build46 默认版做稳定性/观测验证（无窗口），再转向 **PSM 驱动的媒体
-   block 激活**：`PSM_UseAsicBlock`/`PSM_ActivateClient`/PEM 视频启动任务，或让
-   `PSM_ReArbit` 在 `[psm+0x5F0]`/`[0x690]` 置位后走 `PHM_PowerGateVCN(phm,0)`，
-   而不是从 NootedRed 裸调 `PhwRaven_PowerUpVCN`。
-4. 另一条线：查 `readValidateReg32` 卡住的寄存器访问（RIP +`0x1cabf` 前一条是
-   `mov edx,[rcx+rax]`），确认窗口里到底是 `loadUVDFW` 还是 `initHardwareCail` 的读
-   挂住了 GPU；这决定下一步是改固件装载路径还是改电源时序。
+1. 当前 EFI 已装 build47（`DBBC2952`/`E5F48284`），默认无 boot-arg：只观测，窗口与
+   PSM 唤醒都关闭。重启后空闲 60s + 播 30s QuickTime + dump，确认 `PsmWake*` 不出现、
+   `PsmWakeSymbols=31`、`InitPowerGate1A0Before/After=1`、`UnsafePoweredAtInit=0`，
+   系统稳定。
+2. 可选 PSM 唤醒实验（`docs/vcn1-psm-plan.md`）：备份 `config.plist` → 追加
+   `-NRedVCNPsmWake` → 重启 → 播 30s QuickTime → dump。判读 `PsmWakeRun`、
+   `PsmWakeGetStateResult`、`PsmWakeSetUvdResult`、`PsmWakeAdjustResult`、
+   `PsmWakeUseBlockResult`、`PsmWakeFlag5F0/690Before/After`、`PsmWake190Before/After`、
+   `PsmWakeVcnGateDelta`、`CailInitResult`、`InitHardwareCailRaw`。成功判据：flag 出现 1、
+   `VcnGateDelta>0`、`190After=0`；随后 `CailInitResult=0` 且 `InitHardwareCailRaw=1`。
+   实验后恢复 config.plist。
+3. 若 `GetStateResult!=1` 或 flag 仍为 0：按 `docs/vcn1-psm-plan.md` §2.5 查状态分类、
+   `PHM_isAdjustPowerStateBlocked` 与状态属性表；不要退回裸调 `PowerUpVCN`。
+4. **禁止** build35/39/41/45、`-NRedVCNInitWindow`、`-NRedVCNForceVCNPG0`。
 5. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
    先恢复 EFI/配置再重启。
 

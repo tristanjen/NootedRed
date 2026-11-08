@@ -1104,3 +1104,25 @@ block（`PSM_UseAsicBlock`/`PSM_ActivateClient`/PEM 视频启动，或让 `PSM_R
 DPG 由驱动自己的电源管理序列协调；另一条线是查清 `readValidateReg32` 卡住的具体
 寄存器（`loadUVDFW` 的 SML/PSP 读还是 `initHardwareCail` 的 `UVD_STATUS(0x83AF)` 读），
 再决定是改固件装载路径还是改电源时序。
+
+## 34. 第三十一轮：build47 的 PSM 驱动唤醒（不裸调 PowerUpVCN）
+
+build46 的窗口 panic 与 build35 同 RIP（`readValidateReg32+0x8b`）后，放弃“自己写
+`[0x1A0]` 再调 `PowerUpVCN`”的路线。重新反汇编 X5000HWLibs 后确认 PSM 的真实路径：
+
+- `PSM_UseAsicBlock(psm, block)` 只维护 `[psm + block*12 + 0x204]` 引用计数并调用
+  `_PHM_SetAsicBlockGating`（Raven 是空桩），不负责 VCN 电源。
+- `PSM_ReArbit` 在 `[psm+0x5F0]`/`[psm+0x690]`（VCN0/VCN1 目标状态）为 1 时调用
+  `PHM_PowerGateVCN(phm, 0, 0/1)`，为 0 时调用 `(phm, 1, 0/1)`；真正上电/下电在这里。
+- `PEM_Task_VideoStartMultiUVDStates` 的基本 UVD 分支（分类 `0x12`、block 3）顺序是
+  `PSM_GetStateByClassification` → `PSM_SetUvdState` → `PSM_AdjustPowerState` →
+  `PSM_UseAsicBlock`。`PSM_AdjustPowerState_Legacy` 是状态机，应用新 power state 时写
+  VCN 目标状态，再由 ReArbit 执行。
+
+build47（CDHash `DBBC2952`，UUID `E5F48284`）据此实现：
+
+- 默认只解析 PSM 状态机符号并捕获 `psm` 句柄，不改变电源行为。
+- `-NRedVCNPsmWake`（默认关）在 `Vega10VideoContext::contextStart` 成功且 UVD0 队列
+  非空后复刻上面的基本 UVD 序列；失败立即 `UnuseAsicBlock(3)`，客户端 stop 时释放。
+- 不写 `[0x1A0]`/`[0x190]`，不调用 `PhwRaven_PowerUpVCN/PowerDownVCN`。
+- 完整设计、属性表与判读见 `docs/vcn1-psm-plan.md`。
