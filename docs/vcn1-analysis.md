@@ -724,3 +724,45 @@ no-start 闸保持不变。
 - `PhmInitHooked=0` → 符号未导出或路由失败；改从 `_PSM_ReArbit` 或 `AMDHardware` 对象字段抓 PHM。
 - `PhmState1A0=1` 且 `InitPowerGate190After=1` → 驱动确实跳过了 PowerUpVCN，强制调用方向正确。
 - `PhmState190After` 仍为 1 → PowerUpVCN 失败，看 `RavenPowerUpResult`。
+
+## 22. 第十九轮：强制 PowerUpVCN 触发 panic，改为只读观测
+
+build35（CDHash `0E74697C`）实机连续两次 panic：
+
+- 11:11:53，启动后 43.1s，CPU 1/2/6/7 报 `NMIPI for unresponsive processor:
+  TLB flush timeout`；CPU 7 的 RIP 落在 `AMDRadeonX6000Framebuffer`
+  （0xffffff7f9d2d1abf），栈里还有 GPU 驱动多帧。
+- 11:20:15，启动后 40.5s，同样的 TLB flush timeout，随后 `IPI timeout,
+  unresponsive CPU bitmap: 0x1`。
+- 两份 panic 都没有 NootedRed 栈帧，但时间点与 build35 在 `PHM_Initialize` 返回后
+  强制调用 `PhwRaven_PowerUpVCN`（SMU message 2 + SOC15 寄存器写）完全吻合；40 秒
+  左右正是登录后 WindowServer/显示电源仲裁开始工作的时机。**build35 不安全，不要安装。**
+
+当前启动的 NootedRed 是 VCN 被拒绝的构建（`NRedVCNRejected=5`、
+`NRedVCNUserRejected=5`、`NRedVCNUserEnabled=0`），没有 VCN1 探测，系统稳定；
+这也解释了为什么当前 ioreg 里没有 `NRedVCN1*` 属性。
+
+补充发现：`[state+0x1A0]` 不是固件能力位，而是 `PhwRaven_Initialize` 从注册表键
+**`PP_EnableVCNPG`** 读出的覆盖值（`PECI_ReadRegistry`，0x47B72C7–0x47B72E6）。
+`PP_EnableVCNPG==1` 表示启用 VCN 电源门控，`TF_PhwRaven_InitPowerGateState` 会跳过
+初始化时的 `PowerUpVCN`；0 则让驱动自己在 init 任务里上电。这提供了一个比手动调
+SMU 更安全的入口：让驱动自己的 TF 走 `PowerUpVCN` 分支，而不是从 PHM 钩子里强行调用。
+
+build36（commit `428430a`，只读观测，不写 SMU/寄存器）：
+
+- 只路由 `_TF_PhwRaven_InitPowerGateState`：捕获 `phm`，记录 `[state+0x190]` 与
+  `[state+0x1A0]` 的前后值和函数返回值；原始函数照常执行。
+- **不**路由 `_PHM_Initialize`，**不**调用 `PhwRaven_PowerUpVCN`，不写任何寄存器。
+- `uvd7InitHardware` 只读 `PhmState190AtHardware`。
+- 保留 B4419BB1 的 engine `powerOnOff(true)` 诊断和 no-start 闸。
+
+判读：
+
+- `InitPowerGateSeen=1`、`InitPowerGate1A0Before=1`、`InitPowerGate190After=1`
+  → 驱动因 `PP_EnableVCNPG=1` 跳过上电；下一版在 TF hook 里**只**把 `[0x1A0]` 临时
+  清 0，让驱动自己的 TF 任务调用 `PowerUpVCN`（正确时机/锁上下文），而不是从 PHM 钩子
+  强行发 SMU。若仍 panic，再考虑把 `PP_EnableVCNPG` 作为设备属性注入为 0。
+- `InitPowerGateSeen=1`、`InitPowerGate190After=0` → 驱动自己已经上电；之前
+  UVD_STATUS=0 的原因在别处（时钟/复位或 CAIL 读取路径），查 PSM/时钟。
+- `InitPowerGateSeen` 缺失 → TF 未被调用（PHM 初始化走了别的 ASIC 路径），需要另找
+  入口（`PhwRaven_Initialize` 或 `PSM_ReArbit`）。

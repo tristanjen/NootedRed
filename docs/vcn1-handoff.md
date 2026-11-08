@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `428369b` VCN1: Power up the VCN domain through PHM and PhwRaven_PowerUpVCN；docs（本轮） |
+| 最新提交 | `428430a` VCN1: Observe the Raven power gate without writing SMU state；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -100,26 +100,38 @@ message 2 = PowerUpVcn）。`PHM_Initialize(pp,cfg)` 在 `pp+0x960` 分配 0x1AC
 `TF_PhwRaven_InitPowerGateState` 只有在 `[state+0x1A0]==0` 时才调 `PowerUpVCN`；Picasso 上很
 可能被跳过（§21）。
 
-诊断构建（build35，CDHash `0E74697C`，commit `428369b`）：路由 `_PHM_Initialize` 捕获 PHM
-扩展块，原始调用返回后若 `[state+0x190]!=0` 就强制置 1 并调用 `PhwRaven_PowerUpVCN`；同时
-路由 `_TF_PhwRaven_InitPowerGateState` 观测驱动自身行为，并在 `uvd7InitHardware` 里再补一次
-（`RavenPowerUpRetry`）。no-start 闸保持不变。
+**build35 不安全**（`0E74697C`，commit `428369b`）：它在 `PHM_Initialize` 返回后强制调用
+`PhwRaven_PowerUpVCN`（SMU message 2 + SOC15 寄存器写），实机连续两次 panic：
+11:11:53（启动后 43.1s）与 11:20:15（40.5s），均为 `TLB flush timeout`，CPU 7 卡在
+`AMDRadeonX6000Framebuffer`。**不要再安装 build35。** 当前启动的是 VCN 被拒绝的构建
+（`NRedVCNRejected=5`、`NRedVCNUserRejected=5`），系统稳定。
+
+补充：`[state+0x1A0]` 来自注册表键 `PP_EnableVCNPG`（`PhwRaven_Initialize` 读取）。
+`PP_EnableVCNPG==1` 表示启用 VCN 电源门控，驱动自己的 `TF_PhwRaven_InitPowerGateState`
+会跳过 init 时的 `PowerUpVCN`；0 则让驱动自己在 init 任务里上电。这比从 PHM 钩子强行发
+SMU 安全得多。
+
+安全观测构建（build36，commit `428430a`）：只路由 `_TF_PhwRaven_InitPowerGateState`，
+捕获 `phm` 并记录 `[state+0x190]`/`[state+0x1A0]` 的前后值；**不**路由 `_PHM_Initialize`、
+**不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
+no-start 闸。
 
 `CapUVD0`/`CapResult=0` 是 init 失败的后果：查询已经到达内核并写入了属性，但引擎没 start，能力为 0。
 
 ## 下一步
 
-1. 安装 build35（`0E74697C`，commit `428369b`）重启、播 30 秒 QuickTime，读 `PhmInitHooked`、
-   `PhmInitCalled`、`PhmInitResult`、`PhmState190`/`PhmState1A0`、`InitPowerGateSeen`、
-   `RavenPowerUpResult`、`PhmState190After`、`CailUvdStatusBefore`、`CailInitResult`。
-2. `PhmInitHooked=1`、`PhmInitResult=1`、`RavenPowerUpResult=1`、`PhmState190After=0`、
-   `CailUvdStatusBefore=0x2` → 电源域打通；下一版放开 no-start 闸（或加 `-NRedVCNAllowStart`）
-   试真正的 start/解码。
-3. `RavenPowerUpResult=2` → SMU 拒绝 message 2；hook `_Raven_SendMsgToSmc`/`_Raven_ReadArgFromSmc`
-   读真实响应，或改走 `PHM_PowerGateVCN(phm,0,0)`。
-4. `PhmInitHooked=0` → 符号未导出/路由失败；改从 `_PSM_ReArbit` 或 `AMDHardware` 对象字段抓 PHM。
-5. `PhmState1A0=1` 且 `InitPowerGate190After=1` → 驱动确实跳过 PowerUpVCN，强制调用方向正确；
-   若 `PhmState190After` 仍为 1，看 `RavenPowerUpResult`。
+1. 安装 build36（`428430a`，CDHash `38DA3C47`）重启、播 30 秒 QuickTime，读
+   `InitPowerGateSeen`、`InitPowerGateResult`、`InitPowerGate190Before/After`、
+   `InitPowerGate1A0Before/After`、`PhmState190AtHardware`、`CailUvdStatusBefore`、
+   `CailInitResult`。
+2. `InitPowerGateSeen=1`、`InitPowerGate1A0Before=1`、`InitPowerGate190After=1`
+   → 驱动因 `PP_EnableVCNPG=1` 跳过上电；下一版只在 TF hook 里临时清 `[0x1A0]`，让驱动
+   自己的 TF 任务调用 `PowerUpVCN`（正确时机/锁上下文），不要从 PHM 钩子强行发 SMU。
+3. `InitPowerGateSeen=1`、`InitPowerGate190After=0` → 驱动自己已经上电；之前 UVD_STATUS=0
+   的原因在别处（时钟/复位或 CAIL 读取路径），查 PSM/时钟。
+4. `InitPowerGateSeen` 缺失 → TF 未被调用；改从 `PhwRaven_Initialize` 或 `PSM_ReArbit` 找入口。
+5. 如果清理 `[0x1A0]` 后仍然 panic，考虑把 `PP_EnableVCNPG` 作为设备属性注入为 0，而不是在
+   kext 里写状态。
 
 ## 反汇编环境
 
