@@ -1515,13 +1515,20 @@ static int initPowerGateHook(void* phm)
     const auto result = reinterpret_cast<int (*)(void*)>(initPowerGateOriginal)(phm);
     const auto after190 = readState32(state, 0x190);
     const auto after1A0 = readState32(state, 0x1A0);
-    if (clearGate) { memcpy(static_cast<UInt8*>(state) + 0x1A0, &original1A0, sizeof(original1A0)); }
+    // 默认把 [0x1A0] 留在 0：PowerDownVCN 看到 0 会直接返回，不会把 VCN 重新门控。
+    // build38 恢复成 1 后，PSM 在 engine init 前把 [0x190] 又置回了 1（§24）。
+    const bool restoreGate = clearGate && checkKernelArgument("-NRedVCNRestorePG");
+    if (restoreGate) {
+        memcpy(static_cast<UInt8*>(state) + 0x1A0, &original1A0, sizeof(original1A0));
+    }
     NRed::singleton().setProp32("NRedVCN1InitPowerGateResult", static_cast<UInt32>(result));
     NRed::singleton().setProp32("NRedVCN1InitPowerGate190After", after190);
     NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0After", after1A0);
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Restored", clearGate ? 1 : 0);
-    SYSLOG("VCN1", "TF_PhwRaven_InitPowerGateState result=%d clear=%u 190=%u", result,
-           clearGate ? 1U : 0U, after190);
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Restored", restoreGate ? 1 : 0);
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0LeftZero",
+                                clearGate && !restoreGate ? 1 : 0);
+    SYSLOG("VCN1", "TF_PhwRaven_InitPowerGateState result=%d clear=%u restore=%u 190=%u", result,
+           clearGate ? 1U : 0U, restoreGate ? 1U : 0U, after190);
     return result;
 }
 
