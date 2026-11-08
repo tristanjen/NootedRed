@@ -198,6 +198,8 @@ else:
 
 - `GetStateResult != 1`：分类 0x12 在当前 power state 表里不存在；需要枚举
   `PSM_EnumerateAllStates` / `PSM_ListPresentClassifications`，找可用的 UVD 分类。
+  **build47 实测正是这一条**：15 = 0xF，状态未找到；build48 已加入分类位图枚举和
+  0x12/0x13/0x14/0x11 四个分类探测。
 - `SetUvdResult/AdjustResult` 成功但 flag 仍 0：`PSM_AdjustPowerState` 被
   `PHM_isAdjustPowerStateBlocked` 挡住，或选中的状态没有 VCN 属性；需要查
   `[psm+0x280]`（`PSM_ReArbitrateUVDState_Legacy` 会置 1）与状态属性表。

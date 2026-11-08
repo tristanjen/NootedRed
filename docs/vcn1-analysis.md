@@ -1126,3 +1126,33 @@ build47（CDHash `DBBC2952`，UUID `E5F48284`）据此实现：
   非空后复刻上面的基本 UVD 序列；失败立即 `UnuseAsicBlock(3)`，客户端 stop 时释放。
 - 不写 `[0x1A0]`/`[0x190]`，不调用 `PhwRaven_PowerUpVCN/PowerDownVCN`。
 - 完整设计、属性表与判读见 `docs/vcn1-psm-plan.md`。
+
+## 35. 第三十二轮：build47 唤醒返回 0xF；build48 分类探测
+
+2026-11-08 15:49 的 build47 `-NRedVCNPsmWake` 实测：
+
+- `PsmWakeRun=1`、`PsmWakeSymbols=31`、`PsmWake190Before=1`、
+  `PsmWakeFlag5F0/690Before=0`：触发点与安全前置都满足。
+- **`PsmWakeGetStateResult=15`**（0xF）、`PsmWakeStateIndex=0`、`PsmWakeFailed=1`；
+  `SetUvd/Adjust/UseBlock` 均未执行，PSM 没有上电，系统稳定运行。
+- 0xF 是 `PSM_GetStateByClassification_Legacy` 的“状态未找到”：
+  `PSM_SearchForState(psm, class, ...)` 遍历 `[psm+0x88]` 的状态链表，用
+  `PSM_StateMatchesClassification` 比较 `[state+0x28]`/`[state+0x2C]` 的分类位；
+  找不到时回退 `PSM_PSDT_EnumerateAllStates`，仍找不到才返回 0xF。
+  因此 **当前 PSM 状态表没有分类 0x12 的状态**，不是调用顺序/参数问题。
+
+静态补充：
+
+- `PSM_ListPresentClassifications(psm, UInt32* out)` 的 wrapper 在 `0x46BCDA4`
+  （`jmp [psm+0x6D8]`），Legacy 实现在 `0x46BE8A2`：清零 `*out` 后枚举全部状态，
+  `PSM_ListPresentClassifications_Callback`（`0x46BF555`）把分类 0..0x16 的存在
+  情况写成一个 24 位小端位图（bit N = 分类 N）。
+- 分类 0x11..0x14 对应位图 bit 17..20（byte2 的 bit1..bit4）。
+
+build48（CDHash `A5E04CEB`，UUID `A0F67623`）据此改为分类探测版：
+
+- 唤醒前调用 `PSM_ListPresentClassifications` 发布 `PsmWakeClassesMask`；
+- 依次探测 0x12→3、0x13→4、0x14→5、0x11→2，发布每个分类的 result/index；
+- 取第一个存在的分类，调用对应 `PSM_SetUvd*State` → `PSM_AdjustPowerState` →
+  `PSM_UseAsicBlock(block)`；
+- 四个都不存在则 `PsmWakeNoState=1`，释放并停止，不写任何电源状态。

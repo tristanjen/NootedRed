@@ -264,6 +264,21 @@ UVD0 队列非空后执行一次 PSM 序列：`GetStateByClassification(0x12)` �
 不写 `[0x1A0]`/`[0x190]`，不调用 `PhwRaven_PowerUpVCN/PowerDownVCN`。完整设计与判读见
 `docs/vcn1-psm-plan.md`。
 
+**build47 首轮唤醒实测（2026-11-08 15:49，`-NRedVCNPsmWake`）**：
+`PsmWakeRun=1`、`PsmWakeSymbols=31`、`PsmWake190Before=1`、`PsmWakeFlag5F0/690Before=0`，
+但 **`PsmWakeGetStateResult=15`**（0xF = 状态不存在）、`PsmWakeStateIndex=0`、
+`PsmWakeFailed=1`；后续 SetUvd/Adjust/UseBlock 未执行，PSM 未上电，系统稳定。
+0xF 来自 `PSM_GetStateByClassification_Legacy`：`PSM_SearchForState` 找不到分类 0x12，
+回退枚举全部状态后仍找不到。结论：**当前 PSM 状态表没有分类 0x12 的 UVD 状态**，
+不是调用顺序问题。
+
+build48（CDHash `A5E04CEB`，UUID `A0F67623`）：在唤醒前先调用
+`PSM_ListPresentClassifications` 枚举状态表实际存在的分类位（`PsmWakeClassesMask`），
+并依次探测 0x12/0x13/0x14/0x11 四个 UVD 分类（`PsmWakeClass12/13/14/11Result`），
+取第一个存在的分类和对应 block（0x12→3、0x13→4、0x14→5、0x11→2），再执行
+SetUvdX/AdjustPowerState/UseAsicBlock。仍不写 `[0x1A0]`/`[0x190]`、不直接调
+`PhwRaven_PowerUpVCN`。
+
 build36 设计：只路由 `_TF_PhwRaven_InitPowerGateState`，**不**路由 `_PHM_Initialize`、
 **不**调用 `PhwRaven_PowerUpVCN`、不写任何寄存器。保留 engine `powerOnOff(true)` 诊断和
 no-start 闸。
@@ -272,21 +287,24 @@ no-start 闸。
 
 ## 下一步
 
-1. 当前 EFI 已装 build47（`DBBC2952`/`E5F48284`），默认无 boot-arg：只观测，窗口与
-   PSM 唤醒都关闭。重启后空闲 60s + 播 30s QuickTime + dump，确认 `PsmWake*` 不出现、
-   `PsmWakeSymbols=31`、`InitPowerGate1A0Before/After=1`、`UnsafePoweredAtInit=0`，
-   系统稳定。
-2. 可选 PSM 唤醒实验（`docs/vcn1-psm-plan.md`）：备份 `config.plist` → 追加
-   `-NRedVCNPsmWake` → 重启 → 播 30s QuickTime → dump。判读 `PsmWakeRun`、
-   `PsmWakeGetStateResult`、`PsmWakeSetUvdResult`、`PsmWakeAdjustResult`、
-   `PsmWakeUseBlockResult`、`PsmWakeFlag5F0/690Before/After`、`PsmWake190Before/After`、
-   `PsmWakeVcnGateDelta`、`CailInitResult`、`InitHardwareCailRaw`。成功判据：flag 出现 1、
-   `VcnGateDelta>0`、`190After=0`；随后 `CailInitResult=0` 且 `InitHardwareCailRaw=1`。
-   实验后恢复 config.plist。
-3. 若 `GetStateResult!=1` 或 flag 仍为 0：按 `docs/vcn1-psm-plan.md` §2.5 查状态分类、
-   `PHM_isAdjustPowerStateBlocked` 与状态属性表；不要退回裸调 `PowerUpVCN`。
-4. **禁止** build35/39/41/45、`-NRedVCNInitWindow`、`-NRedVCNForceVCNPG0`。
-5. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
+1. **config.plist 恢复待完成**：build47 唤醒实验后，`-NRedVCNPsmWake` 仍留在 ESP 的
+   boot-args 里（管理员授权挂载卡住）。需要用管理员权限把
+   `~/Desktop/config.plist.bak-20261108-154732` 放回
+   `/Volumes/ESP_EFI/EFI/OC/config.plist`，并确认 boot-args 不再包含该开关。
+2. 恢复后安装 build48（`A5E04CEB`/`A0F67623`）默认版：重启 → 空闲 60s → 播 30s →
+   dump；期望 `PsmWake*` 不出现、`PsmWakeSymbols=511`、`InitPowerGate1A0/190=1`、
+   `UnsafePoweredAtInit=0`，系统稳定。
+3. 然后做分类探测实验：备份 config → 追加 `-NRedVCNPsmWake` → 重启 → 播 30s → dump。
+   重点读 `PsmWakeClassesMask`、`PsmWakeClass12/13/14/11Result`、`PsmWakeNoState`、
+   `PsmWakeClass`/`PsmWakeBlock`、`PsmWakeFlag5F0/690After`、`PsmWakeVcnGateDelta`、
+   `PsmWake190After`、`CailInitResult`、`InitHardwareCailRaw`。成功判据：某个分类存在、
+   flag 出现 1、`VcnGateDelta>0`、`190After=0`；随后 `CailInitResult=0` 且
+   `InitHardwareCailRaw=1`。实验后立即恢复 config.plist。
+4. 若四个分类都不存在（`PsmWakeNoState=1` 且 mask 的 0x11-0x14 位为 0）：说明当前
+   PPT/PSM 状态表没有 UVD 状态，需要转向 PSM 动态建状态或直接驱动 PEM 视频启动事件，
+   不要退回裸调 `PowerUpVCN`。
+5. **禁止** build35/39/41/45、`-NRedVCNInitWindow`、`-NRedVCNForceVCNPG0`。
+6. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
    先恢复 EFI/配置再重启。
 
 ## 反汇编环境
