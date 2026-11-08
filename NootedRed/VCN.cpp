@@ -2006,6 +2006,24 @@ void psmWakeVcn()
             chosenSetter = candidate.setter;
         }
     }
+    // 状态表里没有 UVD 分类时，按 CWDDEPM_PredictUVDStateSettings 的做法用分类 4
+    // （性能状态）作为 UVD 的基状态：SetUvdState 把 UVD precedence 9 指向 state 4，
+    // 再由 AdjustPowerState 让 PSM 自己决定是否给 VCN 上电。
+    if (getResult != 1) {
+        UInt32     index{0};
+        const auto probe = reinterpret_cast<int (*)(void*, UInt32, UInt32, UInt32*)>(
+            psmGetStateByClassification)(psm, 4, 0, &index);
+        NRed::singleton().setProp32("NRedVCN1PsmWakeClass4Result", static_cast<UInt32>(probe));
+        NRed::singleton().setProp32("NRedVCN1PsmWakeClass4Index", index);
+        if (probe == 1) {
+            getResult    = 1;
+            stateIndex   = index;
+            chosenClass  = 4;
+            chosenBlock  = 3;
+            chosenSetter = psmSetUvdState;
+            NRed::singleton().setProp32("NRedVCN1PsmWakeFallbackClass4", 1);
+        }
+    }
     NRed::singleton().setProp32("NRedVCN1PsmWakeGetStateResult", static_cast<UInt32>(getResult));
     NRed::singleton().setProp32("NRedVCN1PsmWakeStateIndex", stateIndex);
     NRed::singleton().setProp32("NRedVCN1PsmWakeClass", chosenClass);
