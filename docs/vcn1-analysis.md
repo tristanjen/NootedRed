@@ -673,3 +673,54 @@ no-start 闸保持不变。
   下一版放开 no-start 闸试真正的 start/解码。
 - `PowerForced=0` 或 status 仍为 0 → selector 3 不是电源消息/不足以上电，转 Raven 电源域
   （`PhwRaven_PowerUpVCN` / `_PHM_PowerGateVCN` 或 PhwRaven 的 SMU message 2 路径）。
+
+## 21. 第十八轮：selector 3 返回失败，转 PHM/SMU message 2
+
+11-08 11:0x dump（UUID `B4419BB1`）给出明确结果：
+
+- `PowerHooked=1`、`PowerForced=0`、`PowerDec=2`：手动 `enginePowerOriginal(self, true)`
+  返回 **false**，selector 3 没有把 UVD 打开。
+- `CailUvdStatusBefore/After=0`、`CailUvdStatusFirstBefore/After=0`、`CailInitResult=1`、
+  `InitHardwareCail=0`、`HardwareInitDec=0`、`StartDec=0`。
+- 固件与用户态读数不变：`LoadUVDFWFirst/Second=1`、`VCNUserApplied=16`、`DecoderPID=804`，
+  系统稳定，无冻结。
+
+反汇编补充：
+
+- `AMDHardware::powerUpHWEngines`（0x43CA39E）遍历 `[self+0x3B8+i*8]` 的 11 个引擎，逐个调用
+  `[engine_vt+0x138]`（即 `powerOnOff`）。我们的自定义引擎不在这个数组里（或注入晚于该调用），
+  所以 accelerator 从未对 VCN 引擎发 selector 3。
+- 真正的 VCN 电源域入口在 HWLibs：`PhwRaven_PowerUpVCN`（0x47BB071）。
+  - 读 `[phw+0xA0]` 的 ASIC 状态；若 `[state+0x190]==0`，直接返回 1（认为已上电）。
+  - 否则 `Raven_SendMsgToSmc(smc, 2)`（**SMU message 2 = PowerUpVcn**），再
+    `Raven_ReadArgFromSmc`；返回值 < `0x1E080` 视为失败（返回 2）。
+  - 成功后置 `[state+0x190]=0`，再发 `Raven_SendMsgToSmcWithParameter(smc, 0xC, ...)`；
+    `[state+0x1A0]==0` 时还写 SOC15 寄存器并等 0xC1。
+- `PhwRaven_PowerGateVCN(phw, gate)`：`gate!=0` → `PowerDownVCN`，`gate==0` → `PowerUpVCN`。
+- `PHM_Initialize(pp, cfg)`（0x467ECFD）在 `pp+0x960` 分配并初始化 0x1AC0 字节的 PHM
+  扩展块；`+0x88` = SMC 接口、`+0x90` = 第二个服务指针、`+0xA0` = ASIC 电源状态。
+  这个扩展块就是所有 `PhwRaven_*` 函数的 `phw` 参数。
+- 驱动自己的 `TF_PhwRaven_InitPowerGateState(phw)` 会先置 `[state+0x190]=1`，只有在
+  `[state+0x1A0]==0` 时才调用 `PowerUpVCN`。Picasso 上很可能是 `[0x1A0]!=0` 导致这一步被跳过，
+  VCN 域从未上电——与 UVD_STATUS 恒为 0 完全吻合。
+
+本轮构建（build35，CDHash `0E74697C`）：
+
+- 在 HWLibs 路由 `_PHM_Initialize`：进入时从 `pp+0x960` 捕获 PHM 扩展块；原始调用返回后读
+  `[state+0x190/0x1A0/0x194/0x1C4]`，若 `[0x190]!=0` 则强制置 1 并直接调用
+  `PhwRaven_PowerUpVCN(phm)`，发布 `RavenPowerUpResult`。
+- 路由 `_TF_PhwRaven_InitPowerGateState`：记录驱动自身是否调用、返回值以及 `0x190` 的前后值。
+- `uvd7InitHardware` 在 engine selector 3 之前若仍看到 `[0x190]!=0`，补一次 `PowerUpVCN`
+  （`RavenPowerUpRetry`）。
+- 保留 engine powerOnOff 强制调用和 no-start 闸。
+
+判读：
+
+- `PhmInitHooked=1`、`PhmInitCalled=1`、`PhmInitResult=1`、`RavenPowerUpResult=1`、
+  `PhmState190After=0`、`CailUvdStatusBefore=0x2` → 电源域打通，CAIL init 应成功；
+  下一版放开 no-start 闸，试真正的 start/解码。
+- `RavenPowerUpResult=2` → SMU 拒绝 message 2（参数 < 0x1E080 或发送失败）；下一步 hook
+  `_Raven_SendMsgToSmc` / `_Raven_ReadArgFromSmc` 读真实响应。
+- `PhmInitHooked=0` → 符号未导出或路由失败；改从 `_PSM_ReArbit` 或 `AMDHardware` 对象字段抓 PHM。
+- `PhmState1A0=1` 且 `InitPowerGate190After=1` → 驱动确实跳过了 PowerUpVCN，强制调用方向正确。
+- `PhmState190After` 仍为 1 → PowerUpVCN 失败，看 `RavenPowerUpResult`。

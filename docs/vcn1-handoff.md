@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `603fbde` VCN1: Power the UVD engine before initHardware；docs（本轮） |
+| 最新提交 | `428369b` VCN1: Power up the VCN domain through PHM and PhwRaven_PowerUpVCN；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
@@ -90,23 +90,36 @@ UVD 仍然没上电——问题在电源域，不在固件顺序。
 
 关键线索：dump 从不出现 `PowerDec`/`PowerEnc`，accelerator 根本没调用引擎的 `powerOnOff`。
 反汇编 `AMDUVDHWEngine::powerOnOff`（0x43D152A）只有几条指令：取 `[self+0x18]` 的 CAIL 客户端，
-固定发送 **selector 3**（忽略 `on` 参数），很可能是 UVD 电源/时钟消息。我们的自定义引擎没有进入
-accelerator 的电源流程，所以这条消息从没发出。
+固定发送 **selector 3**（忽略 `on` 参数）。但强制调用（`B4419BB1`，11-08 dump）返回
+`PowerForced=0`、`PowerDec=2`，UVD_STATUS 仍为 0：selector 3 只是下游使能，不是电源域开关。
 
-强制上电诊断构建（UUID `B4419BB1`，本轮）：在 `uvd7InitHardware` 里、原始 initHardware 之前，
-对解码引擎手动调用一次 `enginePowerOriginal(self, true)`，发布 `PowerHooked`/`PowerForced`/
-`PowerDec`。no-start 闸保持不变。
+`AMDHardware::powerUpHWEngines` 遍历 `[self+0x3B8+i*8]` 的 11 个引擎并调用 `[engine_vt+0x138]`，
+但我们的自定义引擎不在该数组；真正的电源域入口是 HWLibs 的 `PhwRaven_PowerUpVCN`（SMU
+message 2 = PowerUpVcn）。`PHM_Initialize(pp,cfg)` 在 `pp+0x960` 分配 0x1AC0 字节的 PHM
+扩展块，`+0x88`=SMC、`+0xA0`=ASIC 状态，该扩展块就是 `PhwRaven_*` 的 `phw` 参数。驱动自己的
+`TF_PhwRaven_InitPowerGateState` 只有在 `[state+0x1A0]==0` 时才调 `PowerUpVCN`；Picasso 上很
+可能被跳过（§21）。
+
+诊断构建（build35，CDHash `0E74697C`，commit `428369b`）：路由 `_PHM_Initialize` 捕获 PHM
+扩展块，原始调用返回后若 `[state+0x190]!=0` 就强制置 1 并调用 `PhwRaven_PowerUpVCN`；同时
+路由 `_TF_PhwRaven_InitPowerGateState` 观测驱动自身行为，并在 `uvd7InitHardware` 里再补一次
+（`RavenPowerUpRetry`）。no-start 闸保持不变。
 
 `CapUVD0`/`CapResult=0` 是 init 失败的后果：查询已经到达内核并写入了属性，但引擎没 start，能力为 0。
 
 ## 下一步
 
-1. 安装 `B4419BB1` 重启、播 30 秒 QuickTime，读 `PowerHooked`、`PowerForced`、
-   `CailUvdStatusAfter`、`CailInitResult`、`CailStartBlocked`。
-2. `PowerForced=1`、`After=0x2`、`CailInitResult=0` → 就是缺这条电源消息；下一版放开 no-start 闸
-   （或加 `-NRedVCNAllowStart`）试真正的 start/解码。
-3. `PowerForced=0` 或 `After` 仍为 0 → selector 3 不是电源消息/不足以上电，转 Raven 电源域
-   （`PhwRaven_PowerUpVCN` / `_PHM_PowerGateVCN`，或 PhwRaven 的 SMU message 2 路径）。
+1. 安装 build35（`0E74697C`，commit `428369b`）重启、播 30 秒 QuickTime，读 `PhmInitHooked`、
+   `PhmInitCalled`、`PhmInitResult`、`PhmState190`/`PhmState1A0`、`InitPowerGateSeen`、
+   `RavenPowerUpResult`、`PhmState190After`、`CailUvdStatusBefore`、`CailInitResult`。
+2. `PhmInitHooked=1`、`PhmInitResult=1`、`RavenPowerUpResult=1`、`PhmState190After=0`、
+   `CailUvdStatusBefore=0x2` → 电源域打通；下一版放开 no-start 闸（或加 `-NRedVCNAllowStart`）
+   试真正的 start/解码。
+3. `RavenPowerUpResult=2` → SMU 拒绝 message 2；hook `_Raven_SendMsgToSmc`/`_Raven_ReadArgFromSmc`
+   读真实响应，或改走 `PHM_PowerGateVCN(phm,0,0)`。
+4. `PhmInitHooked=0` → 符号未导出/路由失败；改从 `_PSM_ReArbit` 或 `AMDHardware` 对象字段抓 PHM。
+5. `PhmState1A0=1` 且 `InitPowerGate190After=1` → 驱动确实跳过 PowerUpVCN，强制调用方向正确；
+   若 `PhmState190After` 仍为 1，看 `RavenPowerUpResult`。
 
 ## 反汇编环境
 
