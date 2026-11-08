@@ -651,8 +651,23 @@ namespace
             NRed::singleton().setProp32("NRedVCN1PowerProbeRun", 0);
             return;
         }
+        // CAIL client 不是 [engine+0x18]，而是它虚表 +0x2B8 的 getter 返回的对象；
+        // adapter 在 client+0x20038。attachCailSubmit 成功时直接用缓存的 cailClient。
         void* client{nullptr};
-        memcpy(&client, static_cast<UInt8*>(engine) + 0x18, sizeof(client));
+        if (cailClient != 0) { client = reinterpret_cast<void*>(cailClient); }
+        else {
+            void* service{nullptr};
+            memcpy(&service, static_cast<UInt8*>(engine) + 0x18, sizeof(service));
+            if (service != nullptr) {
+                void** vptr{nullptr};
+                memcpy(&vptr, service, sizeof(vptr));
+                if (vptr != nullptr) {
+                    using ClientGetter = void* (*)(void*);
+                    auto* const getter = reinterpret_cast<ClientGetter>(vptr[0x2B8 / sizeof(void*)]);
+                    if (getter != nullptr) { client = getter(service); }
+                }
+            }
+        }
         void* adapter{nullptr};
         if (client != nullptr) { memcpy(&adapter, static_cast<UInt8*>(client) + 0x20038, sizeof(adapter)); }
         NRed::singleton().setProp32("NRedVCN1PowerProbeRun", 1);
@@ -674,6 +689,16 @@ namespace
             }
         }
         NRed::singleton().setProp32("NRedVCN1PowerProbeStatus", status);
+        if ((status & 2U) != 0) {
+            // 块已 idle：在同一个电源窗口里跑原生 initHardware（0x25D=1 → 跳过固件装载，
+            // 只走 CAIL init）；no-start 闸仍由 uvd7InitHardwareCail 的钩子控制。
+            const auto windowInit = reinterpret_cast<bool (*)(void*)>(uvd7InitHardwareOriginal)(engine);
+            NRed::singleton().setProp32("NRedVCN1PowerProbeWindowInit", windowInit ? 1 : 0);
+            NRed::singleton().setProp32("NRedVCN1PowerProbeStatusAfterInit",
+                                        (cailReadMmRegister != nullptr && adapter != nullptr)
+                                            ? cailReadMmRegister(adapter, 0x83AF)
+                                            : 0U);
+        }
         memcpy(static_cast<UInt8*>(state) + 0x1A0, &saved1A0, sizeof(saved1A0));
         const auto down = reinterpret_cast<int (*)(void*)>(ravenPowerDownOriginal)(phm);
         NRed::singleton().setProp32("NRedVCN1PowerProbeDownResult", static_cast<UInt32>(down));
@@ -1746,6 +1771,11 @@ static int psmReArbitHook(void* psm, const UInt32 reason)
     const auto calls     = __atomic_fetch_add(&psmReArbitCalls, 1U, __ATOMIC_RELAXED) + 1;
     const auto gateDelta = (vcnAfter - vcnBefore) + (uvdAfter - uvdBefore);
     if (calls <= 16 || gateDelta != 0) {
+        if (calls == 1) {
+            const auto caller = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
+            NRed::singleton().setProp32("NRedVCN1PsmReArbitCaller", static_cast<UInt32>(caller));
+            NRed::singleton().setProp32("NRedVCN1PsmReArbitCallerHi", static_cast<UInt32>(caller >> 32));
+        }
         const auto psmValue = reinterpret_cast<mach_vm_address_t>(psm);
         NRed::singleton().setProp32("NRedVCN1PsmHandle", static_cast<UInt32>(psmValue & 0xFFFFFFFFULL));
         NRed::singleton().setProp32("NRedVCN1PsmHandleHi", static_cast<UInt32>(psmValue >> 32));
@@ -1767,11 +1797,21 @@ static int psmActivateClientHook(void* psm, const UInt32 client, const UInt32 ar
         psm, client, arg2, arg3, arg4);
     const auto calls = __atomic_fetch_add(&psmActivateClientCalls, 1U, __ATOMIC_RELAXED) + 1;
     if (calls <= 16) {
+        // 调用者地址：用来反查是哪条驱动路径在向 PSM 注册客户端（client 3 尤其关键）。
+        const auto caller = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
         NRed::singleton().setProp32("NRedVCN1PsmActivateClientCalls", calls);
         NRed::singleton().setProp32("NRedVCN1PsmActivateClientLast", client);
         NRed::singleton().setProp32("NRedVCN1PsmActivateClientArg2", arg2);
         NRed::singleton().setProp32("NRedVCN1PsmActivateClientArg3", arg3);
+        NRed::singleton().setProp32("NRedVCN1PsmActivateClientArg4", arg4);
         NRed::singleton().setProp32("NRedVCN1PsmActivateClientResult", static_cast<UInt32>(result));
+        NRed::singleton().setProp32("NRedVCN1PsmActivateClientCaller", static_cast<UInt32>(caller));
+        NRed::singleton().setProp32("NRedVCN1PsmActivateClientCallerHi", static_cast<UInt32>(caller >> 32));
+        if (client == 3) {
+            NRed::singleton().setProp32("NRedVCN1PsmActivateClient3Caller", static_cast<UInt32>(caller));
+            NRed::singleton().setProp32("NRedVCN1PsmActivateClient3CallerHi",
+                                        static_cast<UInt32>(caller >> 32));
+        }
     }
     return result;
 }
