@@ -50,6 +50,10 @@ namespace
     bool                    cailRetryActive{false};
     mach_vm_address_t       engineStartOriginal{0}, enginePowerOriginal{0};
     mach_vm_address_t       engineRingsOriginal{0}, engineChannelsOriginal{0};
+    // 电源管理：PHM_Initialize(pp, cfg) 把扩展块分配在 pp+0x960，该扩展块就是
+    // PhwRaven_PowerUpVCN 的句柄（+0x88 = SMC 接口，+0xA0 = ASIC 电源状态）。
+    mach_vm_address_t       phmInitializeOriginal{0}, phwRavenPowerUpVCN{0}, initPowerGateOriginal{0};
+    void*                   phmHandle{nullptr};
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -87,6 +91,13 @@ namespace
                                        "IAMDHWChannel"};
     constexpr unsigned    lengths[] = {37, 35, 30, 28};
     UInt32                hardwareInitCount{0};
+
+    UInt32 readState32(const void* state, const size_t offset)
+    {
+        UInt32 value{0};
+        if (state != nullptr) { memcpy(&value, static_cast<const UInt8*>(state) + offset, sizeof(value)); }
+        return value;
+    }
 
     bool supported()
     {
@@ -608,6 +619,27 @@ namespace
         NRed::singleton().setProp32("NRedVCN1HardwareEarlyFlag", early);
         NRed::singleton().setProp32("NRedVCN1HardwareSkipFirmware", skipFirmware);
         NRed::singleton().setProp32(isEncode ? "NRedVCN1HardwareBaseEnc" : "NRedVCN1HardwareBaseDec", base);
+        // VCN 电源域由 PHM/SMU 控制。PHM 初始化时已经补发过一次 SMU message 2；
+        // 如果状态仍是「已门控」，在 CAIL 之前再补一次，避免 engine powerOnOff 反复失败。
+        void* phm = __atomic_load_n(&phmHandle, __ATOMIC_ACQUIRE);
+        NRed::singleton().setProp32("NRedVCN1PhmHandlePresent", phm != nullptr);
+        if ((isEncode & 1U) == 0 && phm != nullptr) {
+            void* state{nullptr};
+            memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state));
+            const auto gated = readState32(state, 0x190);
+            NRed::singleton().setProp32("NRedVCN1PhmState190AtHardware", gated);
+            if (state != nullptr && gated != 0 && phwRavenPowerUpVCN != 0) {
+                static UInt32 powerRetryCount{0};
+                if (__atomic_fetch_add(&powerRetryCount, 1U, __ATOMIC_RELAXED) == 0) {
+                    const UInt32 forced{1};
+                    memcpy(static_cast<UInt8*>(state) + 0x190, &forced, sizeof(forced));
+                    const auto powered = reinterpret_cast<int (*)(void*)>(phwRavenPowerUpVCN)(phm);
+                    NRed::singleton().setProp32("NRedVCN1RavenPowerUpRetry", static_cast<UInt32>(powered));
+                    NRed::singleton().setProp32("NRedVCN1PhmState190AfterRetry", readState32(state, 0x190));
+                    SYSLOG("VCN1", "raven PowerUpVCN retry result=%d", powered);
+                }
+            }
+        }
         // accelerator 从未调用引擎的 powerOnOff（PowerDec 缺失）；UVD 电源域因此没打开。
         // 诊断：解码引擎第一次 initHardware 前手动上电一次，观察 UVD_STATUS 是否变化。
         NRed::singleton().setProp32("NRedVCN1PowerHooked", enginePowerOriginal != 0);
@@ -1467,6 +1499,66 @@ static int cailUvdInitHook(void* adapter, void* input)
     return result;
 }
 
+// PHM 扩展块：PHM_Initialize 在 pp+0x960 分配 0x1AC0 字节的电源管理对象，
+// 驱动的 TF_PhwRaven_InitPowerGateState 会先把 +0x190 置 1 再发 SMU message 2。
+// Picasso 上这一步可能因 +0x1A0 被跳过，UVD 块就从未上电；这里在 PHM 初始化返回后强制补一次。
+static void publishPhmState(const char* k190, const char* k1a0, const char* k194, const char* k1c4)
+{
+    void* phm = __atomic_load_n(&phmHandle, __ATOMIC_ACQUIRE);
+    void* state{nullptr};
+    if (phm != nullptr) { memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state)); }
+    if (state == nullptr) { return; }
+    NRed::singleton().setProp32(k190, readState32(state, 0x190));
+    NRed::singleton().setProp32(k1a0, readState32(state, 0x1A0));
+    NRed::singleton().setProp32(k194, readState32(state, 0x194));
+    NRed::singleton().setProp32(k1c4, readState32(state, 0x1C4));
+}
+
+static int phmInitializeHook(void* pp, void* config)
+{
+    void* phm{nullptr};
+    if (pp != nullptr) { memcpy(&phm, static_cast<UInt8*>(pp) + 0x960, sizeof(phm)); }
+    if (phm != nullptr) { __atomic_store_n(&phmHandle, phm, __ATOMIC_RELEASE); }
+    NRed::singleton().setProp32("NRedVCN1PhmInitCalled", 1);
+    if (phm != nullptr) {
+        const auto value = reinterpret_cast<mach_vm_address_t>(phm);
+        NRed::singleton().setProp32("NRedVCN1PhmHandle", static_cast<UInt32>(value & 0xFFFFFFFFULL));
+        NRed::singleton().setProp32("NRedVCN1PhmHandleHi", static_cast<UInt32>(value >> 32));
+    }
+    const auto result = reinterpret_cast<int (*)(void*, void*)>(phmInitializeOriginal)(pp, config);
+    NRed::singleton().setProp32("NRedVCN1PhmInitResult", static_cast<UInt32>(result));
+    publishPhmState("NRedVCN1PhmState190", "NRedVCN1PhmState1A0", "NRedVCN1PhmState194",
+                    "NRedVCN1PhmState1C4");
+    if (result == 1 && phm != nullptr && phwRavenPowerUpVCN != 0) {
+        void* state{nullptr};
+        memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state));
+        if (state != nullptr) {
+            const UInt32 forced{1};
+            memcpy(static_cast<UInt8*>(state) + 0x190, &forced, sizeof(forced));
+            const auto powered = reinterpret_cast<int (*)(void*)>(phwRavenPowerUpVCN)(phm);
+            NRed::singleton().setProp32("NRedVCN1RavenPowerUpResult", static_cast<UInt32>(powered));
+            publishPhmState("NRedVCN1PhmState190After", "NRedVCN1PhmState1A0After",
+                            "NRedVCN1PhmState194After", "NRedVCN1PhmState1C4After");
+            SYSLOG("VCN1", "PHM PowerUpVCN result=%d", powered);
+        }
+    }
+    return result;
+}
+
+static int initPowerGateHook(void* phm)
+{
+    void* state{nullptr};
+    if (phm != nullptr) { memcpy(&state, static_cast<UInt8*>(phm) + 0xA0, sizeof(state)); }
+    NRed::singleton().setProp32("NRedVCN1InitPowerGateSeen", 1);
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate190Before", readState32(state, 0x190));
+    const auto result = reinterpret_cast<int (*)(void*)>(initPowerGateOriginal)(phm);
+    NRed::singleton().setProp32("NRedVCN1InitPowerGateResult", static_cast<UInt32>(result));
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate190After", readState32(state, 0x190));
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0", readState32(state, 0x1A0));
+    SYSLOG("VCN1", "TF_PhwRaven_InitPowerGateState result=%d", result);
+    return result;
+}
+
 void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
 {
     if (!vcn1Device()) { return; }
@@ -1491,5 +1583,26 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
         reinterpret_cast<UInt32 (*)(void*, UInt32)>(patcher.solveSymbol(id, "_ulReadMmRegisterUlong"));
     patcher.clearError();
     NRed::singleton().setProp32("NRedVCN1CailMmioReadResolved", cailReadMmRegister != nullptr);
+    // VCN 电源域：PHM_Initialize 的扩展块 + PhwRaven_PowerUpVCN 是 SMU message 2 的入口。
+    phwRavenPowerUpVCN = patcher.solveSymbol(id, "_PhwRaven_PowerUpVCN");
+    patcher.clearError();
+    NRed::singleton().setProp32("NRedVCN1RavenPowerUpResolved", phwRavenPowerUpVCN != 0);
+    KernelPatcher::RouteRequest phmRoute{"_PHM_Initialize", phmInitializeHook, phmInitializeOriginal};
+    if (!patcher.routeMultiple(id, &phmRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1PhmInitHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1PhmInitHooked", 1);
+    }
+    KernelPatcher::RouteRequest gateRoute{"_TF_PhwRaven_InitPowerGateState", initPowerGateHook,
+                                          initPowerGateOriginal};
+    if (!patcher.routeMultiple(id, &gateRoute, 1, slide, size)) {
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedVCN1InitPowerGateHooked", 0);
+    }
+    else {
+        NRed::singleton().setProp32("NRedVCN1InitPowerGateHooked", 1);
+    }
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
