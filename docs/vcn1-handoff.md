@@ -11,7 +11,7 @@ Ryzen 5 3500U（Picasso，iGPU `1002:15D8`，VCN 1.0）在 macOS 15.8.1 (24H32) 
 | 分支 | `vcn1-upstream`（基于 upstream/master `690e6c5` 重放 VCN1 增量） |
 | 主检出 | `/Users/tristanjen/Desktop/NootedRed`（含切片与 capstone） |
 | 工作树 | `/Users/tristanjen/Desktop/NootedRed/build/up-tree` ← 在这里改代码/构建 |
-| 最新提交 | `6218a05` VCN1: Observe PSM_ReArbit, the real VCN gate caller on Raven；docs（本轮） |
+| 最新提交 | `66c842a` VCN1: Observe PSM_ReArbit, the real VCN gate caller on Raven；docs（本轮） |
 
 **规则**：每次改完文件都要提交并 push：
 
