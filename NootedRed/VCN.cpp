@@ -1487,9 +1487,10 @@ static int cailUvdInitHook(void* adapter, void* input)
     return result;
 }
 
-// 只观测：驱动的 TF_PhwRaven_InitPowerGateState 会决定是否调用 PhwRaven_PowerUpVCN。
-// 上一版在 PHM_Initialize 返回后强制调用 PowerUpVCN，约 40 秒后 GPU/显示路径出现
-// TLB flush 超时 panic（§22）；这一版保留驱动自己的调用，只记录状态和返回值，不写硬件。
+// 驱动的 TF_PhwRaven_InitPowerGateState 会根据 [state+0x1A0] 决定是否调 PowerUpVCN。
+// build37 的 CAIL_PP_EnableVCNPG=0 已经出现在 IGPU@0 的属性里，但驱动读到的 [0x1A0]
+// 仍是 1（§23），所以这里在 TF 入口临时把 [0x1A0] 清 0，让驱动自己的 TF 走完整的
+// PowerUpVCN 分支；调用后恢复原值。传 -NRedVCNNoForcePG 可跳过这次写入（安全回退）。
 static int initPowerGateHook(void* phm)
 {
     if (phm != nullptr) { __atomic_store_n(&phmHandle, phm, __ATOMIC_RELEASE); }
@@ -1500,14 +1501,27 @@ static int initPowerGateHook(void* phm)
         NRed::singleton().setProp32("NRedVCN1PhmHandle", static_cast<UInt32>(value & 0xFFFFFFFFULL));
         NRed::singleton().setProp32("NRedVCN1PhmHandleHi", static_cast<UInt32>(value >> 32));
     }
+    const auto original1A0 = readState32(state, 0x1A0);
     NRed::singleton().setProp32("NRedVCN1InitPowerGateSeen", 1);
     NRed::singleton().setProp32("NRedVCN1InitPowerGate190Before", readState32(state, 0x190));
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Before", readState32(state, 0x1A0));
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Before", original1A0);
+    const bool clearGate =
+        state != nullptr && original1A0 != 0 && !checkKernelArgument("-NRedVCNNoForcePG");
+    if (clearGate) {
+        const UInt32 zero{0};
+        memcpy(static_cast<UInt8*>(state) + 0x1A0, &zero, sizeof(zero));
+        NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Cleared", 1);
+    }
     const auto result = reinterpret_cast<int (*)(void*)>(initPowerGateOriginal)(phm);
+    const auto after190 = readState32(state, 0x190);
+    const auto after1A0 = readState32(state, 0x1A0);
+    if (clearGate) { memcpy(static_cast<UInt8*>(state) + 0x1A0, &original1A0, sizeof(original1A0)); }
     NRed::singleton().setProp32("NRedVCN1InitPowerGateResult", static_cast<UInt32>(result));
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate190After", readState32(state, 0x190));
-    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0After", readState32(state, 0x1A0));
-    SYSLOG("VCN1", "TF_PhwRaven_InitPowerGateState result=%d", result);
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate190After", after190);
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0After", after1A0);
+    NRed::singleton().setProp32("NRedVCN1InitPowerGate1A0Restored", clearGate ? 1 : 0);
+    SYSLOG("VCN1", "TF_PhwRaven_InitPowerGateState result=%d clear=%u 190=%u", result,
+           clearGate ? 1U : 0U, after190);
     return result;
 }
 
