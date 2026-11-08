@@ -798,3 +798,21 @@ build37（CDHash `A73797F8`）已把新 XML 嵌入二进制。安装后预期：
 - `CailInitResult=0`（如果 CAIL 初始化随后成功）。
 - 如果 `1A0Before` 仍为 1，说明属性没落在 `IGPU@0` 上或读取路径不同；退回在 TF hook 里
   临时清 `[0x1A0]`。
+
+### build37 实测（11-08 12:0x dump）
+
+`CAIL_PP_EnableVCNPG=0` 已经出现在 `IGPU@0` 的 ioreg 属性里（顶层和
+`cail_properties` 字典都能看到），但驱动仍然读到 `[state+0x1A0]=1`：
+`InitPowerGate1A0Before/After=1`、`InitPowerGate190After=1`、
+`PhmState190AtHardware=1`、`CailUvdStatusBefore/After=0`、`CailInitResult=1`。
+系统稳定。说明属性注入成功，但 `PhwRaven_Initialize` 读取的时机/对象与 IGPU@0 上这份
+属性不一致（可能读发生在 `setupCAIL` 展平 `cail_properties` 之前，或读的是另一个
+IOPCIDevice 实例）。
+
+### build38（commit `e870420`，CDHash `6BAB212F`）：在驱动自己的 TF 任务里清 `[0x1A0]`
+
+`initPowerGateHook` 在调用原始 `TF_PhwRaven_InitPowerGateState` 之前，把
+`[state+0x1A0]` 临时清 0，让驱动自己的 TF 走完整的 `PowerUpVCN` 分支（message 2 +
+message 0xC + SOC15 寄存器写/等待）；调用后恢复原值。新增
+`InitPowerGate1A0Cleared`/`Restored` 探针。传 `-NRedVCNNoForcePG` 可跳过这次写入
+（安全回退）。
