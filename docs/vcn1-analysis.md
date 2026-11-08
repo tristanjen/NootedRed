@@ -909,3 +909,37 @@ build41（CDHash `37DF0FD4`，commit `a5a2085`）：
   `PhmPowerGateVCNCalls/LastOn/Result/190Before/190After`、
   `InitHardwareCailRaw`（no-start 闸之前的真实结果）。
 - probe 仍默认关闭，不强制 powerOnOff；预期系统稳定。
+
+## 28. 第二十五轮：build41 冻屏/panic，build42 回到安全默认并观测 PSM
+
+build41（CDHash `37DF0FD4`，UUID `90A2B51D`，commit `a5a2085`）实机：
+
+- 13:07 安装，13:14:53 冻屏后 panic，`System uptime` 45.6s。
+- panic 类型：`NMIPI for spinlock acquisition timeout`；CPU 4 的 fseventsd 线程在
+  VFS 路径（`read` → ... → `thread_block_reason`）上持有 spinlock 阻塞，其余 CPU
+  超时；栈里没有 NootedRed / AMD 帧。
+- 时间点（40–46s）与 build35（强制 PowerUpVCN、VCN 持续上电后 TLB flush 超时）
+  属于同一类；build41 是该次启动唯一增量。**判定 build41 不安全，EFI 回滚到 build40**
+  （当前实机 kextstat UUID `FEB0F272`）。
+
+根因链：PECI 强制 `PP_EnableVCNPG=0` → `PhwRaven_Initialize` 写 `[state+0x1A0]=0`
+→ `TF_PhwRaven_InitPowerGateState` 调 `PowerUpVCN`（VCN 上电）
+→ 之后所有 `PhwRaven_PowerDownVCN` 因 `[0x1A0]==0` 直接返回
+→ VCN 在 PSM 之外持续上电，PSM 内部状态与真实电源域不一致。
+
+build42（CDHash `D23DDE55`，UUID `3B0F0DA8`，commit `eb260d6`）：
+
+- PECI 强制改为 `-NRedVCNForceVCNPG0` 门控，默认放行原值；只保留
+  `PeciVCNPGCalls/Raw/Result` 观测（回答 build37 的属性为何读不到）。
+- 默认行为回到 build40：不写 `[0x1A0]`/`[0x190]`、不调 PowerUp/DownVCN、
+  probe 关闭、不强制 powerOnOff。
+- 新增只读观测：
+  - `_PSM_UseAsicBlock`（block 2/3/6 是 PEM 视频启动任务使用的媒体 block）
+    → `PsmUseAsicBlockCalls/LastBlock/LastResult/BlockMask`；
+  - `_PHM_PowerGateUVD` → `PhmPowerGateUVDCalls/LastOn/Result/190Before/190After`；
+  - `UnsafePoweredAtInit` = `[state+0x190]==0`（引擎 init 时 VCN 仍上电）→ 1。
+- 判据：默认路径应为 `InitPowerGate1A0Before=1`、`UnsafePoweredAtInit=0`。
+  若播放时 `PsmUseAsicBlockBlockMask` 出现 bit 2/3/6 或 `PhmPowerGateVCN/UVD`
+  的 `LastOn=0`，说明 PSM 自己会激活媒体 block，下一步在 PSM 上电后的安全时间点
+  一次性重跑引擎 `initHardware`（保留 no-start 闸）；若 PSM 计数全 0，则改从
+  视频上下文路径调用 `PSM_UseAsicBlock`/`PSM_ActivateClient`，不再裸发 `PowerUpVCN`。
