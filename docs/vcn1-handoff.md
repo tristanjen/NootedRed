@@ -360,6 +360,14 @@ build54：删除 build53 的运行期 vtable 槽改写与 `cpSlot248Hook`，保�
 `LoadUVDFWCpObj/Slot248` 诊断和 build52 的 CP/SML 钩子。构建产物与 build52 完全一致
 （CDHash `D3162664`，UUID `4FC4E5CF`）。
 
+build55（CDHash `1A47DC9E`，UUID `21C20B40`）：只读调查版，默认启动，不写任何电源状态。
+遍历 PSM 状态链表并发布 `PsmDumpClassesMask`、`PsmDumpStateCount`、`PsmS0Id/Class/Flags/Del`
+与属性区 `PsmS0A0..A7`、`PsmS1Id/Class/Flags/Del`；读取 `[phm]` 的 `pp`，调用
+`PptRaven_GetNumberOfPowerPlayTableEntries` 发布 `PsmDumpPptCountResult/PptEntries`，
+调用 `PptRaven_GetNumberOfVCEStateTableEntries`/`GetVCEStateTableEntry` 与
+`PEM_CWDDEPM_GetUVDStateNum/Info` 确认返回值。静态已知：后三组在 Raven 上分别是
+0 / 1 / 3 的空桩。
+
 ## 下一步
 
 1. **build49 分类 4 兜底实测失败**（2026-11-08 21:48）：`PsmWakeClass4Result/Index=1/1`、
@@ -369,10 +377,13 @@ build54：删除 build53 的运行期 vtable 槽改写与 `cpSlot248Hook`，保�
    PSM 分类路线到此为止**，不要再试 0x11–0x14 或分类 4。
 2. **config.plist 已恢复**：当前 boot-args 不含 `-NRedVCNPsmWake`；build49 分类路线已结束，
    不再重试。
-3. **build54 = build52**（CDHash `D3162664`/UUID `4FC4E5CF`）已安装并验证稳定；
-   冻屏/panic **与 Chrome 无关**，根因是 vtable 槽接管（已删除）。**禁止重新加回
-   vtable 槽接管。** 若要继续硬件解码，转 PSM 动态建状态/CWDDEPM，或直接驱动 PEM
-   视频启动任务。
+3. **build54 稳定性已确认**（与 Chrome 无关；vtable 槽接管已删除，禁止重加）。
+   build55（CDHash `1A47DC9E`/UUID `21C20B40`）已装，只读调查 PSM 状态链表与 PPT：
+   读 `PsmDumpRun`、`PsmDumpClassesMask`、`PsmDumpStateCount`、`PsmS0Id/Class/Flags/Del`、
+   `PsmS0A0..A7`、`PsmS1Id/Class/Flags/Del`、`PsmDumpPpPresent`、`PsmDumpPptCountResult`、
+   `PsmDumpPptEntries`、`PsmDumpVceCountResult/Entries`、`PsmDumpVceEntryResult`、
+   `PsmDumpCwddeUvdNum/Info`。判读：若 `PsmS0A0..A7` 出现非零 VCN/VCE 时钟字段或
+   `PptEntries>0` 且有可用状态，再做 A；若全是 0/桩，说明 PSM 路径不可达，B 也只会 0xF。
 4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
    /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
    `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。

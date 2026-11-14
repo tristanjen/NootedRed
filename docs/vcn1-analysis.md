@@ -1353,3 +1353,25 @@ build54：删除 `cpSlot248Hook`、`cpSlot248*` 全局量和 `loadUVDFW` 里的 
 保留只读的 `LoadUVDFWCpObj/Slot248` 诊断与 build52 的 CP/SML 钩子。由于 build53 的
 唯一代码增量就是槽接管，build54 的构建产物与 build52 **逐字节一致**
 （CDHash `D3162664`，UUID `4FC4E5CF`）。
+
+## 42. 第三十九轮：只读调查 PSM 状态表与 PPT 的 UVD 状态来源
+
+先做静态结论（X5000HWLibs）：
+
+- `PptRaven_GetNumberOfVCEStateTableEntries`（`0x47BD080`）= `xor eax,eax; ret` → 0。
+- `PptRaven_GetVCEStateTableEntry`（`0x47BD088`）= `mov eax,1; ret` → 空桩。
+- `PhwRaven_GetVCEStateTableEntry`（`0x47B80C3`）= `mov eax,1; ret` → 空桩。
+- `PEM_CWDDEPM_GetUVDStateNum`/`GetUVDStateInfo` = `mov eax,3; ret` → 3，不填 info。
+- 只有 `PptRaven_GetPowerPlayTableEntry`（`0x47BD161`）是真实解析函数；它从
+  `pp+0xB0` 的 PPT 读主表条目。
+
+也就是说 Raven 上没有独立的 VCE/UVD 状态表；UVD 状态来源只剩 PPT 主表条目或手工构造。
+
+build55（CDHash `1A47DC9E`，UUID `21C20B40`）做只读运行时确认：
+
+- 遍历 PSM 状态链表（`psm+0x88` → `[psdt+8]`，next `[state+0x18]`），发布
+  `PsmS0Id/Class/Flags/Del`、`PsmS0A0..A7`（`+0x40..0x5C` 原始 dword）与
+  `PsmS1Id/Class/Flags/Del`；
+- 调 `PptRaven_GetNumberOfPowerPlayTableEntries(pp, &count)` 发布条目数；
+- 调 VCE/UVD 取数桩与 CWDDEPM 桩确认运行时返回值；
+- 全部只读，不写任何电源状态，默认启动。
