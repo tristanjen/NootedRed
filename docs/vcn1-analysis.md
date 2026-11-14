@@ -1340,8 +1340,9 @@ build53 实机（UUID `7DEA5250`）连续两份 panic：
   同一 UUID、同一 `RSI/RDX/R8/R9` 组合、同一进程。
 
 结论：`cpSlot248Hook` 调用 `[self+0x20] vtable+0x248` 的“原值”时，原值并不是可调用的
-函数指针（chained fixup/数据目标），我们把它当函数调用导致 page fault。Chrome 的
-硬件加速只是触发 VTDecoderXPCService 走视频解码、到达这条路径的引信。
+函数指针（chained fixup/数据目标），我们把它当函数调用导致 page fault。**与 Chrome
+无关**；任何走到视频解码初始化的应用都会到达这条路径（当时线程是
+`VTDecoderXPCService`）。
 
 另一份 `Kernel-2026-11-15-001216.panic`（UUID `4FC4E5CF`，build52）是
 `[PPLIB] Failed to send PPLIB IRI to Accelerator`（`AmdRadeonController.cpp:2022`，

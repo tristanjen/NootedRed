@@ -347,8 +347,9 @@ boot-arg。
 两份 panic（`Kernel-2026-11-14-162637.panic`、`Kernel-2026-11-15-003554.panic`）
 都是 NootedRed UUID `7DEA5250`，RIP 落在 **NootedRed 自己的代码段**，`RSI=0xf47b52f000`、
 `R8/R9=1`、`RDX=0xffc10a0000`（fault 地址），进程 **VTDecoderXPCService**。
-即 `cpSlot248Hook` 调用原槽位时跳到了非函数指针（原值是 chained fixup/数据目标），
-Chrome 的硬件加速只是触发视频解码、走到这条路径的引信。**槽接管已删除，禁止重加。**
+即 `cpSlot248Hook` 调用原槽位时跳到了非函数指针（原值是 chained fixup/数据目标）。
+**与 Chrome 无关**；任何触发视频解码初始化的应用都会到达这条路径（当时线程是
+`VTDecoderXPCService`）。**槽接管已删除，禁止重加。**
 
 另外 `Kernel-2026-11-15-001216.panic`（NootedRed UUID `4FC4E5CF`，build52）是
 `[PPLIB] Failed to send PPLIB IRI to Accelerator`（`AmdRadeonController.cpp:2022`，
@@ -368,9 +369,10 @@ build54：删除 build53 的运行期 vtable 槽改写与 `cpSlot248Hook`，保�
    PSM 分类路线到此为止**，不要再试 0x11–0x14 或分类 4。
 2. **config.plist 已恢复**：当前 boot-args 不含 `-NRedVCNPsmWake`；build49 分类路线已结束，
    不再重试。
-3. **build54 = build52**（CDHash `D3162664`/UUID `4FC4E5CF`）已安装，先做稳定性验证：
-   重启 → 空闲 60s → 播 30s → dump。建议先**关闭 Chrome 硬件加速**确认不冻屏，再开启，
-   以区分 vtable 槽问题与 PPLIB/IRI 路径。**禁止重新加回 vtable 槽接管。**
+3. **build54 = build52**（CDHash `D3162664`/UUID `4FC4E5CF`）已安装并验证稳定；
+   冻屏/panic **与 Chrome 无关**，根因是 vtable 槽接管（已删除）。**禁止重新加回
+   vtable 槽接管。** 若要继续硬件解码，转 PSM 动态建状态/CWDDEPM，或直接驱动 PEM
+   视频启动任务。
 4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
    /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
    `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。
