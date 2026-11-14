@@ -297,6 +297,22 @@ no-start 闸。
 
 `CapUVD0`/`CapResult=0` 是 init 失败的后果：查询已经到达内核并写入了属性，但引擎没 start，能力为 0。
 
+**build50 实测（2026-11-14 14:15，默认启动，build50 UUID `519D7C84`）**：
+`FwMsgSymbolResolved=1`、`FwMsgRouteInstalled=1`，但 `FwMsgCount/Opcode/Result` **都不出现**；
+`LoadUVDFWCacheFlag=0`、`LoadUVDFWEarlyReturn=0`、`LoadUVDFW=1`、`LoadUVDFWCalls=1`。
+即缓存标志没有提前返回，`loadUVDFW` 也确实返回了成功，但它没有调用被路由的
+`AMDUVD7HWEngine::commitUVDFWMsg`。反汇编 `AMDUVDHWEngine::loadUVDFW`（`0x43D0C40`）
+确认：它通过 `[self+0x18]` 的 SML 接口虚表下发固件消息
+（`0x43D0E72 call [r13+0x258]`、`0x43D0F4E call [obj+0x248]`），并不经过 UVD7 自己的
+`commitUVDFWMsg`。build50 的钩子挂错了层，`FwMsgCount` 缺失是预期结果。
+
+build51（CDHash `DD68F992`，UUID `C8128EB3`）：改为直接路由 `AMDSMLInterface` 的
+`writeUVDCreateMsg`/`writeUVDDestroyMsg`/`getUVDFW`/`getUVDFWCacheInfo`/
+`saveUVDState`/`restoreUVDState`，发布 `SmlSymbols`/`SmlRoutes` 和各自的
+calls/opcode/result；`loadUVDFW` 入口额外发布 `LoadUVDFWFwPtrLow/High`（`+0x280`）、
+`LoadUVDFWSmlPtrLow/High`（`+0x2A8`）、`LoadUVDFWFlag25C`（`+0x25C`）。默认启动即可，
+不需要 boot-arg。
+
 ## 下一步
 
 1. **build49 分类 4 兜底实测失败**（2026-11-08 21:48）：`PsmWakeClass4Result/Index=1/1`、
@@ -304,16 +320,15 @@ no-start 闸。
    `PsmWakeFlag5F0/690After=0`、`PsmWakeVcnGateDelta=0`、`PsmWake190After=1`，
    随后 `PsmWakeUnuseResult=1`、`PsmWakeFailed=1`。**分类 4 的 state 没有 VCN 时钟属性，
    PSM 分类路线到此为止**，不要再试 0x11–0x14 或分类 4。
-2. **先恢复 config.plist**：本机启动仍带 `-NRedVCNPsmWake`（`PsmWakeRun=1` 可证）。
-   挂载 ESP 后用 `~/Desktop/config.plist.bak-20261108-214330` 覆盖
-   `EFI/OC/config.plist`，确认 boot-args 不再含该开关。
-3. **build50 已实现固件路径诊断**（本次改动，默认启动即可，无需 boot-arg）：
-   `prepareVCN1` 发布 `FwMsgSymbolResolved`、`FwMsgRouteInstalled`；`loadUVDFW` 入口
-   发布 `LoadUVDFWCacheFlag`、`LoadUVDFWEarlyReturn`（后者由 `+0x3BA` 推断，不是直接观测）。
-   判读：`FwMsgSymbolResolved=0` → `commitUVDFWMsg` 符号没解析；`=1` 且
-   `FwMsgRouteInstalled=0` → 路由没装上；两者都为 1 但 `FwMsgCount` 缺失时，
-   `LoadUVDFWCacheFlag=1`/`EarlyReturn=1` 说明缓存标志已置位、原函数很可能跳过了
-   `commitUVDFWMsg`；`CacheFlag=0` 则是别的原因提前返回，下一轮再读 `+0x280` 固件指针。
+2. **config.plist 已恢复**：当前 boot-args 不含 `-NRedVCNPsmWake`；build49 分类路线已结束，
+   不再重试。
+3. **build51 固件方法诊断**（默认启动，无需 boot-arg）：读 `SmlSymbols`/`SmlRoutes`、
+   `SmlCreateCalls/Opcode/Result`、`SmlDestroy*`、`SmlGetFwCalls/Info0/Info1/Result`、
+   `SmlCacheCalls/Info0/Info1/Result`、`SmlSave/Restore*`、`LoadUVDFWFwPtrLow/High`、
+   `LoadUVDFWSmlPtrLow/High`、`LoadUVDFWFlag25C`、`LoadUVDFWCacheFlag/EarlyReturn`。
+   判读：`SmlCreateCalls>0` → 找到真正的固件消息出口；`SmlGetFwCalls>0` → 固件加载走
+   `getUVDFW`；两者都为 0 但 `LoadUVDFW=1` → `loadUVDFW` 走的是另一条 SML 虚表路径，
+   需要按 `[r13+0x258]`/`[obj+0x248]` 的实际 vtable 槽位继续定位。
 4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
    /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
    `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。

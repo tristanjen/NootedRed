@@ -1238,3 +1238,33 @@ build49 `-NRedVCNPsmWake` 实测（2026-11-08 21:48，dump 共 391 项）：
 
 下一步方向：放弃 PSM 分类路线；转向 CWDDEPM 的 UVD 状态创建 /`PSM_AddState`，
 或直接驱动 `PEM_Task_VideoStartMultiUVDStates`；禁止退回裸调 `PowerUpVCN`。
+
+## 38. 第三十五轮：build50 固件钩子挂错层，build51 改钩 AMDSMLInterface
+
+build50 默认启动实测（2026-11-14 14:15，UUID `519D7C84`）：
+
+- `FwMsgSymbolResolved=1`、`FwMsgRouteInstalled=1`，但 `FwMsgCount/FwMsgOpcode/
+  FwMsgResult` **一个都不出现**。
+- `LoadUVDFWCacheFlag=0`、`LoadUVDFWEarlyReturn=0`、`LoadUVDFW=1`、
+  `LoadUVDFWCalls=1`。缓存标志没有置位，函数也没有因缓存提前返回；它确实返回了成功。
+- 结论：`loadUVDFW` 没有调用被路由的 `AMDUVD7HWEngine::commitUVDFWMsg`。这不是缓存
+  早退，而是**钩子挂在了错误的层**。
+
+反汇编 `AMDUVDHWEngine::loadUVDFW`（`0x43D0C40`）确认：
+
+- 入口先看 `[self+0x3BA]`（缓存标志）和 `[self+0x280]`（固件指针）、`[self+0x2A8]`
+  （SML 指针）；三者都满足才继续。
+- 固件消息通过 `[self+0x18]` 的 SML 接口虚表下发：
+  `0x43D0E72 call [r13+0x258]`（r13 由 `[self+0x18]` 的 `+0x310` 返回）和
+  `0x43D0F4E call [obj+0x248]`（`[self+0x18]` 的 `+0x2D8` 返回对象）。
+- `AMDSMLInterface` 的导出方法包括 `writeUVDCreateMsg`、`writeUVDDestroyMsg`、
+  `getUVDFW`、`getUVDFWCacheInfo`、`saveUVDState`、`restoreUVDState`；它们才是这条
+  虚表路径的实现层。
+
+build51（CDHash `DD68F992`，UUID `C8128EB3`）：
+
+- 直接路由上述 6 个 `AMDSMLInterface` 方法，发布 `SmlSymbols`/`SmlRoutes` 与各自的
+  calls/opcode/result（message 首 dword 作为 opcode）。
+- `loadUVDFW` 入口额外发布 `LoadUVDFWFwPtrLow/High`（`+0x280`）、
+  `LoadUVDFWSmlPtrLow/High`（`+0x2A8`）、`LoadUVDFWFlag25C`（`+0x25C`）。
+- 默认启动即可，不需要 boot-arg；仍不写任何电源状态。
