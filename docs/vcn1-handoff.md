@@ -313,6 +313,23 @@ calls/opcode/result；`loadUVDFW` 入口额外发布 `LoadUVDFWFwPtrLow/High`（
 `LoadUVDFWSmlPtrLow/High`（`+0x2A8`）、`LoadUVDFWFlag25C`（`+0x25C`）。默认启动即可，
 不需要 boot-arg。
 
+**build51 实测（2026-11-14 15:34，默认启动，UUID `C8128EB3`）**：
+`SmlSymbols=63`、`SmlRoutes=63`（6 个方法全部解析/路由）；`SmlCacheCalls=1`
+（`Info0/1=0`、`Result=0x2A9101`）、`SmlGetFwCalls=1`
+（`Info0/1=0xFFFFFFD155446000`、`Result=0x61701`）；`SmlCreate/Destroy/Save/Restore`
+**均未出现**。`LoadUVDFWFlag25C=1`、`FwPtr=0xF4_7B52F000`、
+`SmlPtr=0xFFFFFFD155446000`、`LoadUVDFW=1`、`CacheFlag=0`。
+说明 `Flag25C==1` 分支走的是 `[self+0x20]` 的 CP 接口 `vtable+0x248`，不是 SML 的
+`writeUVDCreateMsg`；SML 只做了 `getUVDFW`/`getUVDFWCacheInfo`。`CailInitResult=1`、
+`UvdStatus=0`、`CapUVD0=0` 不变。
+
+build52（CDHash `D3162664`，UUID `4FC4E5CF`）：直接路由 `AMDCPAppInterface` 的
+`sendAppMsg`/`waitForAppMsg`/`initAppMsgOutput`/`destroyAppMsg` 与
+`AMDAccelPspContext::submitAppMsg`，发布 `CpSymbols`/`CpRoutes` 和各自的
+calls/opcode/result；`loadUVDFW` 入口额外发布 `[self+0x20]` 对象指针与
+`vtable+0x248` 目标（`LoadUVDFWCpObjLow/High`、`LoadUVDFWCpSlot248Low/High`）。
+默认启动，无需 boot-arg。
+
 ## 下一步
 
 1. **build49 分类 4 兜底实测失败**（2026-11-08 21:48）：`PsmWakeClass4Result/Index=1/1`、
@@ -322,13 +339,11 @@ calls/opcode/result；`loadUVDFW` 入口额外发布 `LoadUVDFWFwPtrLow/High`（
    PSM 分类路线到此为止**，不要再试 0x11–0x14 或分类 4。
 2. **config.plist 已恢复**：当前 boot-args 不含 `-NRedVCNPsmWake`；build49 分类路线已结束，
    不再重试。
-3. **build51 固件方法诊断**（默认启动，无需 boot-arg）：读 `SmlSymbols`/`SmlRoutes`、
-   `SmlCreateCalls/Opcode/Result`、`SmlDestroy*`、`SmlGetFwCalls/Info0/Info1/Result`、
-   `SmlCacheCalls/Info0/Info1/Result`、`SmlSave/Restore*`、`LoadUVDFWFwPtrLow/High`、
-   `LoadUVDFWSmlPtrLow/High`、`LoadUVDFWFlag25C`、`LoadUVDFWCacheFlag/EarlyReturn`。
-   判读：`SmlCreateCalls>0` → 找到真正的固件消息出口；`SmlGetFwCalls>0` → 固件加载走
-   `getUVDFW`；两者都为 0 但 `LoadUVDFW=1` → `loadUVDFW` 走的是另一条 SML 虚表路径，
-   需要按 `[r13+0x258]`/`[obj+0x248]` 的实际 vtable 槽位继续定位。
+3. **build52 CP/PSP 固件消息诊断**（默认启动，无需 boot-arg）：读 `CpSymbols`/`CpRoutes`、
+   `CpSendCalls/Opcode/Result`、`CpWait*`、`CpInit*`、`CpDestroy*`、`PspSubmit*`、
+   `LoadUVDFWCpObjLow/High`、`LoadUVDFWCpSlot248Low/High`，以及 build51 的 `Sml*` 键。
+   判读：`CpSend`/`PspSubmit` 出现 → 找到真正的固件提交出口；把 `CpSlot248` 目标与
+   `AMDCPAppInterface` 符号对比，确认 `[self+0x20]` 的类和槽位含义。
 4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
    /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
    `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。

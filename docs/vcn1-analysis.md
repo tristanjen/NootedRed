@@ -1268,3 +1268,34 @@ build51（CDHash `DD68F992`，UUID `C8128EB3`）：
 - `loadUVDFW` 入口额外发布 `LoadUVDFWFwPtrLow/High`（`+0x280`）、
   `LoadUVDFWSmlPtrLow/High`（`+0x2A8`）、`LoadUVDFWFlag25C`（`+0x25C`）。
 - 默认启动即可，不需要 boot-arg；仍不写任何电源状态。
+
+## 39. 第三十六轮：build51 只走 SML 查询，build52 转钩 CP/PSP 消息层
+
+build51 默认启动实测（2026-11-14 15:34，UUID `C8128EB3`）：
+
+- `SmlSymbols=63`、`SmlRoutes=63`：6 个 `AMDSMLInterface` 方法全部解析并路由。
+- `SmlCacheCalls=1`、`SmlCacheInfo0/1=0`、`SmlCacheResult=0x2A9101`；
+  `SmlGetFwCalls=1`、`SmlGetFwInfo0/1=0xFFFFFFD155446000`、`SmlGetFwResult=0x61701`。
+- `SmlCreate/Destroy/Save/Restore` **全部未出现**：`writeUVDCreateMsg` 不在当前路径上。
+- `LoadUVDFWFlag25C=1`、`FwPtr=0xF4_7B52F000`、`SmlPtr=0xFFFFFFD155446000`、
+  `LoadUVDFW=1`、`CacheFlag=0`。`CailInitResult=1`、`UvdStatusBefore/After=0`、
+  `CapUVD0=0` 不变。
+
+静态确认：
+
+- `AMDSMLInterface::getUVDFW`/`getUVDFWCacheInfo` 只是 wrapper：`getUVDFW` 尾跳
+  `[self+0x10]` 的 `vtable+0x130`，cache 版本跳到 `+0x128`。
+- `AMDUVDHWEngine::loadUVDFW` 在 `[self+0x25C]==1` 时走 `0x43D0EFE`：
+  `rdi=[self+0x20]`，`rsi=[self+0x280]`（固件地址），`rdx=[rbp-0xC0]`（SML 消息），
+  `call [rdi_vt+0x248]`；`Flag25C==0` 才走 `[self+0x18]` 的 `+0x2D8` → `+0x248`。
+  本机 `Flag25C=1`，所以真正未观测的是 `[self+0x20]` 的 CP 接口提交。
+- `AMDCPAppInterface` 的符号包括 `sendAppMsg`、`waitForAppMsg`、`initAppMsgOutput`、
+  `destroyAppMsg`；`AMDAccelPspContext::submitAppMsg` 是 PSP 侧的另一条提交路径。
+
+build52（CDHash `D3162664`，UUID `4FC4E5CF`）：
+
+- 路由上述 5 个 CP/PSP 方法，发布 `CpSymbols`/`CpRoutes` 与各自的 calls/opcode/result；
+- `loadUVDFW` 入口发布 `LoadUVDFWCpObjLow/High`（`[self+0x20]`）和
+  `LoadUVDFWCpSlot248Low/High`（该对象 vtable+0x248 的运行时目标），用来确认对象类
+  和槽位到底指向哪个方法；
+- 默认启动，不写任何电源状态。
