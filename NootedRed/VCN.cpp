@@ -42,10 +42,6 @@ namespace
     mach_vm_address_t       cpDestroyMsgOriginal{0}, pspSubmitMsgOriginal{0};
     UInt32                  cpSendMsgCount{0}, cpWaitMsgCount{0}, cpInitOutputCount{0};
     UInt32                  cpDestroyMsgCount{0}, pspSubmitMsgCount{0};
-    // build53：运行期直接接管 [self+0x20] 的 vtable+0x248。build52 证明这个槽不是
-    // X5000 的 AMDCPAppInterface 方法（chained-fixup 目标落在 X4100HWLibs）。
-    mach_vm_address_t       cpSlot248Original{0};
-    UInt32                  cpSlot248Patched{0}, cpSlot248Count{0};
     mach_vm_address_t       uvd7LoadUVDFWOriginal{0}, uvd7InitHardwareCailOriginal{0};
     // AMDUVD7HWEngine 的 __ZTV；对象虚表与它相减得到不随 KASLR 变化的类差值。
     mach_vm_address_t       uvd7VTable{0};
@@ -702,19 +698,6 @@ namespace
         return result;
     }
 
-    UInt64 cpSlot248Hook(void* self, UInt64 fwPtr, void* message, UInt64 arg4, UInt64 arg5, UInt64 arg6)
-    {
-        const auto opcode = messageOpcode(message);
-        const auto result = reinterpret_cast<UInt64 (*)(void*, UInt64, void*, UInt64, UInt64, UInt64)>(
-            cpSlot248Original)(self, fwPtr, message, arg4, arg5, arg6);
-        NRed::singleton().setProp32("NRedVCN1CpSlotCalls", __atomic_fetch_add(&cpSlot248Count, 1U, __ATOMIC_RELAXED) + 1);
-        NRed::singleton().setProp32("NRedVCN1CpSlotFwPtrLow", static_cast<UInt32>(fwPtr & 0xFFFFFFFFULL));
-        NRed::singleton().setProp32("NRedVCN1CpSlotFwPtrHigh", static_cast<UInt32>(fwPtr >> 32));
-        NRed::singleton().setProp32("NRedVCN1CpSlotOpcode", opcode);
-        NRed::singleton().setProp32("NRedVCN1CpSlotResult", static_cast<UInt32>(result));
-        return result;
-    }
-
     // +0x338 是 SML 接口指针（由 services->vt[0x850] 创建）：一出现就接管其查询槽。
     void hookCailClient(void* client);
 
@@ -1106,22 +1089,6 @@ namespace
         NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpObjHigh", static_cast<UInt32>(cpValue >> 32));
         NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpSlot248Low", static_cast<UInt32>(cpSlot248 & 0xFFFFFFFFULL));
         NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpSlot248High", static_cast<UInt32>(cpSlot248 >> 32));
-        // build53：把 [self+0x20] 的 vtable+0x248 直接换成 cpSlot248Hook，一次性、链式调原函数。
-        if (cpVtable != nullptr && cpSlot248 != 0
-            && __atomic_load_n(&cpSlot248Patched, __ATOMIC_ACQUIRE) == 0) {
-            if (__atomic_exchange_n(&cpSlot248Patched, 1U, __ATOMIC_ACQ_REL) == 0) {
-                cpSlot248Original = cpSlot248;
-                if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
-                    const auto hook = reinterpret_cast<mach_vm_address_t>(&cpSlot248Hook);
-                    memcpy(static_cast<UInt8*>(cpVtable) + 0x248, &hook, sizeof(hook));
-                    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-                    NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpSlotHooked", 1);
-                }
-                else {
-                    NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpSlotHooked", 0);
-                }
-            }
-        }
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7LoadUVDFWOriginal)(self);
         NRed::singleton().setProp32("NRedVCN1LoadUVDFW", result);
         auto count = __atomic_fetch_add(&uvd7LoadUVDFWCount, 1U, __ATOMIC_RELAXED);
