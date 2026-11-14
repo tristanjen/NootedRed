@@ -101,12 +101,17 @@ namespace
     // 分类位，并依次尝试 UVD 的四个分类（0x12/0x13/0x14/0x11）。
     mach_vm_address_t       psmListPresentClassifications{0};
     mach_vm_address_t       psmSetUvdHDState{0}, psmSetUvdSDState{0}, psmSetUvdMVCState{0};
+    // build55：只读调查 PSM 状态链表与 PPT 的 UVD/VCE 状态来源（不写任何电源状态）。
+    mach_vm_address_t       pptEntryCountOriginal{0}, pptVceCountOriginal{0}, pptVceEntryOriginal{0};
+    mach_vm_address_t       cwddeUvdNumOriginal{0}, cwddeUvdInfoOriginal{0};
+    UInt32                  psmDumpDone{0};
     void*                   psmHandle{nullptr};
     UInt32                  psmWakeStage{0};      // 0=未跑，1=已尝试，2=已放弃
     UInt32                  psmWakeAcquired{0};   // PSM 已接受 block 3 的登记
     UInt32                  psmWakeConsumed{0};   // 引擎 initHardware 已看到唤醒
     void                    psmWakeVcn();
     void                    psmWakeRelease();
+    void                    dumpPsmAndPpt();
     mach_vm_address_t       acceleratorStartOriginal{0};
     mach_vm_address_t       safeCastOriginal{0}, newSharedOriginal{0}, newClientOriginal{0}, newVideoOriginal{0};
     mach_vm_address_t       newVideo6000{0};
@@ -1190,6 +1195,8 @@ namespace
         // build47：视频上下文建立、解码引擎 start 之前，让 PSM 自己决定是否给 VCN 上电。
         // 只观测；没有 -NRedVCNPsmWake 时 psmWakeVcn() 直接返回。
         if (result && uvd0Present) { psmWakeVcn(); }
+        // build55：只读地把 PSM 状态链表与 PPT 条目打出来，确认有无 UVD/VCN 状态来源。
+        if (result && uvd0Present) { dumpPsmAndPpt(); }
         auto count = __atomic_fetch_add(&videoContextStartCount, 1U, __ATOMIC_RELAXED);
         if (count < 8) { SYSLOG("VCN1", "Vega10VideoContext::contextStart result=%u", result); }
         return result;
@@ -2372,6 +2379,91 @@ void psmWakeRelease()
     NRed::singleton().setProp32("NRedVCN1PsmWakeUnuseOnRelease", static_cast<UInt32>(result));
 }
 
+// build55：只读调查。遍历 PSM 状态链表（id/class/flags/deleted + 属性区前 8 个 dword），
+// 读取 PPT 主表条目数，并确认 VCE/UVD 取数函数是否为空桩。全部只读，不写电源状态。
+void dumpPsmAndPpt()
+{
+    if (__atomic_load_n(&psmDumpDone, __ATOMIC_ACQUIRE) != 0) { return; }
+    void* psm = __atomic_load_n(&psmHandle, __ATOMIC_ACQUIRE);
+    if (psm == nullptr) { return; }
+    if (__atomic_exchange_n(&psmDumpDone, 1U, __ATOMIC_ACQ_REL) != 0) { return; }
+    NRed::singleton().setProp32("NRedVCN1PsmDumpRun", 1);
+
+    UInt32 classesMask{0};
+    if (psmListPresentClassifications != 0) {
+        reinterpret_cast<int (*)(void*, UInt32*)>(psmListPresentClassifications)(psm, &classesMask);
+    }
+    NRed::singleton().setProp32("NRedVCN1PsmDumpClassesMask", classesMask);
+
+    void* psdt{nullptr};
+    memcpy(&psdt, static_cast<UInt8*>(psm) + 0x88, sizeof(psdt));
+    void* state{nullptr};
+    if (psdt != nullptr) { memcpy(&state, static_cast<UInt8*>(psdt) + 8, sizeof(state)); }
+    UInt32 count{0};
+    while (state != nullptr && count < 32) {
+        const auto id = readState32(state, 0);
+        const auto cls = readState32(state, 0x28);
+        const auto flags = readState32(state, 0x2C);
+        const auto deleted = readState32(state, 0x34);
+        if (count == 0) {
+            NRed::singleton().setProp32("NRedVCN1PsmS0Id", id);
+            NRed::singleton().setProp32("NRedVCN1PsmS0Class", cls);
+            NRed::singleton().setProp32("NRedVCN1PsmS0Flags", flags);
+            NRed::singleton().setProp32("NRedVCN1PsmS0Del", deleted);
+            static const char* const attrs[8] = {
+                "NRedVCN1PsmS0A0", "NRedVCN1PsmS0A1", "NRedVCN1PsmS0A2", "NRedVCN1PsmS0A3",
+                "NRedVCN1PsmS0A4", "NRedVCN1PsmS0A5", "NRedVCN1PsmS0A6", "NRedVCN1PsmS0A7"};
+            for (UInt32 i = 0; i < 8; ++i) {
+                NRed::singleton().setProp32(attrs[i], readState32(state, 0x40 + i * 4));
+            }
+        }
+        else if (count == 1) {
+            NRed::singleton().setProp32("NRedVCN1PsmS1Id", id);
+            NRed::singleton().setProp32("NRedVCN1PsmS1Class", cls);
+            NRed::singleton().setProp32("NRedVCN1PsmS1Flags", flags);
+            NRed::singleton().setProp32("NRedVCN1PsmS1Del", deleted);
+        }
+        void* next{nullptr};
+        memcpy(&next, static_cast<UInt8*>(state) + 0x18, sizeof(next));
+        state = next;
+        ++count;
+    }
+    NRed::singleton().setProp32("NRedVCN1PsmDumpStateCount", count);
+
+    void* phm = __atomic_load_n(&phmHandle, __ATOMIC_ACQUIRE);
+    void* pp{nullptr};
+    if (phm != nullptr) { memcpy(&pp, phm, sizeof(pp)); }
+    NRed::singleton().setProp32("NRedVCN1PsmDumpPpPresent", pp != nullptr);
+    if (pp == nullptr) { return; }
+
+    if (pptEntryCountOriginal != 0) {
+        UInt32 entries{0};
+        const auto result = reinterpret_cast<int (*)(void*, UInt32*)>(pptEntryCountOriginal)(pp, &entries);
+        NRed::singleton().setProp32("NRedVCN1PsmDumpPptCountResult", static_cast<UInt32>(result));
+        NRed::singleton().setProp32("NRedVCN1PsmDumpPptEntries", entries);
+    }
+    if (pptVceCountOriginal != 0) {
+        UInt32 entries{0};
+        const auto result = reinterpret_cast<int (*)(void*, UInt32*)>(pptVceCountOriginal)(pp, &entries);
+        NRed::singleton().setProp32("NRedVCN1PsmDumpVceCountResult", static_cast<UInt32>(result));
+        NRed::singleton().setProp32("NRedVCN1PsmDumpVceEntries", entries);
+    }
+    if (pptVceEntryOriginal != 0) {
+        UInt8 buffer[0x80] = {};
+        const auto result = reinterpret_cast<int (*)(void*, UInt32, void*)>(pptVceEntryOriginal)(pp, 0, buffer);
+        NRed::singleton().setProp32("NRedVCN1PsmDumpVceEntryResult", static_cast<UInt32>(result));
+        NRed::singleton().setProp32("NRedVCN1PsmDumpVceEntry0", readState32(buffer, 0));
+    }
+    if (cwddeUvdNumOriginal != 0) {
+        NRed::singleton().setProp32("NRedVCN1PsmDumpCwddeUvdNum",
+                                    static_cast<UInt32>(reinterpret_cast<int (*)()>(cwddeUvdNumOriginal)()));
+    }
+    if (cwddeUvdInfoOriginal != 0) {
+        NRed::singleton().setProp32("NRedVCN1PsmDumpCwddeUvdInfo",
+                                    static_cast<UInt32>(reinterpret_cast<int (*)()>(cwddeUvdInfoOriginal)()));
+    }
+}
+
 } // namespace
 
 void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide, const size_t size)
@@ -2501,5 +2593,20 @@ void VCN::hookCailLibrary(KernelPatcher& patcher, const size_t id, const mach_vm
                                     (psmStatusOk ? 16U : 0U) | (psmListOk ? 32U : 0U) |
                                     (psmHdOk ? 64U : 0U) | (psmSdOk ? 128U : 0U) |
                                     (psmMvcOk ? 256U : 0U));
+    // build55：只读调查用的 PPT/CWDDEPM 取数函数。
+    const bool pptCountOk = resolve(patcher, id, "_PptRaven_GetNumberOfPowerPlayTableEntries",
+                                    pptEntryCountOriginal, slide, size);
+    const bool vceCountOk = resolve(patcher, id, "_PptRaven_GetNumberOfVCEStateTableEntries",
+                                    pptVceCountOriginal, slide, size);
+    const bool vceEntryOk = resolve(patcher, id, "_PptRaven_GetVCEStateTableEntry",
+                                    pptVceEntryOriginal, slide, size);
+    const bool cwddeNumOk = resolve(patcher, id, "_PEM_CWDDEPM_GetUVDStateNum",
+                                    cwddeUvdNumOriginal, slide, size);
+    const bool cwddeInfoOk = resolve(patcher, id, "_PEM_CWDDEPM_GetUVDStateInfo",
+                                     cwddeUvdInfoOriginal, slide, size);
+    NRed::singleton().setProp32("NRedVCN1PsmDumpSymbols",
+                                (pptCountOk ? 1U : 0U) | (vceCountOk ? 2U : 0U) |
+                                    (vceEntryOk ? 4U : 0U) | (cwddeNumOk ? 8U : 0U) |
+                                    (cwddeInfoOk ? 16U : 0U));
     NRed::singleton().setProp32("NRedVCN1CailLibraryHooked", 1);
 }
