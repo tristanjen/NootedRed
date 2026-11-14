@@ -1299,3 +1299,30 @@ build52（CDHash `D3162664`，UUID `4FC4E5CF`）：
   `LoadUVDFWCpSlot248Low/High`（该对象 vtable+0x248 的运行时目标），用来确认对象类
   和槽位到底指向哪个方法；
 - 默认启动，不写任何电源状态。
+
+## 40. 第三十七轮：build52 CP 方法未命中；build53 直接接管 vtable 槽
+
+build52 默认启动实测（2026-11-14 16:12，UUID `4FC4E5CF`）：
+
+- `CpSymbols=31`、`CpRoutes=31`：5 个 CP/PSP 符号全部解析并路由。
+- `CpSend/Wait/Init/Destroy/PspSubmit` **全部不出现**：这些方法没有被调用。
+- `LoadUVDFWCpObj=0xFFFFFF8B9A9A6C60`（内核堆对象）。
+- `LoadUVDFWCpSlot248` 原始值 `0xFFFFFF7FA1A8B8EE`；按项目的 chained fixup 约定
+  取低 28 位 = `0x1A8B8EE`，反查内核集合落在
+  `com.apple.kext.AMDRadeonX4100HWLibs` 的 fileset（`kmutil showloaded` 里没有这个
+  kext），不是 X5000 的 `AMDCPAppInterface`。
+- SML 侧仍是 `getUVDFW`/`getUVDFWCacheInfo` 各一次（结果 `0x61701`/`0x2A9101`），
+  没有 create/save/restore；`CailInitResult=1`、`UvdStatus=0`、`CapUVD0=0` 不变。
+
+结论：`[self+0x20] vtable+0x248` 是共享 HWLibs（X4100HWLibs）层的函数/导入桩，
+按 X5000 符号去挂钩必然落空。继续猜符号没有意义。
+
+build53（CDHash `52AA44D6`，UUID `7DEA5250`）：
+
+- 在 `uvd7LoadUVDFW` 第一次进入时读取 `[self+0x20]` 的 vtable，把 `+0x248` 槽
+  直接替换为 `cpSlot248Hook`（保存原值、一次性、`MachInfo::setKernelWriting`），
+  原函数照常链式调用。
+- 钩子按 6 个参数（rdi/rsi/rdx/rcx/r8/r9）接收，发布 `CpSlotCalls`、
+  `CpSlotFwPtrLow/High`、`CpSlotOpcode`（message 首 dword）、`CpSlotResult`；
+  另发布 `LoadUVDFWCpSlotHooked` 表示槽是否替换成功。
+- 这样无论目标属于 X4100HWLibs 还是别的层，`loadUVDFW` 的真实调用都会进钩子。

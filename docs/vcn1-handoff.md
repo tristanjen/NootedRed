@@ -330,6 +330,19 @@ calls/opcode/result；`loadUVDFW` 入口额外发布 `[self+0x20]` 对象指针�
 `vtable+0x248` 目标（`LoadUVDFWCpObjLow/High`、`LoadUVDFWCpSlot248Low/High`）。
 默认启动，无需 boot-arg。
 
+**build52 实测（2026-11-14 16:12，默认启动，UUID `4FC4E5CF`）**：
+`CpSymbols=31`、`CpRoutes=31`，但 `CpSend/Wait/Init/Destroy/PspSubmit` **全部不出现**。
+`LoadUVDFWCpObj=0xFFFFFF8B9A9A6C60`；`LoadUVDFWCpSlot248` 原始值
+`0xFFFFFF7FA1A8B8EE`，按 chained fixup 取低 28 位 = `0x1A8B8EE`，落在
+`com.apple.kext.AMDRadeonX4100HWLibs` 的 fileset（不在 `kmutil showloaded` 列表里），
+不是 X5000 的 `AMDCPAppInterface` 方法。SML 仍只有 `getUVDFW`/`getUVDFWCacheInfo`
+（结果同 build51）；`CailInitResult=1`、`UvdStatus=0`、`CapUVD0=0` 不变。
+
+build53（CDHash `52AA44D6`，UUID `7DEA5250`）：在 `loadUVDFW` 第一次进入时直接把
+`[self+0x20]` 的 `vtable+0x248` 换成 `cpSlot248Hook`（一次性、链式调原函数），发布
+`LoadUVDFWCpSlotHooked`、`CpSlotCalls/FwPtrLow/High/Opcode/Result`。默认启动，无需
+boot-arg。
+
 ## 下一步
 
 1. **build49 分类 4 兜底实测失败**（2026-11-08 21:48）：`PsmWakeClass4Result/Index=1/1`、
@@ -339,11 +352,12 @@ calls/opcode/result；`loadUVDFW` 入口额外发布 `[self+0x20]` 对象指针�
    PSM 分类路线到此为止**，不要再试 0x11–0x14 或分类 4。
 2. **config.plist 已恢复**：当前 boot-args 不含 `-NRedVCNPsmWake`；build49 分类路线已结束，
    不再重试。
-3. **build52 CP/PSP 固件消息诊断**（默认启动，无需 boot-arg）：读 `CpSymbols`/`CpRoutes`、
-   `CpSendCalls/Opcode/Result`、`CpWait*`、`CpInit*`、`CpDestroy*`、`PspSubmit*`、
-   `LoadUVDFWCpObjLow/High`、`LoadUVDFWCpSlot248Low/High`，以及 build51 的 `Sml*` 键。
-   判读：`CpSend`/`PspSubmit` 出现 → 找到真正的固件提交出口；把 `CpSlot248` 目标与
-   `AMDCPAppInterface` 符号对比，确认 `[self+0x20]` 的类和槽位含义。
+3. **build53 CP vtable 槽接管**（默认启动，无需 boot-arg）：读
+   `LoadUVDFWCpSlotHooked`、`CpSlotCalls`、`CpSlotFwPtrLow/High`、`CpSlotOpcode`、
+   `CpSlotResult`、`LoadUVDFWCpSlot248Low/High`。判读：`CpSlotCalls>0` → 已经抓到
+   真正的固件提交，看 fwPtr/opcode/result；若 `CpSlotCalls` 仍为 0，说明 `loadUVDFW`
+   没走到该槽（`Flag25C` 分支变化）或槽被别的路径覆盖。槽目标继续与
+   `AMDRadeonX4100HWLibs` 的符号表对照。
 4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
    /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
    `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。
