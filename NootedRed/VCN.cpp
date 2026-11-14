@@ -36,6 +36,12 @@ namespace
     mach_vm_address_t       smlGetCacheInfoOriginal{0}, smlSaveStateOriginal{0}, smlRestoreStateOriginal{0};
     UInt32                  smlWriteCreateCount{0}, smlWriteDestroyCount{0}, smlGetUVDFWCount{0};
     UInt32                  smlGetCacheInfoCount{0}, smlSaveStateCount{0}, smlRestoreStateCount{0};
+    // build52：CP/PSP 消息接口。loadUVDFW 在 [self+0x25C]==1 时通过 [self+0x20] 的
+    // vtable+0x248 提交固件消息；这是 SML getUVDFW 之后真正的一步。
+    mach_vm_address_t       cpSendMsgOriginal{0}, cpWaitMsgOriginal{0}, cpInitOutputOriginal{0};
+    mach_vm_address_t       cpDestroyMsgOriginal{0}, pspSubmitMsgOriginal{0};
+    UInt32                  cpSendMsgCount{0}, cpWaitMsgCount{0}, cpInitOutputCount{0};
+    UInt32                  cpDestroyMsgCount{0}, pspSubmitMsgCount{0};
     mach_vm_address_t       uvd7LoadUVDFWOriginal{0}, uvd7InitHardwareCailOriginal{0};
     // AMDUVD7HWEngine 的 __ZTV；对象虚表与它相减得到不随 KASLR 变化的类差值。
     mach_vm_address_t       uvd7VTable{0};
@@ -642,6 +648,56 @@ namespace
         return result;
     }
 
+    UInt32 messageOpcode(const void* message)
+    {
+        UInt32 opcode{0};
+        if (message != nullptr) { memcpy(&opcode, message, sizeof(opcode)); }
+        return opcode;
+    }
+    UInt32 cpSendMsgHook(void* self, void* message)
+    {
+        const auto opcode = messageOpcode(message);
+        const auto result = reinterpret_cast<UInt32 (*)(void*, void*)>(cpSendMsgOriginal)(self, message);
+        NRed::singleton().setProp32("NRedVCN1CpSendCalls", __atomic_fetch_add(&cpSendMsgCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1CpSendOpcode", opcode);
+        NRed::singleton().setProp32("NRedVCN1CpSendResult", result);
+        return result;
+    }
+    UInt32 cpWaitMsgHook(void* self, void* message, const bool wait)
+    {
+        const auto opcode = messageOpcode(message);
+        const auto result = reinterpret_cast<UInt32 (*)(void*, void*, bool)>(cpWaitMsgOriginal)(self, message, wait);
+        NRed::singleton().setProp32("NRedVCN1CpWaitCalls", __atomic_fetch_add(&cpWaitMsgCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1CpWaitOpcode", opcode);
+        NRed::singleton().setProp32("NRedVCN1CpWaitResult", result);
+        return result;
+    }
+    UInt32 cpInitOutputHook(void* self, void* message)
+    {
+        const auto opcode = messageOpcode(message);
+        const auto result = reinterpret_cast<UInt32 (*)(void*, void*)>(cpInitOutputOriginal)(self, message);
+        NRed::singleton().setProp32("NRedVCN1CpInitCalls", __atomic_fetch_add(&cpInitOutputCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1CpInitOpcode", opcode);
+        NRed::singleton().setProp32("NRedVCN1CpInitResult", result);
+        return result;
+    }
+    UInt32 cpDestroyMsgHook(void* self, void* message)
+    {
+        const auto result = reinterpret_cast<UInt32 (*)(void*, void*)>(cpDestroyMsgOriginal)(self, message);
+        NRed::singleton().setProp32("NRedVCN1CpDestroyCalls", __atomic_fetch_add(&cpDestroyMsgCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1CpDestroyResult", result);
+        return result;
+    }
+    UInt32 pspSubmitMsgHook(void* self, void* interface, void* message)
+    {
+        const auto opcode = messageOpcode(message);
+        const auto result = reinterpret_cast<UInt32 (*)(void*, void*, void*)>(pspSubmitMsgOriginal)(self, interface, message);
+        NRed::singleton().setProp32("NRedVCN1PspSubmitCalls", __atomic_fetch_add(&pspSubmitMsgCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1PspSubmitOpcode", opcode);
+        NRed::singleton().setProp32("NRedVCN1PspSubmitResult", result);
+        return result;
+    }
+
     // +0x338 是 SML 接口指针（由 services->vt[0x850] 创建）：一出现就接管其查询槽。
     void hookCailClient(void* client);
 
@@ -1014,6 +1070,25 @@ namespace
         NRed::singleton().setProp32("NRedVCN1LoadUVDFWFwPtrHigh", static_cast<UInt32>(fwPtr >> 32));
         NRed::singleton().setProp32("NRedVCN1LoadUVDFWSmlPtrLow", static_cast<UInt32>(smlPtr & 0xFFFFFFFFULL));
         NRed::singleton().setProp32("NRedVCN1LoadUVDFWSmlPtrHigh", static_cast<UInt32>(smlPtr >> 32));
+        // build52：[self+0x20] 是 Flag25C==1 分支使用的 CP 接口；发布对象指针和
+        // vtable+0x248 的真实目标，确认它到底是哪个类/函数。
+        void*    cpObject{nullptr};
+        UInt64   cpSlot248{0};
+        if (self != nullptr) {
+            memcpy(&cpObject, static_cast<UInt8*>(self) + 0x20, sizeof(cpObject));
+            if (cpObject != nullptr) {
+                void* cpVtable{nullptr};
+                memcpy(&cpVtable, cpObject, sizeof(cpVtable));
+                if (cpVtable != nullptr) {
+                    memcpy(&cpSlot248, static_cast<UInt8*>(cpVtable) + 0x248, sizeof(cpSlot248));
+                }
+            }
+        }
+        const auto cpValue = reinterpret_cast<UInt64>(cpObject);
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpObjLow", static_cast<UInt32>(cpValue & 0xFFFFFFFFULL));
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpObjHigh", static_cast<UInt32>(cpValue >> 32));
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpSlot248Low", static_cast<UInt32>(cpSlot248 & 0xFFFFFFFFULL));
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWCpSlot248High", static_cast<UInt32>(cpSlot248 >> 32));
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7LoadUVDFWOriginal)(self);
         NRed::singleton().setProp32("NRedVCN1LoadUVDFW", result);
         auto count = __atomic_fetch_add(&uvd7LoadUVDFWCount, 1U, __ATOMIC_RELAXED);
@@ -1268,6 +1343,26 @@ namespace
         NRed::singleton().setProp32("NRedVCN1SmlSymbols",
             (smlCreateOk ? 1U : 0U) | (smlDestroyOk ? 2U : 0U) | (smlGetFwOk ? 4U : 0U) |
             (smlCacheOk ? 8U : 0U) | (smlSaveOk ? 16U : 0U) | (smlRestoreOk ? 32U : 0U));
+        // build52：Flag25C==1 时 loadUVDFW 走 [self+0x20] 的 CP 接口。
+        mach_vm_address_t cpSend{0}, cpWait{0}, cpInit{0}, cpDestroy{0}, pspSubmit{0};
+        const bool cpSendOk = resolve(patcher, id,
+            "__ZN32AMDRadeonX5000_AMDCPAppInterface10sendAppMsgEP26AMDRadeonX5000_AMDSMLCPMsg",
+            cpSend, slide, size);
+        const bool cpWaitOk = resolve(patcher, id,
+            "__ZN32AMDRadeonX5000_AMDCPAppInterface13waitForAppMsgEP26AMDRadeonX5000_AMDSMLCPMsgb",
+            cpWait, slide, size);
+        const bool cpInitOk = resolve(patcher, id,
+            "__ZN32AMDRadeonX5000_AMDCPAppInterface16initAppMsgOutputEP26AMDRadeonX5000_AMDSMLCPMsg",
+            cpInit, slide, size);
+        const bool cpDestroyOk = resolve(patcher, id,
+            "__ZN32AMDRadeonX5000_AMDCPAppInterface13destroyAppMsgEP26AMDRadeonX5000_AMDSMLCPMsg",
+            cpDestroy, slide, size);
+        const bool pspSubmitOk = resolve(patcher, id,
+            "__ZN33AMDRadeonX5000_AMDAccelPspContext12submitAppMsgEP32AMDRadeonX5000_AMDCPAppInterfaceP26AMDRadeonX5000_AMDSMLCPMsg",
+            pspSubmit, slide, size);
+        NRed::singleton().setProp32("NRedVCN1CpSymbols",
+            (cpSendOk ? 1U : 0U) | (cpWaitOk ? 2U : 0U) | (cpInitOk ? 4U : 0U) |
+            (cpDestroyOk ? 8U : 0U) | (pspSubmitOk ? 16U : 0U));
         ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine16initHardwareCailEb", engineInitHardwareCail,
                       slide, size);
         ok &= resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDUVD7HWEngine", engineVTable, slide, size);
@@ -1418,6 +1513,46 @@ namespace
             (smlCreateRoute ? 1U : 0U) | (smlDestroyRoute ? 2U : 0U) |
             (smlGetFwRoute ? 4U : 0U) | (smlCacheRoute ? 8U : 0U) |
             (smlSaveRoute ? 16U : 0U) | (smlRestoreRoute ? 32U : 0U));
+        bool cpSendRoute{false}, cpWaitRoute{false}, cpInitRoute{false};
+        bool cpDestroyRoute{false}, pspSubmitRoute{false};
+        if (cpSend != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN32AMDRadeonX5000_AMDCPAppInterface10sendAppMsgEP26AMDRadeonX5000_AMDSMLCPMsg",
+                cpSendMsgHook, cpSendMsgOriginal};
+            cpSendRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!cpSendRoute) { patcher.clearError(); }
+        }
+        if (cpWait != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN32AMDRadeonX5000_AMDCPAppInterface13waitForAppMsgEP26AMDRadeonX5000_AMDSMLCPMsgb",
+                cpWaitMsgHook, cpWaitMsgOriginal};
+            cpWaitRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!cpWaitRoute) { patcher.clearError(); }
+        }
+        if (cpInit != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN32AMDRadeonX5000_AMDCPAppInterface16initAppMsgOutputEP26AMDRadeonX5000_AMDSMLCPMsg",
+                cpInitOutputHook, cpInitOutputOriginal};
+            cpInitRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!cpInitRoute) { patcher.clearError(); }
+        }
+        if (cpDestroy != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN32AMDRadeonX5000_AMDCPAppInterface13destroyAppMsgEP26AMDRadeonX5000_AMDSMLCPMsg",
+                cpDestroyMsgHook, cpDestroyMsgOriginal};
+            cpDestroyRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!cpDestroyRoute) { patcher.clearError(); }
+        }
+        if (pspSubmit != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN33AMDRadeonX5000_AMDAccelPspContext12submitAppMsgEP32AMDRadeonX5000_AMDCPAppInterfaceP26AMDRadeonX5000_AMDSMLCPMsg",
+                pspSubmitMsgHook, pspSubmitMsgOriginal};
+            pspSubmitRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!pspSubmitRoute) { patcher.clearError(); }
+        }
+        NRed::singleton().setProp32("NRedVCN1CpRoutes",
+            (cpSendRoute ? 1U : 0U) | (cpWaitRoute ? 2U : 0U) | (cpInitRoute ? 4U : 0U) |
+            (cpDestroyRoute ? 8U : 0U) | (pspSubmitRoute ? 16U : 0U));
         if (externalInterfacesFunction != 0) {
             KernelPatcher::RouteRequest route{"__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
                                               externalInterfaces, externalInterfacesOriginal};
