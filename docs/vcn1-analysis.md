@@ -1375,3 +1375,37 @@ build55（CDHash `1A47DC9E`，UUID `21C20B40`）做只读运行时确认：
 - 调 `PptRaven_GetNumberOfPowerPlayTableEntries(pp, &count)` 发布条目数；
 - 调 VCE/UVD 取数桩与 CWDDEPM 桩确认运行时返回值；
 - 全部只读，不写任何电源状态，默认启动。
+
+## 43. 第四十轮：build55 只读结果与上游实现对照
+
+build55 实测（默认启动，UUID `21C20B40`，系统稳定）：
+
+- `PsmDumpRun=1`、`PsmDumpSymbols=31`、`PsmDumpClassesMask=49`（0x31，只有分类 0/4/5）、
+  `PsmDumpStateCount=3`；
+- `PsmS0Id=4`、`PsmS0Class=1`、`PsmS0Flags=0`、`PsmS0Del=0`，
+  `PsmS0A0..A7 = 0,0,1,0,0,0,0,0`（只有 A2=1，不是时钟）；
+- `PsmS1Id=2`、`PsmS1Class=0`、`PsmS1Flags=1`、`PsmS1Del=0`；
+- `PsmDumpPpPresent=1`、`PsmDumpPptCountResult=1`、`PsmDumpPptEntries=2`；
+- `PsmDumpVceCountResult=0`、`PsmDumpVceEntries=0`、`PsmDumpVceEntryResult=1`、
+  `PsmDumpVceEntry0=0`；`PsmDumpCwddeUvdNum=3`、`PsmDumpCwddeUvdInfo=3`。
+
+判读：PSM 状态表只有 3 个通用状态，没有 UVD 分类位（0x11–0x14）；VCE/UVD 状态表与
+CWDDEPM 都是空桩；PPT 主表只有 2 个通用电源条目。**没有 UVD 状态来源**。Path A（用驱动
+表动态建状态）无数据可依；Path B（驱动 PEM video start）仍会在
+`GetStateByClassification(0x12)` 返回 0xF。PSM 分类/动态建状态路线关闭。
+
+上游对照（steve12311/NootedRed）：
+
+- `VCNCapabilities.hpp:22` 明确「Raven/Picasso 保留分类，但尚未实现 VCN1 桥接」，
+  `rejection()` 对 VCN1 返回 5；`docs/vcn.md` 与 `docs/macos-multi-os-compat.md`
+  均只开放 `15E7/1636/1638/164C` 的 VCN2.2。**上游没有 VCN1 实现。**
+- 上游 VCN2.2 的做法是桥接 Apple 原生 X6000 驱动：加载 X6000、核验两侧 ABI、
+  把 X5000 的 shared/user client/video context/SML 实例改走 X6000 类，VCN2 的
+  上电/固件/PSM 全部由 `AMDVCN2HWEngine` 原生代码完成。
+- 该模式的前提「存在能完整初始化硬件的原生驱动」在 Picasso VCN1 上不成立，
+  因此没有可复用的上游代码，也解释了 PSM 路线的死路。
+- 上游对跨驱动虚调用先核验 ABI、不匹配即拒绝；build53 的 `vtable+0x248` 接管
+  没有核验，导致 page fault（`Kernel-2026-11-15-003554.panic`），已回退且禁止重加。
+
+剩余选项只有两个：接受 Picasso VCN1 在当前驱动模型下无解；或研究 VA 驱动能否在
+无 PSM UVD 状态时接受手工构造的解码会话（高风险，超出上游任何已有实现）。

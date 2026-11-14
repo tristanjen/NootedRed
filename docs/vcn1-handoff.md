@@ -368,6 +368,47 @@ build55（CDHash `1A47DC9E`，UUID `21C20B40`）：只读调查版，默认启�
 `PEM_CWDDEPM_GetUVDStateNum/Info` 确认返回值。静态已知：后三组在 Raven 上分别是
 0 / 1 / 3 的空桩。
 
+## 上游（steve12311/NootedRed）是如何实现的
+
+结论：**上游没有实现 VCN1**，Picasso/Raven（`1002:15D8`/`15DD`）被明确拒绝。
+
+- `NootedRed/VCNCapabilities.hpp:22`：「Raven/Picasso 保留分类，但**尚未实现 VCN1 桥接**」；
+  同文件 `rejection()` 对 VCN1 设备返回 **5 = 未实现的视频代际**。
+- `docs/vcn.md` 表格：`15D8 / 15DD` → 「拒绝，尚未实现 VCN1 桥接」；
+  `docs/macos-multi-os-compat.md:28`：「VCN 仍只接受 `15E7 / 1636 / 1638 / 164C`，
+  **不开放 VCN1**」。
+
+上游实际实现的是 VCN2.2（Renoir/Cezanne），做法是**桥接 Apple 原生 X6000 驱动**，
+不自己实现固件加载和电源管理：
+
+1. `-NRedVideoFix` → `lilu.onKextLoadForce(&x6000)`；X5000 的
+   `AMDGraphicsAccelerator::start` 钩子里调用
+   `OSKextLoadKextWithIdentifier("com.apple.kext.AMDRadeonX6000")`（`VCN.cpp:55-64`）。
+2. 加载时先 `verifyKernelABI()`：对照 `VCNKernelProfiles` 逐槽核对两侧虚表的方法身份、
+   getter 字段偏移和代码字节，不符即整体拒绝并置 `NRedVCNKernelABIRejected=1`；
+   失败时不在既有实例中途启用。
+3. 钩 X5000 的 `newShared`/`newSharedUserClient`/`newVideoContext`/`createSMLInterface`，
+   把对象分配与 SML 选择改走 X6000 的类/构造器（`VCN.cpp:317-330`）。
+4. X6000 侧只做**逐字节核验过的**代码补丁（GFXOFF idle 修正等），
+   `install()` 先比对原字节再写，失败回滚（`VCN.cpp:209-263`）。
+5. VCN2 的上电、PSP/SML/CP 固件提交、PSM 电源状态**全部由 Apple 的
+   `AMDVCN2HWEngine` 原生代码完成**；NootedRed 只 hook `initHardware` 做记录。
+
+关键前提：**必须存在一个原生驱动能完整初始化这块硬件**。Picasso 的 VCN1 在 macOS 里
+没有这样的驱动：X5000 的 Vega10 UVD7 路径不处理 VCN1，也没有 VCN1 的 PSM 状态。
+所以上游不是「没试过」，而是没有可桥接的对象，直接用拒绝码 5 挡住。
+
+对本项目的含义：
+
+- **没有上游 VCN1 代码可复用**；固件/电源/PSM 必须自己实现，而这正是上游刻意绕开的部分。
+- 与 build55 的只读结论一致：PSM 状态表只有 3 个通用状态，VCE/UVD 表与 CWDDEPM 都是
+  空桩，Path A 无数据源，Path B 仍会在 `GetStateByClassification(0x12)` 返回 0xF。
+- 上游对跨驱动虚调用的原则是「先核验 ABI，不匹配就拒绝」；build53 直接改
+  `vtable+0x248` 指向 X4100HWLibs 代码、没有这种核验，结果 page fault
+  （`Kernel-2026-11-15-003554.panic`）。**槽接管已删除，禁止重加。**
+- 继续硬解只剩两条路：接受「Picasso VCN1 无解」；或彻底换思路，研究 Apple 的 VA 驱动
+  能否在无 PSM UVD 状态时接受手工构造的解码会话（超出上游任何已有实现，高风险）。
+
 ## 下一步
 
 1. **build49 分类 4 兜底实测失败**（2026-11-08 21:48）：`PsmWakeClass4Result/Index=1/1`、
@@ -377,17 +418,17 @@ build55（CDHash `1A47DC9E`，UUID `21C20B40`）：只读调查版，默认启�
    PSM 分类路线到此为止**，不要再试 0x11–0x14 或分类 4。
 2. **config.plist 已恢复**：当前 boot-args 不含 `-NRedVCNPsmWake`；build49 分类路线已结束，
    不再重试。
-3. **build54 稳定性已确认**（与 Chrome 无关；vtable 槽接管已删除，禁止重加）。
-   build55（CDHash `1A47DC9E`/UUID `21C20B40`）已装，只读调查 PSM 状态链表与 PPT：
-   读 `PsmDumpRun`、`PsmDumpClassesMask`、`PsmDumpStateCount`、`PsmS0Id/Class/Flags/Del`、
-   `PsmS0A0..A7`、`PsmS1Id/Class/Flags/Del`、`PsmDumpPpPresent`、`PsmDumpPptCountResult`、
-   `PsmDumpPptEntries`、`PsmDumpVceCountResult/Entries`、`PsmDumpVceEntryResult`、
-   `PsmDumpCwddeUvdNum/Info`。判读：若 `PsmS0A0..A7` 出现非零 VCN/VCE 时钟字段或
-   `PptEntries>0` 且有可用状态，再做 A；若全是 0/桩，说明 PSM 路径不可达，B 也只会 0xF。
-4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
-   /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
-   `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。
-   不要退回裸调 `PowerUpVCN`。
+3. **build55 只读实测结论**（默认启动，UUID `21C20B40`，系统稳定）：
+   `PsmDumpRun=1`、`PsmDumpSymbols=31`、`PsmDumpClassesMask=49`、`PsmDumpStateCount=3`；
+   `PsmS0Id=4/Class=1/Flags=0/Del=0`、`PsmS0A0..A7=0,0,1,0,0,0,0,0`；
+   `PsmS1Id=2/Class=0/Flags=1`；`PsmDumpPpPresent=1`、`PptEntries=2`；
+   `VceCountResult/Entries=0`、`VceEntryResult=1`；`CwddeUvdNum/Info=3`。
+   PSM 没有任何 UVD 分类位，VCE/UVD 表与 CWDDEPM 都是空桩，PPT 主表只有 2 个通用条目。
+   **PSM 分类/动态建状态路线到此为止**：不再试 0x11–0x14、分类 4、CWDDEPM 建状态
+   （原第 4 项随之关闭）。
+4. **上游对照结论**：上游只实现 VCN2.2，并明确拒绝 VCN1（见上一节）；本机没有可桥接的
+   原生 VCN1 驱动，也没有上游实现可参考。剩余只有「接受限制」或「手工合成 UVD state」
+   （高风险，需单独评估）两条路。
 5. **禁止** build35/39/41/45、`-NRedVCNInitWindow`、`-NRedVCNForceVCNPG0`。
 6. 任何新实验仍必须：boot-arg 默认关、备份 `config.plist`、装前备份 EFI kext、失败后
    先恢复 EFI/配置再重启。
@@ -401,7 +442,7 @@ build55（CDHash `1A47DC9E`，UUID `21C20B40`）：只读调查版，默认启�
 
 ## 代码地图
 
-`NootedRed/VCN.cpp`（VCN1 主体：`prepareVCN1`、`hookCailLibrary`、`cailUvdControlHook`、`cailUvdInitHook`、`probeHardwareInit`）、`VCN.hpp`、`X5000.cpp`/`.hpp`（`allocateHWEngines` VCN1 分支、能力位）、`HWLibs.cpp`（钩 HWLibs 前调用 `VCN::hookCailLibrary`）、`UserVideoDecode.cpp`、`UserSequoiaVideoData.hpp`（生成物）、`VCNCapabilities.hpp`、`docs/vcn.md`、`docs/vcn1-analysis.md`（§1–§37 全过程记录）。
+`NootedRed/VCN.cpp`（VCN1 主体：`prepareVCN1`、`hookCailLibrary`、`cailUvdControlHook`、`cailUvdInitHook`、`probeHardwareInit`）、`VCN.hpp`、`X5000.cpp`/`.hpp`（`allocateHWEngines` VCN1 分支、能力位）、`HWLibs.cpp`（钩 HWLibs 前调用 `VCN::hookCailLibrary`）、`UserVideoDecode.cpp`、`UserSequoiaVideoData.hpp`（生成物）、`VCNCapabilities.hpp`、`docs/vcn.md`、`docs/vcn1-analysis.md`（§1–§43 全过程记录）。
 
 ## 完整对话导出
 
