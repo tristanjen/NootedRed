@@ -307,9 +307,13 @@ no-start 闸。
 2. **先恢复 config.plist**：本机启动仍带 `-NRedVCNPsmWake`（`PsmWakeRun=1` 可证）。
    挂载 ESP 后用 `~/Desktop/config.plist.bak-20261108-214330` 覆盖
    `EFI/OC/config.plist`，确认 boot-args 不再含该开关。
-3. **补固件路径诊断**：`LoadUVDFW=1`、`FirmwareAddress=0x7B52F000` 非零，但 `FwMsg*`
-   全缺。下一版在 `prepareVCN1` 发布 `FwMsgRouteInstalled`，并在 `loadUVDFW` 入口读
-   `+0x3BA` 缓存标志、发布提前返回位，先区分“没下发”和“没钩上”。
+3. **build50 已实现固件路径诊断**（本次改动，默认启动即可，无需 boot-arg）：
+   `prepareVCN1` 发布 `FwMsgSymbolResolved`、`FwMsgRouteInstalled`；`loadUVDFW` 入口
+   发布 `LoadUVDFWCacheFlag`、`LoadUVDFWEarlyReturn`（后者由 `+0x3BA` 推断，不是直接观测）。
+   判读：`FwMsgSymbolResolved=0` → `commitUVDFWMsg` 符号没解析；`=1` 且
+   `FwMsgRouteInstalled=0` → 路由没装上；两者都为 1 但 `FwMsgCount` 缺失时，
+   `LoadUVDFWCacheFlag=1`/`EarlyReturn=1` 说明缓存标志已置位、原函数很可能跳过了
+   `commitUVDFWMsg`；`CacheFlag=0` 则是别的原因提前返回，下一轮再读 `+0x280` 固件指针。
 4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
    /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
    `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。

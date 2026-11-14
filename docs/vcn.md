@@ -27,7 +27,9 @@ IsEncode/BaseForced）、`HardwareInitDec/Enc`、`HardwareBaseDec/Enc`、`CailDe
 NativeBase）、`HardwareEarlyFlag`、`HardwareSkipFirmware`、`LastHardwareInit`、`InitHardwareCail`、
 `FirmwareAddress`、`RingCount`、`RingArrayLow`、`CailHooked`、`CailClientLow/CailVptrLow/CailSubmitLow`、
 `CailSubmit1/6/7/8/9`、`CailLastSelector`、`CailLastResult`，以及固件消息路径的
-`FwMsgOpcode/FwMsgResult/FwMsgCount`；视频上下文链的 `HasUVD0/HasUVD1/HasVCE`（硬件能力结构
+`FwMsgOpcode/FwMsgResult/FwMsgCount`，以及 build50 的固件路由/缓存诊断
+`FwMsgSymbolResolved/FwMsgRouteInstalled/LoadUVDFWCacheFlag/LoadUVDFWEarlyReturn`
+（后两者读 `UVDHWEngine+0x3BA` 的固件已缓存标志，`EarlyReturn` 是据此推断原函数是否提前返回）；视频上下文链的 `HasUVD0/HasUVD1/HasVCE`（硬件能力结构
 +0xB4/+0xB5/+0xB6 的实际字节）、`NewCtxFlag/NewCtxForced/NewCtxResult`（加速器 +0x1F10 的 bit3
 闸门）、`AccelVideoStart`、`VideoCtxStart`、`VcQueueUVD0/UVD1/VCE`（上下文 +0x1240/+0x1248/+0x1250
 上的队列）、`CapResult/CapUVD0/CapUVD1/CapVCE`、`NewCtxType/NewCtxCodec/NewCtxStatus`、`UvdCtxInit`、

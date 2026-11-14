@@ -931,6 +931,13 @@ namespace
     // initHardware 的两个子步骤：固件下载（SML/PSP）与 CAIL 硬件初始化。
     bool uvd7LoadUVDFW(void* self)
     {
+        // +0x3BA 是 UVDHWEngine::loadUVDFW 的固件已缓存标志（§6 反汇编结论）。入口先读一次；
+        // 置位时原函数很可能跳过 commitUVDFWMsg 直接返回 true，所以 EarlyReturn 只是据此
+        // 推断，不是直接观测。
+        UInt8 cacheFlag{0};
+        if (self != nullptr) { memcpy(&cacheFlag, static_cast<UInt8*>(self) + 0x3BA, sizeof(cacheFlag)); }
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWCacheFlag", cacheFlag);
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWEarlyReturn", cacheFlag != 0 ? 1 : 0);
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7LoadUVDFWOriginal)(self);
         NRed::singleton().setProp32("NRedVCN1LoadUVDFW", result);
         auto count = __atomic_fetch_add(&uvd7LoadUVDFWCount, 1U, __ATOMIC_RELAXED);
@@ -1159,8 +1166,11 @@ namespace
                       size);
         ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine9loadUVDFWEv", engineLoadUVDFW, slide, size);
         mach_vm_address_t fwMessageFunction{0};
-        resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDUVD7HWEngine14commitUVDFWMsgEP12_SML_UVD_MSGyyy",
-                fwMessageFunction, slide, size);
+        const bool fwMessageResolved =
+            resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDUVD7HWEngine14commitUVDFWMsgEP12_SML_UVD_MSGyyy",
+                    fwMessageFunction, slide, size);
+        NRed::singleton().setProp32("NRedVCN1FwMsgSymbolResolved",
+                                    fwMessageResolved && fwMessageFunction != 0 ? 1 : 0);
         ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine16initHardwareCailEb", engineInitHardwareCail,
                       slide, size);
         ok &= resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDUVD7HWEngine", engineVTable, slide, size);
@@ -1253,12 +1263,16 @@ namespace
              uvd7InitHardwareCailOriginal},
         };
         if (!patcher.routeMultiple(id, routes, arrsize(routes), slide, size)) { patcher.clearError(); }
+        bool fwMessageRouteInstalled{false};
         if (fwMessageFunction != 0) {
             KernelPatcher::RouteRequest route{
                 "__ZN30AMDRadeonX5000_AMDUVD7HWEngine14commitUVDFWMsgEP12_SML_UVD_MSGyyy", uvd7CommitFWMessage,
                 fwMessageOriginal};
-            if (!patcher.routeMultiple(id, &route, 1, slide, size)) { patcher.clearError(); }
+            fwMessageRouteInstalled = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!fwMessageRouteInstalled) { patcher.clearError(); }
         }
+        // 三个键一起判：symbol 没解析 / 路由没装上 / 装上但没被调用（FwMsgCount 缺失）。
+        NRed::singleton().setProp32("NRedVCN1FwMsgRouteInstalled", fwMessageRouteInstalled ? 1 : 0);
         if (externalInterfacesFunction != 0) {
             KernelPatcher::RouteRequest route{"__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
                                               externalInterfaces, externalInterfacesOriginal};
