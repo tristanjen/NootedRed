@@ -30,6 +30,12 @@ namespace
     mach_vm_address_t       smlQueryOriginalGFX9{0}, smlQueryOriginalBase{0};
     mach_vm_address_t       uvd7InitOriginal{0}, uvd7InitHardwareOriginal{0}, fwMessageOriginal{0};
     UInt32                  fwMessageCount{0};
+    // build51：AMDSMLInterface 的固件消息/状态方法。loadUVDFW 实际通过 [engine+0x18] 的
+    // 虚表调用这些方法，而不是 UVD7 自己的 commitUVDFWMsg。
+    mach_vm_address_t       smlWriteCreateOriginal{0}, smlWriteDestroyOriginal{0}, smlGetUVDFWOriginal{0};
+    mach_vm_address_t       smlGetCacheInfoOriginal{0}, smlSaveStateOriginal{0}, smlRestoreStateOriginal{0};
+    UInt32                  smlWriteCreateCount{0}, smlWriteDestroyCount{0}, smlGetUVDFWCount{0};
+    UInt32                  smlGetCacheInfoCount{0}, smlSaveStateCount{0}, smlRestoreStateCount{0};
     mach_vm_address_t       uvd7LoadUVDFWOriginal{0}, uvd7InitHardwareCailOriginal{0};
     // AMDUVD7HWEngine 的 __ZTV；对象虚表与它相减得到不随 KASLR 变化的类差值。
     mach_vm_address_t       uvd7VTable{0};
@@ -578,6 +584,64 @@ namespace
         return result;
     }
 
+    UInt32 smlWriteCreateHook(void* self, UInt32 arg, void* message)
+    {
+        UInt32 opcode{0};
+        if (message != nullptr) { memcpy(&opcode, message, sizeof(opcode)); }
+        const auto result = reinterpret_cast<UInt32 (*)(void*, UInt32, void*)>(smlWriteCreateOriginal)(self, arg, message);
+        NRed::singleton().setProp32("NRedVCN1SmlCreateCalls", __atomic_fetch_add(&smlWriteCreateCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1SmlCreateOpcode", opcode);
+        NRed::singleton().setProp32("NRedVCN1SmlCreateArg", arg);
+        NRed::singleton().setProp32("NRedVCN1SmlCreateResult", result);
+        return result;
+    }
+    UInt32 smlWriteDestroyHook(void* self, UInt32 arg, void* message)
+    {
+        UInt32 opcode{0};
+        if (message != nullptr) { memcpy(&opcode, message, sizeof(opcode)); }
+        const auto result = reinterpret_cast<UInt32 (*)(void*, UInt32, void*)>(smlWriteDestroyOriginal)(self, arg, message);
+        NRed::singleton().setProp32("NRedVCN1SmlDestroyCalls", __atomic_fetch_add(&smlWriteDestroyCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1SmlDestroyOpcode", opcode);
+        NRed::singleton().setProp32("NRedVCN1SmlDestroyResult", result);
+        return result;
+    }
+    UInt32 smlGetUVDFWHook(void* self, void* info)
+    {
+        UInt32 w0{0}, w1{0};
+        if (info != nullptr) { memcpy(&w0, info, 4); memcpy(&w1, static_cast<UInt8*>(info) + 4, 4); }
+        const auto result = reinterpret_cast<UInt32 (*)(void*, void*)>(smlGetUVDFWOriginal)(self, info);
+        NRed::singleton().setProp32("NRedVCN1SmlGetFwCalls", __atomic_fetch_add(&smlGetUVDFWCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1SmlGetFwInfo0", w0);
+        NRed::singleton().setProp32("NRedVCN1SmlGetFwInfo1", w1);
+        NRed::singleton().setProp32("NRedVCN1SmlGetFwResult", result);
+        return result;
+    }
+    UInt32 smlGetCacheInfoHook(void* self, void* info)
+    {
+        UInt32 w0{0}, w1{0};
+        if (info != nullptr) { memcpy(&w0, info, 4); memcpy(&w1, static_cast<UInt8*>(info) + 4, 4); }
+        const auto result = reinterpret_cast<UInt32 (*)(void*, void*)>(smlGetCacheInfoOriginal)(self, info);
+        NRed::singleton().setProp32("NRedVCN1SmlCacheCalls", __atomic_fetch_add(&smlGetCacheInfoCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1SmlCacheInfo0", w0);
+        NRed::singleton().setProp32("NRedVCN1SmlCacheInfo1", w1);
+        NRed::singleton().setProp32("NRedVCN1SmlCacheResult", result);
+        return result;
+    }
+    UInt32 smlSaveStateHook(void* self, UInt32 arg, void* message)
+    {
+        const auto result = reinterpret_cast<UInt32 (*)(void*, UInt32, void*)>(smlSaveStateOriginal)(self, arg, message);
+        NRed::singleton().setProp32("NRedVCN1SmlSaveCalls", __atomic_fetch_add(&smlSaveStateCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1SmlSaveResult", result);
+        return result;
+    }
+    UInt32 smlRestoreStateHook(void* self, UInt32 arg, void* message)
+    {
+        const auto result = reinterpret_cast<UInt32 (*)(void*, UInt32, void*)>(smlRestoreStateOriginal)(self, arg, message);
+        NRed::singleton().setProp32("NRedVCN1SmlRestoreCalls", __atomic_fetch_add(&smlRestoreStateCount, 1U, __ATOMIC_RELAXED) + 1);
+        NRed::singleton().setProp32("NRedVCN1SmlRestoreResult", result);
+        return result;
+    }
+
     // +0x338 是 SML 接口指针（由 services->vt[0x850] 创建）：一出现就接管其查询槽。
     void hookCailClient(void* client);
 
@@ -935,9 +999,21 @@ namespace
         // 置位时原函数很可能跳过 commitUVDFWMsg 直接返回 true，所以 EarlyReturn 只是据此
         // 推断，不是直接观测。
         UInt8 cacheFlag{0};
-        if (self != nullptr) { memcpy(&cacheFlag, static_cast<UInt8*>(self) + 0x3BA, sizeof(cacheFlag)); }
+        UInt8 flag25C{0};
+        UInt64 fwPtr{0}, smlPtr{0};
+        if (self != nullptr) {
+            memcpy(&cacheFlag, static_cast<UInt8*>(self) + 0x3BA, sizeof(cacheFlag));
+            memcpy(&flag25C, static_cast<UInt8*>(self) + 0x25C, sizeof(flag25C));
+            memcpy(&fwPtr, static_cast<UInt8*>(self) + 0x280, sizeof(fwPtr));
+            memcpy(&smlPtr, static_cast<UInt8*>(self) + 0x2A8, sizeof(smlPtr));
+        }
         NRed::singleton().setProp32("NRedVCN1LoadUVDFWCacheFlag", cacheFlag);
         NRed::singleton().setProp32("NRedVCN1LoadUVDFWEarlyReturn", cacheFlag != 0 ? 1 : 0);
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWFlag25C", flag25C);
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWFwPtrLow", static_cast<UInt32>(fwPtr & 0xFFFFFFFFULL));
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWFwPtrHigh", static_cast<UInt32>(fwPtr >> 32));
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWSmlPtrLow", static_cast<UInt32>(smlPtr & 0xFFFFFFFFULL));
+        NRed::singleton().setProp32("NRedVCN1LoadUVDFWSmlPtrHigh", static_cast<UInt32>(smlPtr >> 32));
         const auto result = reinterpret_cast<bool (*)(void*)>(uvd7LoadUVDFWOriginal)(self);
         NRed::singleton().setProp32("NRedVCN1LoadUVDFW", result);
         auto count = __atomic_fetch_add(&uvd7LoadUVDFWCount, 1U, __ATOMIC_RELAXED);
@@ -1171,6 +1247,27 @@ namespace
                     fwMessageFunction, slide, size);
         NRed::singleton().setProp32("NRedVCN1FwMsgSymbolResolved",
                                     fwMessageResolved && fwMessageFunction != 0 ? 1 : 0);
+        // build51：loadUVDFW 实际走 AMDSMLInterface 的虚表方法；逐个解析并挂钩。
+        mach_vm_address_t smlWriteCreate{0}, smlWriteDestroy{0}, smlGetUVDFW{0};
+        mach_vm_address_t smlGetCacheInfo{0}, smlSaveState{0}, smlRestoreState{0};
+        const bool smlCreateOk = resolve(patcher, id,
+            "__ZN30AMDRadeonX5000_AMDSMLInterface17writeUVDCreateMsgEjP12_SML_UVD_MSG",
+            smlWriteCreate, slide, size);
+        const bool smlDestroyOk = resolve(patcher, id,
+            "__ZN30AMDRadeonX5000_AMDSMLInterface18writeUVDDestroyMsgEjP12_SML_UVD_MSG",
+            smlWriteDestroy, slide, size);
+        const bool smlGetFwOk = resolve(patcher, id,
+            "__ZN30AMDRadeonX5000_AMDSMLInterface8getUVDFWEP10_SML_UVDFW", smlGetUVDFW, slide, size);
+        const bool smlCacheOk = resolve(patcher, id,
+            "__ZN30AMDRadeonX5000_AMDSMLInterface17getUVDFWCacheInfoEP14_SML_UVDFWInfo",
+            smlGetCacheInfo, slide, size);
+        const bool smlSaveOk = resolve(patcher, id,
+            "__ZN30AMDRadeonX5000_AMDSMLInterface12saveUVDStateEjP12_SML_UVD_MSG", smlSaveState, slide, size);
+        const bool smlRestoreOk = resolve(patcher, id,
+            "__ZN30AMDRadeonX5000_AMDSMLInterface15restoreUVDStateEjP12_SML_UVD_MSG", smlRestoreState, slide, size);
+        NRed::singleton().setProp32("NRedVCN1SmlSymbols",
+            (smlCreateOk ? 1U : 0U) | (smlDestroyOk ? 2U : 0U) | (smlGetFwOk ? 4U : 0U) |
+            (smlCacheOk ? 8U : 0U) | (smlSaveOk ? 16U : 0U) | (smlRestoreOk ? 32U : 0U));
         ok &= resolve(patcher, id, "__ZN29AMDRadeonX5000_AMDUVDHWEngine16initHardwareCailEb", engineInitHardwareCail,
                       slide, size);
         ok &= resolve(patcher, id, "__ZTV30AMDRadeonX5000_AMDUVD7HWEngine", engineVTable, slide, size);
@@ -1273,6 +1370,54 @@ namespace
         }
         // 三个键一起判：symbol 没解析 / 路由没装上 / 装上但没被调用（FwMsgCount 缺失）。
         NRed::singleton().setProp32("NRedVCN1FwMsgRouteInstalled", fwMessageRouteInstalled ? 1 : 0);
+        bool smlCreateRoute{false}, smlDestroyRoute{false}, smlGetFwRoute{false};
+        bool smlCacheRoute{false}, smlSaveRoute{false}, smlRestoreRoute{false};
+        if (smlWriteCreate != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN30AMDRadeonX5000_AMDSMLInterface17writeUVDCreateMsgEjP12_SML_UVD_MSG",
+                smlWriteCreateHook, smlWriteCreateOriginal};
+            smlCreateRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!smlCreateRoute) { patcher.clearError(); }
+        }
+        if (smlWriteDestroy != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN30AMDRadeonX5000_AMDSMLInterface18writeUVDDestroyMsgEjP12_SML_UVD_MSG",
+                smlWriteDestroyHook, smlWriteDestroyOriginal};
+            smlDestroyRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!smlDestroyRoute) { patcher.clearError(); }
+        }
+        if (smlGetUVDFW != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN30AMDRadeonX5000_AMDSMLInterface8getUVDFWEP10_SML_UVDFW",
+                smlGetUVDFWHook, smlGetUVDFWOriginal};
+            smlGetFwRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!smlGetFwRoute) { patcher.clearError(); }
+        }
+        if (smlGetCacheInfo != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN30AMDRadeonX5000_AMDSMLInterface17getUVDFWCacheInfoEP14_SML_UVDFWInfo",
+                smlGetCacheInfoHook, smlGetCacheInfoOriginal};
+            smlCacheRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!smlCacheRoute) { patcher.clearError(); }
+        }
+        if (smlSaveState != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN30AMDRadeonX5000_AMDSMLInterface12saveUVDStateEjP12_SML_UVD_MSG",
+                smlSaveStateHook, smlSaveStateOriginal};
+            smlSaveRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!smlSaveRoute) { patcher.clearError(); }
+        }
+        if (smlRestoreState != 0) {
+            KernelPatcher::RouteRequest route{
+                "__ZN30AMDRadeonX5000_AMDSMLInterface15restoreUVDStateEjP12_SML_UVD_MSG",
+                smlRestoreStateHook, smlRestoreStateOriginal};
+            smlRestoreRoute = patcher.routeMultiple(id, &route, 1, slide, size);
+            if (!smlRestoreRoute) { patcher.clearError(); }
+        }
+        NRed::singleton().setProp32("NRedVCN1SmlRoutes",
+            (smlCreateRoute ? 1U : 0U) | (smlDestroyRoute ? 2U : 0U) |
+            (smlGetFwRoute ? 4U : 0U) | (smlCacheRoute ? 8U : 0U) |
+            (smlSaveRoute ? 16U : 0U) | (smlRestoreRoute ? 32U : 0U));
         if (externalInterfacesFunction != 0) {
             KernelPatcher::RouteRequest route{"__ZN26AMDRadeonX5000_AMDHardware28initializeExternalInterfacesEv",
                                               externalInterfaces, externalInterfacesOriginal};
