@@ -343,6 +343,22 @@ build53（CDHash `52AA44D6`，UUID `7DEA5250`）：在 `loadUVDFW` 第一次进�
 `LoadUVDFWCpSlotHooked`、`CpSlotCalls/FwPtrLow/High/Opcode/Result`。默认启动，无需
 boot-arg。
 
+**build53 实测：vtable 槽接管触发 page fault（2026-11-14 16:26 / 11-15 00:35）**：
+两份 panic（`Kernel-2026-11-14-162637.panic`、`Kernel-2026-11-15-003554.panic`）
+都是 NootedRed UUID `7DEA5250`，RIP 落在 **NootedRed 自己的代码段**，`RSI=0xf47b52f000`、
+`R8/R9=1`、`RDX=0xffc10a0000`（fault 地址），进程 **VTDecoderXPCService**。
+即 `cpSlot248Hook` 调用原槽位时跳到了非函数指针（原值是 chained fixup/数据目标），
+Chrome 的硬件加速只是触发视频解码、走到这条路径的引信。**槽接管已删除，禁止重加。**
+
+另外 `Kernel-2026-11-15-001216.panic`（NootedRed UUID `4FC4E5CF`，build52）是
+`[PPLIB] Failed to send PPLIB IRI to Accelerator`（`AmdRadeonController.cpp:2022`，
+WindowServer），与 vtable 槽无关，属于另一条 GPU/电源路径；若移除槽接管后仍复现，
+需要单独查 PPLIB/IRI。
+
+build54：删除 build53 的运行期 vtable 槽改写与 `cpSlot248Hook`，保留只读的
+`LoadUVDFWCpObj/Slot248` 诊断和 build52 的 CP/SML 钩子。构建产物与 build52 完全一致
+（CDHash `D3162664`，UUID `4FC4E5CF`）。
+
 ## 下一步
 
 1. **build49 分类 4 兜底实测失败**（2026-11-08 21:48）：`PsmWakeClass4Result/Index=1/1`、
@@ -352,12 +368,9 @@ boot-arg。
    PSM 分类路线到此为止**，不要再试 0x11–0x14 或分类 4。
 2. **config.plist 已恢复**：当前 boot-args 不含 `-NRedVCNPsmWake`；build49 分类路线已结束，
    不再重试。
-3. **build53 CP vtable 槽接管**（默认启动，无需 boot-arg）：读
-   `LoadUVDFWCpSlotHooked`、`CpSlotCalls`、`CpSlotFwPtrLow/High`、`CpSlotOpcode`、
-   `CpSlotResult`、`LoadUVDFWCpSlot248Low/High`。判读：`CpSlotCalls>0` → 已经抓到
-   真正的固件提交，看 fwPtr/opcode/result；若 `CpSlotCalls` 仍为 0，说明 `loadUVDFW`
-   没走到该槽（`Flag25C` 分支变化）或槽被别的路径覆盖。槽目标继续与
-   `AMDRadeonX4100HWLibs` 的符号表对照。
+3. **build54 = build52**（CDHash `D3162664`/UUID `4FC4E5CF`）已安装，先做稳定性验证：
+   重启 → 空闲 60s → 播 30s → dump。建议先**关闭 Chrome 硬件加速**确认不冻屏，再开启，
+   以区分 vtable 槽问题与 PPLIB/IRI 路径。**禁止重新加回 vtable 槽接管。**
 4. **转向 CWDDEPM 建状态**：查 `PEM_CWDDEPM_PredictUVDStateSettings` 的 UVD 状态创建
    /`PSM_AddState`，给状态表补一个带 VCN 时钟/门控属性的 UVD state；或直接驱动
    `PEM_Task_VideoStartMultiUVDStates`（`PemVideoHooked=1`，但本机从未被调用）。

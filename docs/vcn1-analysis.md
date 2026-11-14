@@ -1326,3 +1326,29 @@ build53（CDHash `52AA44D6`，UUID `7DEA5250`）：
   `CpSlotFwPtrLow/High`、`CpSlotOpcode`（message 首 dword）、`CpSlotResult`；
   另发布 `LoadUVDFWCpSlotHooked` 表示槽是否替换成功。
 - 这样无论目标属于 X4100HWLibs 还是别的层，`loadUVDFW` 的真实调用都会进钩子。
+
+## 41. 第三十八轮：build53 的 vtable 槽接管 page fault 与回滚
+
+build53 实机（UUID `7DEA5250`）连续两份 panic：
+
+- `Kernel-2026-11-14-162637.panic`（16:26，uptime 122.7s）：
+  `Kernel trap ... type = 14=page fault`，RIP `0xffffff8023287552` 落在
+  **NootedRed 自己的代码段**（NootedRed 范围 `0xffffff8023260000-0xffffff802356ffff`）；
+  `RSI=0x000000f47b52f000`（固件指针）、`R8=1`、`R9=1`、`RDX=0x000000ffc10a0000`
+  （fault 地址），进程 **VTDecoderXPCService**。
+- `Kernel-2026-11-15-003554.panic`（00:35，uptime 103.0s）：同一 RIP 形态、
+  同一 UUID、同一 `RSI/RDX/R8/R9` 组合、同一进程。
+
+结论：`cpSlot248Hook` 调用 `[self+0x20] vtable+0x248` 的“原值”时，原值并不是可调用的
+函数指针（chained fixup/数据目标），我们把它当函数调用导致 page fault。Chrome 的
+硬件加速只是触发 VTDecoderXPCService 走视频解码、到达这条路径的引信。
+
+另一份 `Kernel-2026-11-15-001216.panic`（UUID `4FC4E5CF`，build52）是
+`[PPLIB] Failed to send PPLIB IRI to Accelerator`（`AmdRadeonController.cpp:2022`，
+WindowServer），与 vtable 槽无关，是另一条 GPU/电源路径；移除槽接管后若仍复现，
+需要单独查 PPLIB/IRI。
+
+build54：删除 `cpSlot248Hook`、`cpSlot248*` 全局量和 `loadUVDFW` 里的 vtable 槽改写，
+保留只读的 `LoadUVDFWCpObj/Slot248` 诊断与 build52 的 CP/SML 钩子。由于 build53 的
+唯一代码增量就是槽接管，build54 的构建产物与 build52 **逐字节一致**
+（CDHash `D3162664`，UUID `4FC4E5CF`）。
